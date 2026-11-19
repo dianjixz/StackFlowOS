@@ -328,6 +328,7 @@ task.completed / task.blocked / task.artifact / task.note
 agent.spawned / agent.registered / agent.working / agent.waiting / agent.finished
 agent.failed / agent.terminated / agent.heartbeat / agent.step
 approval.requested / approval.decided / approval.auto / approval.expired / approval.used / approval.ui_decided
+operator.action
 rule.created / rule.updated / rule.deleted
 tool.invoked / tool.result / tool.denied / tool.failed
 failure.detected / failure.action
@@ -362,6 +363,7 @@ memory.updated / demo.seeded
 | `agent.kill` | high | agent_id | 杀掉工人 |
 | `unit.control` | high | work_id | 暂停/杀死单元 |
 | `sys.config` | high | section | 改系统配置 |
+| `approval.decide` | high | request_id | 放行/拒绝审批 |
 | `data.read` | low | project_id | 读项目数据/事件 |
 | `data.write` | medium | project_id | 写项目记忆 |
 
@@ -426,7 +428,23 @@ class ApprovalRequest:
 * 没有人在线时，pending 到期自动拒绝（**fail closed**）。
 * 所有 `request/decide/use` 都进事件日志，审计页只读事件流。
 
-### 6.4 执行模型
+### 6.4 系统助手 = 操作员代理（特权但全审计）
+
+系统助手（对话框里的 AI）不是普通工人，而是**操作员的代理**：人通过对话下指令，
+所以它的工具调用直接执行，不进入审批队列。`session/operator.py` 维护一个封闭的
+管理工具目录（项目/任务/Agent/单元/审批/规则/配置/租约/项目文件/记忆），
+每一次调用追加 `operator.action` 事件，参数递归脱敏（key/token/password/… → `***`），
+结果截断后入流。它可以 `approval.decide`（含 `approval.allow` / `approval.deny`
+别名），也可以删除项目、改配置、写规则。
+
+边界：
+* 工人 Agent 仍然走 `approval.request`，助手身份不能替它们自动放行工作动作；
+* 助手没有 `shell.exec`，文件读取被限制在项目 workspace 内，不能碰宿主任意路径；
+* 删除项目在人工 UI 仍要求输入项目名；助手路径由对话指令触发，但保留完整审计；
+* 这是有意的信任选择：把"人机交互入口"等同于"操作员"。若未来接不可信输入，
+  应把 operator 工具降级为 approval-gated，或在会话上加签名确认。
+
+### 6.5 执行模型
 
 工具执行在 worker 本地，顺序固定：
 
@@ -653,7 +671,7 @@ tests/
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
-* 当前 `python3 -m unittest discover -s tests -t .` 为 248 个测试。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 256 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）

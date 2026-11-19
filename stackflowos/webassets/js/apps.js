@@ -1808,7 +1808,9 @@ function renderSettingsApp() {
         });
         return el('div', {}, button, result);
       })()),
-    appNote('API Key 以掩码显示，不会回传明文；留空保存会清除已配置的 Key。', { iconName: 'approvals' }),
+    appNote('API Key 以掩码显示，不会回传明文；留空保存会清除已配置的 Key。'
+      + ' 系统助手以「操作员」身份直接执行项目/任务/Agent/审批/配置操作，'
+      + '每次动作都记入事件流；工人 Agent 仍走审批口。', { iconName: 'approvals' }),
   );
 
   panes.security.append(

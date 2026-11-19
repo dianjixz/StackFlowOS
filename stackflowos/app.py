@@ -29,6 +29,7 @@ from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler
 from .projects import ProjectStore, plan_for
 from .security import ApprovalBroker, PolicyEngine
 from .session.chat import ChatService
+from .session.operator import OperatorTools
 from .transport import AddressAllocator, HubTransport
 from .util.jsonio import read_json, write_json
 from .util.logging import get_logger, setup_logging
@@ -80,6 +81,7 @@ class App:
         self._lock_fd: int | None = None
         self._assistant_executor: ToolExecutor | None = None
         self._assistant_agent = None
+        self.operator = OperatorTools(self)
         self.log = get_logger("app")
 
     # ------------------------------------------------------------------
@@ -1355,93 +1357,13 @@ class App:
         }, source="operator")
         return {"config": cfg.public_dict(), "restart_required": restart_required}
 
+    async def operator_tool(self, tool: str, args: dict) -> dict:
+        """Run one assistant/operator tool directly (audited, no approval queue)."""
+        return await self.operator.run(tool, args)
+
     async def assistant_tool(self, tool: str, args: dict) -> dict:
-        """Execute a chat-assistant tool call with a non-blocking approval gate."""
-        mapping = {
-            "project.create": ("project.create", {}),
-            "project.list": ("data.read", {}),
-            "project.get": ("data.read", {"project_id": args.get("project_id")}),
-            "task.list": ("data.read", {"project_id": args.get("project_id")}),
-            "unit.list": ("data.read", {}),
-            "event.query": ("data.read", {"project_id": args.get("project_id")}),
-            "agent.spawn": ("agent.spawn", {"project_id": args.get("project_id"),
-                                           "role": args.get("role")}),
-            "agent.kill": ("agent.kill", {"agent_id": args.get("agent_id")}),
-            "project.update": ("project.update", {"project_id": args.get("project_id")}),
-            "project.archive": ("project.archive", {"project_id": args.get("project_id")}),
-            "project.delete": ("project.delete", {
-                "project_id": args.get("project_id"),
-                "purge_workspace": bool(args.get("purge_workspace", True)),
-            }),
-        }
-        if tool not in mapping:
-            return {"ok": False, "error": f"assistant tool {tool!r} is not allowed"}
-        capability, scope = mapping[tool]
-        preview = str(args)
-        if tool in ("project.delete", "project.archive"):
-            try:
-                target = self.projects.get(str(args.get("project_id") or ""))
-                action = "永久删除" if tool == "project.delete" else "归档"
-                preview = (f"{action}项目「{target.name}」({target.id})\n"
-                           f"工作区：{target.workspace}\n"
-                           f"任务数：{len(self.projects.task_list(project_id=target.id))}")
-            except SfoError:
-                pass
-        request = self.approvals.request(
-            "agent-assistant", capability, scope,
-            reason=f"assistant tool: {tool}",
-            preview=preview[: self.config.security.max_preview_chars],
-            project_id=args.get("project_id"),
-        )
-        if request.status == "pending":
-            return {"ok": False, "error": f"已提交审批 {request.id}，等待人工放行"}
-        if request.status != "approved":
-            return {"ok": False, "error": f"策略拒绝（{request.reason or request.status}）"}
-        try:
-            if tool == "project.create":
-                card = await self.create_project(
-                    str(args.get("name") or "未命名项目"),
-                    str(args.get("goal") or args.get("name") or ""),
-                    created_by="agent-assistant",
-                )
-                result = card
-            elif tool == "project.list":
-                result = {"projects": [self.project_card(p.id) for p in self.projects.list()]}
-            elif tool == "project.get":
-                result = self.project_card(str(args.get("project_id") or ""))
-            elif tool == "task.list":
-                result = {"tasks": [t.to_dict() for t in
-                                    self.projects.task_list(project_id=args.get("project_id"))]}
-            elif tool == "unit.list":
-                result = {"units": [u.to_dict() for u in self.registry.list()]}
-            elif tool == "event.query":
-                result = {"events": [r.to_dict() for r in self.eventlog.since(
-                    int(args.get("since") or 0), limit=int(args.get("limit") or 100),
-                    project_id=args.get("project_id"))]}
-            elif tool == "agent.spawn":
-                result = await self.spawn_agent(str(args.get("role") or "coder"),
-                                                args.get("project_id"), args.get("task_id"))
-            elif tool == "agent.kill":
-                result = {"ok": await self.kill_agent(str(args.get("agent_id") or ""))}
-            elif tool == "project.update":
-                result = self.projects.update(str(args.get("project_id") or ""),
-                                              dict(args.get("patch") or {})).to_dict()
-            elif tool == "project.archive":
-                result = await self.archive_project(
-                    str(args.get("project_id") or ""), by="agent-assistant")
-            elif tool == "project.delete":
-                target = self.projects.get(str(args.get("project_id") or ""))
-                result = await self.delete_project(
-                    target.id,
-                    purge_workspace=bool(args.get("purge_workspace", True)),
-                    confirm=target.name, by="agent-assistant")
-            else:  # pragma: no cover
-                return {"ok": False, "error": "unhandled tool"}
-        except SfoError as exc:
-            return {"ok": False, "error": f"{exc.code}: {exc.message}"}
-        if request.grant_id and request.mode == "grant":
-            self.approvals.use(request.grant_id)
-        return {"ok": True, "data": result}
+        """Compatibility alias for the operator tool entry point."""
+        return await self.operator_tool(tool, args)
 
     # ------------------------------------------------------------------
     # projections for the UI

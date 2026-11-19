@@ -29,6 +29,7 @@ from ..errors import SfoError
 from ..kernel import Context
 from ..util.jsonio import read_json, write_json
 from ..util.logging import get_logger
+from .operator import catalog_text
 
 MAX_HISTORY = 200
 
@@ -191,6 +192,8 @@ class ChatService:
             return self._status_text()
         if intent == "projects":
             return self._projects_text()
+        if intent == "approval_action":
+            return await self._do_approval_action(text)
         if intent == "approvals":
             return self._approvals_text()
         if intent == "help":
@@ -209,6 +212,9 @@ class ChatService:
             return "status"
         if re.search(r"(项目列表|有哪些项目|projects)", low):
             return "projects"
+        if re.search(r"(apr-[0-9a-f]+)", low) and re.search(
+                r"(拒绝|驳回|放行|批准|允许|deny|reject|approve|allow)", low):
+            return "approval_action"
         if re.search(r"(审批|权限|pending|approval)", low):
             return "approvals"
         if re.search(r"(帮助|能做什么|怎么用|help|介绍一下)", low):
@@ -297,6 +303,24 @@ class ChatService:
                          f"{card.get('status')} · {card.get('progress', 0)}%")
         return "\n".join(lines)
 
+    async def _do_approval_action(self, text: str) -> str:
+        match = re.search(r"(apr-[0-9a-z]+)", text, re.IGNORECASE)
+        if not match:
+            return "请给出要处理的审批 id（形如 `apr-xxxxxxxx`）。"
+        request_id = match.group(1)
+        low = text.lower()
+        decision = "deny" if re.search(r"(拒绝|驳回|deny|reject)", low) else "allow"
+        result = await self.app.operator_tool("approval.decide", {
+            "request_id": request_id,
+            "decision": decision,
+            "mode": "once",
+            "note": "由系统助手根据对话指令处理",
+        })
+        if result.get("ok"):
+            verb = "拒绝" if decision == "deny" else "放行"
+            return f"已{verb}审批 `{request_id}`。"
+        return f"处理失败：{result.get('error') or '未知错误'}"
+
     def _approvals_text(self) -> str:
         snap = self.app.snapshot()
         approvals = snap.get("approvals") or []
@@ -332,11 +356,13 @@ class ChatService:
         except Exception:
             snap = {}
         system = (
-            "你是 StackFlowOS 的系统助手，一个以操作系统口吻说话的执行型助手。"
-            "你能看到下方的实时系统状态。需要操作时只输出一个 JSON 对象："
-            '{"tool":"project.create","args":{"name":"...","goal":"..."}} 或 '
-            '{"tool":"agent.spawn","args":{"role":"coder","project_id":"p-1"}}；'
-            "不需要工具时直接用中文回答，简洁、具体，不要编造状态里没有的事实。"
+            "你是 StackFlowOS 的系统助手，也是操作员的代理，拥有系统管理权限。"
+            "用户通过对话下达指令；需要操作时只输出一个 JSON 对象："
+            '{"tool":"工具名","args":{...}}。不要请求审批、不要输出多个 JSON、'
+            "不要编造工具名。不需要操作时直接用中文回答，简洁、具体，"
+            "不要编造状态里没有的事实。若用户要求做某件事而你没有对应工具，"
+            "直接说明做不到，并给出最接近的可执行选项。\n\n"
+            + catalog_text()
         )
         context = json.dumps(snap, ensure_ascii=False)[:6000]
         messages = [
@@ -346,19 +372,47 @@ class ChatService:
         ]
         raw = await self.provider.chat(messages)
         action = _parse_action(raw)
-        if action and hasattr(self.app, "assistant_tool"):
-            result = await self.app.assistant_tool(action["tool"], action.get("args") or {})
-            if result.get("ok"):
-                return self._explain_tool_result(action["tool"], result.get("data") or {})
-            return f"这个操作被挡下了：{result.get('error')}"
+        if action:
+            runner = getattr(self.app, "operator_tool", None) or \
+                getattr(self.app, "assistant_tool", None)
+            if runner is not None:
+                result = await runner(action["tool"], action.get("args") or {})
+                if result.get("ok"):
+                    return self._explain_tool_result(
+                        action["tool"], result.get("data") or {})
+                if result.get("code") == "UNKNOWN_TOOL":
+                    return ("我这边没有这个操作工具。可以让我管理项目、任务、"
+                            "Agent、审批、规则和系统配置。")
+                return f"操作失败：{result.get('error') or '未知错误'}"
         return raw.strip() or self._fallback_text(text)
 
     def _explain_tool_result(self, tool: str, data: dict) -> str:
+        if tool in ("project.delete", "project.remove", "project.purge"):
+            return (f"项目 **{data.get('name') or data.get('deleted')}** 已永久删除"
+                    + ("，工作区已清空。" if data.get("workspace_purged") else "。"))
+        if tool == "project.archive":
+            project = data.get("project") or {}
+            return (f"项目 **{project.get('name') or project.get('id') or ''}** 已归档，"
+                    f"停止 {int(data.get('agents_stopped') or 0)} 个 Agent。")
+        if tool == "project.complete":
+            return f"项目 **{data.get('name') or data.get('id') or ''}** 已确认完成。"
         if tool == "project.create":
             return (f"项目 **{data.get('name')}** 已创建（`{data.get('id')}`），"
                     "主理人会开始拆解和派工。")
+        if tool in ("approval.decide", "approval.allow", "approval.approve",
+                    "approval.deny", "approval.reject"):
+            status = data.get("status") or "完成"
+            return f"审批 `{data.get('id') or ''}` 已处理（{status}）。"
         if tool == "agent.spawn":
             return f"已派工：`{data.get('id')}`（{data.get('role')}）。"
+        if tool in ("agent.kill", "unit.kill"):
+            return "已终止。"
+        if tool == "sys.status":
+            return data.get("summary") or "已刷新系统状态。"
+        if tool in ("config.set", "rule.create", "rule.delete", "rule.update"):
+            return "配置已更新（已热加载）。"
+        if tool in ("task.update", "task.note", "task.create"):
+            return f"任务 `{data.get('id') or ''}` 已更新。"
         return "操作完成。"
 
 

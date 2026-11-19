@@ -343,9 +343,9 @@ function updateSub() {
   const provider = config?.llm?.provider;
   if (provider === 'openai') {
     const model = config?.llm?.model || 'OpenAI 兼容';
-    els.sub.textContent = `系统助手 · ${model}`;
+    els.sub.textContent = `系统助手 · ${model} · 操作员`;
   } else if (provider === 'mock') {
-    els.sub.textContent = '系统助手 · 离线模型';
+    els.sub.textContent = '系统助手 · 离线规则 · 操作员';
   } else {
     els.sub.textContent = '系统助手 · 待命';
   }

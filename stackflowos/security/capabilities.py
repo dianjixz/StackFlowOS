@@ -60,6 +60,8 @@ CAPABILITIES: dict[str, CapabilityDef] = {
     "unit.control": CapabilityDef("unit.control", "high", "暂停/杀死单元",
                                   ("work_id",)),
     "sys.config": CapabilityDef("sys.config", "high", "改系统配置", ("section",)),
+    "approval.decide": CapabilityDef("approval.decide", "high",
+                                     "放行/拒绝审批", ("request_id",)),
     "data.read": CapabilityDef("data.read", "low", "读项目数据/事件",
                                ("project_id",)),
     "data.write": CapabilityDef("data.write", "medium", "写项目记忆",
