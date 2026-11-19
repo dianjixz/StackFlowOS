@@ -99,8 +99,8 @@ ROLES: dict[str, RoleDef] = {
         tools=(
             "task.create", "task.list", "task.update", "task.artifact",
             "task.note", "agent.spawn", "agent.kill", "agent.list",
-            "project.get", "project.update", "event.query", "memory.get",
-            "memory.set", "unit.list",
+            "project.get", "project.update", "project.archive",
+            "event.query", "memory.get", "memory.set", "unit.list",
         ),
         system_prompt=_LEAD_PROMPT,
         ephemeral=False,
@@ -183,6 +183,7 @@ ROLES: dict[str, RoleDef] = {
         tools=(
             "task.create", "task.list", "task.update", "task.note",
             "agent.spawn", "agent.list", "project.get", "project.update",
+            "project.archive", "project.delete",
             "event.query", "memory.get", "unit.list",
         ),
         system_prompt=_ASSISTANT_PROMPT,

@@ -22,7 +22,8 @@ from typing import Any, Callable
 from .agents import AgentSupervisor, ToolExecutor
 from .ai import make_provider
 from .config import Config
-from .errors import BadRequest, Conflict, Denied, NotFound, SfoError, Unavailable
+from .errors import (BadRequest, Conflict, Denied, NotFound, SfoError,
+                     Unavailable, ValidationError)
 from .kernel import Context
 from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler, UnitInfo, UnitRegistry
 from .projects import ProjectStore, plan_for
@@ -74,6 +75,7 @@ class App:
         self._rpc_cache: dict[str, tuple[float, dict]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._aggregator_task: asyncio.Task | None = None
+        self._maintenance_task: asyncio.Task | None = None
         self._stopped = False
         self._lock_fd: int | None = None
         self._assistant_executor: ToolExecutor | None = None
@@ -175,6 +177,7 @@ class App:
         await self.failure.start()
         self.unit_lease_ttl_s = max(30, int(cfg.agents.offline_after_s * 3))
         self._start_aggregation_loop(cfg.agents.aggregator_interval_s)
+        self._start_maintenance_loop()
 
         self.provider = make_provider(cfg.llm)
         self.chat = ChatService(
@@ -185,6 +188,7 @@ class App:
         )
         await self.chat.start()
 
+        self._cancel_orphan_approvals()
         self.eventlog.append("sys.booted", {
             "version": self.version,
             "transport": cfg.transport.mode,
@@ -243,6 +247,13 @@ class App:
             except (asyncio.CancelledError, Exception):
                 pass
             self._aggregator_task = None
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._maintenance_task = None
         for task in list(self._bg_tasks):
             task.cancel()
         if self._bg_tasks:
@@ -360,6 +371,7 @@ class App:
             "project.get": self._project_get,
             "project.update": self._project_update,
             "project.archive": self._project_archive,
+            "project.delete": self._project_delete,
             "task.create": self._task_create,
             "task.list": self._task_list,
             "task.get": self._task_get,
@@ -777,9 +789,16 @@ class App:
         return self.project_card(project.id)
 
     async def _project_archive(self, data, src):
-        project = self.projects.archive(str(data.get("project_id") or ""))
-        killed = await self.supervisor.kill_project(project.id, reason="project_archived")
-        return {"project": self.project_card(project.id), "agents_stopped": killed}
+        return await self.archive_project(str(data.get("project_id") or ""),
+                                          by=str(data.get("by") or src))
+
+    async def _project_delete(self, data, src):
+        return await self.delete_project(
+            str(data.get("project_id") or ""),
+            purge_workspace=bool(data.get("purge_workspace", True)),
+            confirm=data.get("confirm"),
+            by=str(data.get("by") or src),
+        )
 
     async def _task_create(self, data, src):
         task = self.projects.add_task(
@@ -892,8 +911,15 @@ class App:
         return agent.to_dict()
 
     async def _agent_kill(self, data, src):
-        ok = await self.supervisor.kill(str(data.get("agent_id") or ""),
+        agent_id = str(data.get("agent_id") or "")
+        try:
+            agent = self.supervisor.get(agent_id)
+        except Exception:
+            agent = None
+        ok = await self.supervisor.kill(agent_id,
                                         reason=str(data.get("reason") or "killed"))
+        if agent is not None:
+            self._cancel_agent_approvals(agent, "agent killed")
         return {"ok": ok}
 
     async def _agent_list(self, data, src):
@@ -929,6 +955,7 @@ class App:
             "status": "dead",
             "error": "unit offline",
         })
+        self._cancel_agent_approvals(agent, "agent offline")
         if agent.role == "lead" and agent.project_id:
             try:
                 self.projects.update(agent.project_id, {"degraded": True})
@@ -1025,10 +1052,219 @@ class App:
                 }, source="sys", project_id=project.id)
         return self.project_card(project.id)
 
-    async def archive_project(self, project_id: str) -> dict:
-        project = self.projects.archive(project_id)
+    async def archive_project(self, project_id: str, *, by: str = "human:operator") -> dict:
+        project = self.projects.get(project_id)
         killed = await self.supervisor.kill_project(project.id, reason="project_archived")
-        return {"project": self.project_card(project.id), "agents_stopped": killed}
+        stopped = await self._wait_agents_stopped(project.id, timeout=5.0)
+        canceled = self._cancel_project_approvals(project.id, "project archived")
+        leases = self._release_project_leases(project.id)
+        project = self.projects.archive(project.id)
+        self.eventlog.append("project.archive.completed", {
+            "project_id": project.id,
+            "by": by,
+            "agents_stopped": killed,
+            "agents_stopped_cleanly": stopped,
+            "approvals_canceled": canceled,
+            "leases_released": leases,
+        }, source="operator", project_id=project.id)
+        return {
+            "project": self.project_card(project.id),
+            "agents_stopped": killed,
+            "agents_stopped_cleanly": stopped,
+            "approvals_canceled": canceled,
+            "leases_released": leases,
+        }
+
+    async def delete_project(self, project_id: str, *, purge_workspace: bool = True,
+                             confirm: str | None = None,
+                             by: str = "human:operator") -> dict:
+        """Permanently remove a project after stopping its agents.
+
+        This is the destructive path: callers must pass ``confirm`` equal to
+        the project name (or id). The event log keeps the deletion record; the
+        project JSON record, its tasks and (optionally) the workspace are gone.
+        """
+        project = self.projects.get(project_id)
+        expected = {project.name, project.id}
+        if confirm is None or str(confirm).strip() not in expected:
+            raise BadRequest(
+                "project deletion requires confirm=<project name>",
+                detail={"project_id": project_id, "name": project.name})
+        task_count = len(self.projects.task_list(project_id=project_id))
+        killed = await self.supervisor.kill_project(project_id, reason="project_deleted")
+        stopped = await self._wait_agents_stopped(project_id, timeout=8.0)
+        canceled = self._cancel_project_approvals(project_id, "project deleted")
+        leases = self._release_project_leases(project_id)
+        record = self.projects.delete(project_id)
+        self.memory.data.pop(project_id, None)
+        try:
+            write_json(self.paths.state_dir / "state" / "memory.json", self.memory.data)
+        except Exception:
+            self.log.debug("memory cleanup failed", exc_info=True)
+        purged = False
+        purge_error: str | None = None
+        if purge_workspace:
+            try:
+                purged = self._purge_workspace(record)
+            except Exception as exc:
+                purge_error = str(exc)
+                self.log.exception("workspace purge failed for %s", project_id)
+                self.eventlog.append("project.purge.failed", {
+                    "project_id": project_id, "error": purge_error,
+                }, source="sys", project_id=project_id)
+        self.eventlog.append("project.delete.completed", {
+            "project_id": project_id,
+            "name": record.name,
+            "by": by,
+            "tasks_removed": task_count,
+            "agents_stopped": killed,
+            "agents_stopped_cleanly": stopped,
+            "approvals_canceled": canceled,
+            "leases_released": leases,
+            "workspace_purged": purged,
+            "purge_error": purge_error,
+        }, source="operator", project_id=project_id)
+        return {
+            "deleted": project_id,
+            "name": record.name,
+            "tasks_removed": task_count,
+            "agents_stopped": killed,
+            "agents_stopped_cleanly": stopped,
+            "approvals_canceled": canceled,
+            "leases_released": leases,
+            "workspace_purged": purged,
+            "purge_error": purge_error,
+        }
+
+    async def _wait_agents_stopped(self, project_id: str, *,
+                                   timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        terminal = ("done", "failed", "dead")
+        while time.monotonic() < deadline:
+            active_agents = [agent for agent in self.supervisor.list(project_id=project_id)
+                             if agent.status not in terminal]
+            # supervisor.kill marks the roster dead before the OS process
+            # actually exits; also wait for the unit to release its address.
+            active_units = [unit for unit in self.registry.list(project_id=project_id)
+                            if unit.status in ("online", "suspect")]
+            if not active_agents and not active_units:
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
+    def _cancel_orphan_approvals(self) -> int:
+        """On boot, deny pending approvals whose principal agent is gone."""
+        canceled = 0
+        for request in self.approvals.list(status="pending"):
+            principal = request.principal
+            if not principal.startswith("agent-"):
+                continue
+            try:
+                agent = self.supervisor.get(principal)
+            except Exception:
+                agent = None
+            if agent is not None and agent.status not in ("dead", "failed", "done"):
+                continue
+            try:
+                self.approvals.decide(request.id, decision="deny", by="system",
+                                      note="orphaned: agent is not active")
+                canceled += 1
+            except Exception:
+                self.log.debug("could not cancel orphan approval %s", request.id,
+                               exc_info=True)
+        if canceled:
+            self.log.info("canceled %d orphaned approval(s) on boot", canceled)
+        return canceled
+
+    def _cancel_agent_approvals(self, agent, reason: str) -> int:
+        """Deny approvals left behind by a dead agent so they stop hanging."""
+        canceled = 0
+        principals = {agent.id, agent.unit_id}
+        for request in self.approvals.list(status="pending"):
+            if request.principal not in principals:
+                continue
+            try:
+                self.approvals.decide(request.id, decision="deny", by="system",
+                                      note=reason)
+                canceled += 1
+            except Exception:
+                self.log.debug("could not cancel approval %s", request.id,
+                               exc_info=True)
+        return canceled
+
+    def _cancel_project_approvals(self, project_id: str, reason: str) -> int:
+        canceled = 0
+        for request in self.approvals.list(status="pending", project_id=project_id):
+            try:
+                self.approvals.decide(request.id, decision="deny", by="system",
+                                      note=reason)
+                canceled += 1
+            except Exception:
+                self.log.debug("could not cancel approval %s", request.id,
+                               exc_info=True)
+        return canceled
+
+    def _release_project_leases(self, project_id: str) -> int:
+        released = 0
+        prefix = f"project:{project_id}:"
+        for lease in list(self.leases.list(active_only=True)):
+            if not (lease.resource.startswith(prefix)
+                    or (lease.metadata or {}).get("project_id") == project_id):
+                continue
+            try:
+                self.leases.release(lease.id, holder=lease.holder,
+                                    reason="project_closed")
+                released += 1
+            except Exception:
+                self.log.debug("could not release lease %s", lease.id,
+                               exc_info=True)
+        for agent in self.supervisor.list(project_id=project_id):
+            for holder in (agent.id, agent.unit_id):
+                if not holder:
+                    continue
+                try:
+                    released += len(self.leases.release_holder(
+                        holder, reason="project_closed"))
+                except Exception:
+                    self.log.debug("could not release leases for %s", holder,
+                                   exc_info=True)
+        return released
+
+    def _purge_workspace(self, project) -> bool:
+        """Remove ``<projects_dir>/<project_id>`` after a containment check."""
+        projects_root = self.paths.projects_dir.resolve()
+        project_dir = (self.paths.projects_dir / project.id).resolve()
+        if project_dir == projects_root or project_dir.parent != projects_root:
+            raise ValidationError(
+                "refusing to purge outside the projects directory",
+                detail={"path": str(project_dir), "root": str(projects_root)})
+        if project_dir.name != project.id:
+            raise ValidationError("refusing to purge an unexpected path")
+        if not project_dir.exists():
+            return False
+        shutil.rmtree(project_dir)
+        return True
+
+    def _start_maintenance_loop(self) -> None:
+        """Expire approvals and leases even when nobody is polling them."""
+        async def loop() -> None:
+            while not self._stopped:
+                await asyncio.sleep(1.0)
+                if self._stopped:
+                    return
+                try:
+                    expired = self.approvals.sweep()
+                    if expired:
+                        self.log.info("%d approval(s) expired", len(expired))
+                except Exception:
+                    self.log.exception("approval sweep failed")
+                try:
+                    self.leases.sweep()
+                except Exception:
+                    self.log.exception("lease sweep failed")
+
+        self._maintenance_task = asyncio.create_task(loop(), name="maintenance-loop")
+
 
     async def complete_project(self, project_id: str, *, by: str = "human:operator") -> dict:
         project = self.projects.get(project_id)
@@ -1132,14 +1368,29 @@ class App:
                                            "role": args.get("role")}),
             "agent.kill": ("agent.kill", {"agent_id": args.get("agent_id")}),
             "project.update": ("project.update", {"project_id": args.get("project_id")}),
+            "project.archive": ("project.archive", {"project_id": args.get("project_id")}),
+            "project.delete": ("project.delete", {
+                "project_id": args.get("project_id"),
+                "purge_workspace": bool(args.get("purge_workspace", True)),
+            }),
         }
         if tool not in mapping:
             return {"ok": False, "error": f"assistant tool {tool!r} is not allowed"}
         capability, scope = mapping[tool]
+        preview = str(args)
+        if tool in ("project.delete", "project.archive"):
+            try:
+                target = self.projects.get(str(args.get("project_id") or ""))
+                action = "永久删除" if tool == "project.delete" else "归档"
+                preview = (f"{action}项目「{target.name}」({target.id})\n"
+                           f"工作区：{target.workspace}\n"
+                           f"任务数：{len(self.projects.task_list(project_id=target.id))}")
+            except SfoError:
+                pass
         request = self.approvals.request(
             "agent-assistant", capability, scope,
             reason=f"assistant tool: {tool}",
-            preview=str(args)[: self.config.security.max_preview_chars],
+            preview=preview[: self.config.security.max_preview_chars],
             project_id=args.get("project_id"),
         )
         if request.status == "pending":
@@ -1175,6 +1426,15 @@ class App:
             elif tool == "project.update":
                 result = self.projects.update(str(args.get("project_id") or ""),
                                               dict(args.get("patch") or {})).to_dict()
+            elif tool == "project.archive":
+                result = await self.archive_project(
+                    str(args.get("project_id") or ""), by="agent-assistant")
+            elif tool == "project.delete":
+                target = self.projects.get(str(args.get("project_id") or ""))
+                result = await self.delete_project(
+                    target.id,
+                    purge_workspace=bool(args.get("purge_workspace", True)),
+                    confirm=target.name, by="agent-assistant")
             else:  # pragma: no cover
                 return {"ok": False, "error": "unhandled tool"}
         except SfoError as exc:

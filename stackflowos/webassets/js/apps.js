@@ -530,6 +530,32 @@ function renderProjectDetail(project) {
     });
     actionRow.append(archiveBtn);
   }
+  const deleteBtn = el('button', { class: 'btn btn-danger btn-sm', type: 'button' },
+    icon('trash'), '删除项目');
+    deleteBtn.addEventListener('click', () => {
+      const typed = window.prompt(
+        `永久删除项目「${project.name}」会删除项目记录、任务和整个工作区，不可恢复。\n`
+        + '请输入项目名称确认：');
+      if (typed === null) return;
+      if (typed.trim() !== project.name) {
+        toast('名称不匹配，已取消删除', 'error');
+        return;
+      }
+      withBusy(deleteBtn, async () => {
+        try {
+          const result = await api.deleteProject(project.id, {
+            purgeWorkspace: true, confirm: typed.trim(),
+          });
+          toast(`项目已删除，停止 ${Number(result.agents_stopped) || 0} 个 Agent`
+            + (result.workspace_purged ? '，工作区已清空' : ''), 'success');
+          await loadState({ quiet: true });
+          openApp('projects');
+        } catch (error) {
+          toastError(error);
+        }
+      });
+    });
+  actionRow.append(deleteBtn);
   const refreshBtn = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' }, icon('refresh'), '刷新');
   refreshBtn.addEventListener('click', () => {
     withBusy(refreshBtn, async () => {

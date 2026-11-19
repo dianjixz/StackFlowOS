@@ -371,6 +371,30 @@ class ProjectStore:
         self._emit("project.archived", project.to_dict(), project_id=project.id)
         return project
 
+    def delete(self, project_id: str) -> Project:
+        """Permanently remove one project and every task belonging to it.
+
+        The event log is append-only: ``project.deleted`` records exactly what
+        disappeared. Workspace files are the caller's responsibility (the app
+        purges them after agents are stopped), so the store stays filesystem-
+        agnostic beyond its own JSON state.
+        """
+        project = self.get(project_id)
+        removed_tasks = [task_id for task_id, task in self._tasks.items()
+                         if task.project_id == project_id]
+        for task_id in removed_tasks:
+            self._tasks.pop(task_id, None)
+        self._projects.pop(project_id, None)
+        self.save()
+        self._emit("project.deleted", {
+            "id": project.id,
+            "name": project.name,
+            "status": project.status,
+            "workspace": project.workspace,
+            "tasks_removed": len(removed_tasks),
+        }, project_id=project.id)
+        return project
+
     def _require_mutable(self, project: Project) -> None:
         if project.status == ProjectStatus.ARCHIVED:
             raise ValidationError(

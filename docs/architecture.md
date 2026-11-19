@@ -162,7 +162,8 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
 | `project.list` | `{status?}` | `[Project]` |
 | `project.get` | `{project_id}` | `Project` |
 | `project.update` | `{project_id, patch}` | `Project` |
-| `project.archive` | `{project_id}` | `Project` |
+| `project.archive` | `{project_id}` | `{project, agents_stopped, approvals_canceled, leases_released}` |
+| `project.delete` | `{project_id, confirm, purge_workspace?}` | `{deleted, name, tasks_removed, agents_stopped, workspace_purged}` |
 | `task.create` | `{project_id, title, description?, role?, priority?, deps?, created_by?}` | `Task` |
 | `task.list` | `{project_id?, status?, assignee?}` | `[Task]` |
 | `task.get` | `{task_id}` | `Task` |
@@ -307,6 +308,9 @@ active/review/degraded 项目，若项目有任务且当前没有在跑的 aggre
 * 全局单调 `seq`；`since(seq)` 支持重放（UI 刷新/断线重连）。
 * 内存保留最近 5000 条；更早从文件回读。
 * `subscribe()` 返回 `asyncio.Queue`；慢消费者丢弃最旧记录，不阻塞写。
+* hub 每秒跑一次维护循环：`approvals.sweep()` 把过期 pending 置 `expired`（fail
+  closed），`leases.sweep()` 回收过期租约。Agent 死亡/被杀/项目归档时，其名下
+  pending 审批会被系统以 `deny` 关闭，避免“人走单还挂着”。
 * `EPHEMERAL_TYPES = ("chat.delta", "stream.chunk")` 不落盘、不占 seq 持久位置
   （仍递增 seq，只是不写文件；重启后 seq 从文件最大值继续）。
 
@@ -318,6 +322,7 @@ unit.allocated / unit.registered / unit.online / unit.suspect / unit.offline
 unit.released / unit.quarantined / unit.restarted / unit.paused / unit.resumed
 lease.acquired / lease.renewed / lease.released / lease.expired / lease.preempted
 project.created / project.updated / project.archived / project.progress / project.degraded / project.completed
+project.deleted / project.delete.completed / project.archive.completed / project.purge.failed
 task.created / task.updated / task.claimed / task.started / task.review
 task.completed / task.blocked / task.artifact / task.note
 agent.spawned / agent.registered / agent.working / agent.waiting / agent.finished
@@ -350,6 +355,8 @@ memory.updated / demo.seeded
 | `llm.chat` | low | model | 调模型 |
 | `project.create` | low | — | 建项目 |
 | `project.update` | medium | project_id | 改项目 |
+| `project.archive` | medium | project_id | 归档项目、停止其 Agent |
+| `project.delete` | high | project_id, purge_workspace | 永久删除项目记录与工作区 |
 | `task.manage` | low | project_id | 建/改任务 |
 | `agent.spawn` | medium | project_id, role | 拉起工人 |
 | `agent.kill` | high | agent_id | 杀掉工人 |
@@ -471,6 +478,11 @@ class Project:
 * 任务状态机：`todo → doing → review → done`；`doing/review → blocked`；
   `blocked → todo`；`review → todo`（打回）。非法迁移报 `ValidationError`。
 * `claim` 是原子操作：只有 `todo` 且无 assignee 才能被认领，否则 `CONFLICT`。
+* 归档：先停止该项目全部 Agent、取消其 pending 审批、释放项目租约，
+  再把状态置 `archived`；工作区保留。
+* 删除：`project.delete` 需要 `confirm` 等于项目名（或 id）；先停 Agent、取消审批、
+  释放租约，再从 store 删除项目及其任务；`purge_workspace=true` 时校验路径后
+  `rmtree(<projects_dir>/<id>)`。事件流保留 `project.deleted` 记录。
 * 持久化：`<state>/state/projects.json`（全量、原子替换）；
   ID 计数器在 `<state>/state/counters.json`。
 * 每次变更发事件；卡片投影 `project.card()` 由 app 拼上 agents 统计后返回。
@@ -641,7 +653,7 @@ tests/
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
-* 当前 `python3 -m unittest discover -s tests -t .` 为 242 个测试。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 248 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）

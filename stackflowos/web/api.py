@@ -73,6 +73,8 @@ class WebAPI:
         r("GET", r"/api/projects/([^/]+)", self.project_get)
         r("PATCH", r"/api/projects/([^/]+)", self.project_patch)
         r("POST", r"/api/projects/([^/]+)/archive", self.project_archive)
+        r("DELETE", r"/api/projects/([^/]+)", self.project_delete)
+        r("POST", r"/api/projects/([^/]+)/delete", self.project_delete)
         r("POST", r"/api/projects/([^/]+)/complete", self.project_complete)
         r("GET", r"/api/projects/([^/]+)/tasks", self.tasks_list)
         r("POST", r"/api/projects/([^/]+)/tasks", self.tasks_create)
@@ -174,7 +176,17 @@ class WebAPI:
         return _ok(self.app.project_card(project_id))
 
     async def project_archive(self, match, query, body):
-        return _ok(await self.app.archive_project(match.group(1)))
+        return _ok(await self.app.archive_project(match.group(1),
+                                                  by="human:operator"))
+
+    async def project_delete(self, match, query, body):
+        purge = body.get("purge_workspace", True)
+        if isinstance(purge, str):
+            purge = purge.lower() not in ("0", "false", "no")
+        confirm = body.get("confirm") or query.get("confirm")
+        return _ok(await self.app.delete_project(
+            match.group(1), purge_workspace=bool(purge), confirm=confirm,
+            by="human:operator"))
 
     async def project_complete(self, match, query, body):
         return _ok(await self.app.complete_project(match.group(1)))

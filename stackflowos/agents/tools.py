@@ -104,6 +104,11 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
           {"project_id": "string"}),
     _spec("project.update", "project.update", "更新项目字段（如 brief）",
           {"project_id": "string", "patch": "object"}, "medium"),
+    _spec("project.archive", "project.archive", "归档项目并停止其 Agent（保留工作区）",
+          {"project_id": "string"}, "medium"),
+    _spec("project.delete", "project.delete", "永久删除项目记录与工作区（不可恢复）",
+          {"project_id": "string", "purge_workspace": "boolean",
+           "confirm": "string"}, "high"),
     _spec("agent.spawn", "agent.spawn", "按角色拉起一个工人",
           {"role": "string", "project_id": "string", "task_id": "string",
            "reason": "string"}, "medium"),
@@ -511,6 +516,27 @@ class ToolExecutor:
             return ({**base_scope, "project_id": project_id},
                     "更新项目", preview)
 
+        if name == "project.archive":
+            project_id = _arg_optional_str(args, "project_id", self.project_id)
+            if not project_id:
+                raise ToolError("project_id is required")
+            return ({**base_scope, "project_id": project_id}, "归档项目",
+                    _truncate(f"归档项目 {project_id}（停止其 Agent，保留工作区）",
+                              limit))
+
+        if name == "project.delete":
+            project_id = _arg_optional_str(args, "project_id", self.project_id)
+            if not project_id:
+                raise ToolError("project_id is required")
+            purge = args.get("purge_workspace", True)
+            if not isinstance(purge, bool):
+                raise ToolError("argument 'purge_workspace' must be a boolean")
+            scope = {**base_scope, "project_id": project_id,
+                     "purge_workspace": purge}
+            preview = (f"永久删除项目 {project_id}"
+                       + ("（含工作区，不可恢复）" if purge else "（保留工作区）"))
+            return scope, "删除项目", _truncate(preview, limit)
+
         if name == "agent.spawn":
             role = _arg_str(args, "role", required=True)
             project_id = _arg_optional_str(args, "project_id", self.project_id)
@@ -591,6 +617,8 @@ class ToolExecutor:
             "task.list": self._task_list,
             "project.get": self._project_get,
             "project.update": self._project_update,
+            "project.archive": self._project_archive,
+            "project.delete": self._project_delete,
             "agent.spawn": self._agent_spawn,
             "agent.kill": self._agent_kill,
             "agent.list": self._agent_list,
@@ -844,6 +872,31 @@ class ToolExecutor:
         patch = _arg_dict(args, "patch")
         return await call_ok(self.sys, "project.update",
                              {"project_id": project_id, "patch": patch})
+
+    async def _project_archive(self, args: dict, scope: dict) -> dict:
+        project_id = _arg_optional_str(args, "project_id", self.project_id)
+        if not project_id:
+            raise ToolError("project_id is required")
+        return await call_ok(self.sys, "project.archive",
+                             {"project_id": project_id})
+
+    async def _project_delete(self, args: dict, scope: dict) -> dict:
+        project_id = _arg_optional_str(args, "project_id", self.project_id)
+        if not project_id:
+            raise ToolError("project_id is required")
+        confirm = _arg_optional_str(args, "confirm")
+        if not confirm:
+            project = await call_ok(self.sys, "project.get",
+                                    {"project_id": project_id})
+            confirm = str(project.get("name") or project_id)
+        purge = args.get("purge_workspace", True)
+        if not isinstance(purge, bool):
+            raise ToolError("argument 'purge_workspace' must be a boolean")
+        return await call_ok(self.sys, "project.delete", {
+            "project_id": project_id,
+            "purge_workspace": purge,
+            "confirm": confirm,
+        })
 
     async def _agent_spawn(self, args: dict, scope: dict) -> dict:
         role = _arg_str(args, "role", required=True)

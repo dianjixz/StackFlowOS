@@ -90,6 +90,11 @@ export const api = {
   getProject: (id) => requestJson(`/api/projects/${enc(id)}`),
   patchProject: (id, patch) => requestJson(`/api/projects/${enc(id)}`, { method: 'PATCH', body: { patch } }),
   archiveProject: (id) => requestJson(`/api/projects/${enc(id)}/archive`, { method: 'POST', body: {} }),
+  deleteProject: (id, { purgeWorkspace = true, confirm = '' } = {}) =>
+    requestJson(`/api/projects/${enc(id)}`, {
+      method: 'DELETE',
+      body: { purge_workspace: purgeWorkspace, confirm },
+    }),
   completeProject: (id) => requestJson(`/api/projects/${enc(id)}/complete`, { method: 'POST', body: {} }),
   getTasks: (projectId) => requestJson(`/api/projects/${enc(projectId)}/tasks`),
   createTask: (projectId, task) => requestJson(`/api/projects/${enc(projectId)}/tasks`, { method: 'POST', body: task }),
