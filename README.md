@@ -15,7 +15,8 @@
   改配置、归档/删除项目），每次动作写入 `operator.action` 审计；工人仍受审批约束
 
 > 设计与判断的完整推导见 [docs/vision.md](docs/vision.md)，
-> 实现契约见 [docs/architecture.md](docs/architecture.md)。
+> 实现契约见 [docs/architecture.md](docs/architecture.md)，
+> 自举/自改进操作手册见 [docs/self-hosting.md](docs/self-hosting.md)。
 
 ---
 
