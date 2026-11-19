@@ -87,9 +87,14 @@ export const api = {
   /* ---- projects & tasks ---- */
   getProjects: () => requestJson('/api/projects'),
   createProject: (name, goal) => requestJson('/api/projects', { method: 'POST', body: { name, goal } }),
+  attachProject: (payload) => requestJson('/api/projects/attach', { method: 'POST', body: payload }),
   getProject: (id) => requestJson(`/api/projects/${enc(id)}`),
   patchProject: (id, patch) => requestJson(`/api/projects/${enc(id)}`, { method: 'PATCH', body: { patch } }),
   archiveProject: (id) => requestJson(`/api/projects/${enc(id)}/archive`, { method: 'POST', body: {} }),
+  setProjectAccess: (id, allowWrites) =>
+    requestJson(`/api/projects/${enc(id)}/access`, {
+      method: 'POST', body: { allow_writes: Boolean(allowWrites) },
+    }),
   deleteProject: (id, { purgeWorkspace = true, confirm = '' } = {}) =>
     requestJson(`/api/projects/${enc(id)}`, {
       method: 'DELETE',

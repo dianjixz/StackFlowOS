@@ -1054,6 +1054,79 @@ class App:
                 }, source="sys", project_id=project.id)
         return self.project_card(project.id)
 
+    async def attach_project(self, name: str, path: str, *, goal: str = "",
+                             allow_writes: bool = False,
+                             created_by: str = "human:operator") -> dict:
+        """Attach an existing local directory as a project.
+
+        The directory is never created, copied or deleted by the system. Agents
+        are read-only unless ``allow_writes`` is explicitly true; even then
+        they must still pass normal capability approvals.
+        """
+        target = self._validate_attach_path(path)
+        for existing in self.projects.list():
+            try:
+                same = Path(existing.workspace).resolve() == target
+            except (OSError, RuntimeError):
+                same = False
+            if same and existing.status != "archived":
+                card = self.project_card(existing.id)
+                card["attached_now"] = False
+                card["existing"] = True
+                return card
+        mode = "attached-rw" if allow_writes else "attached-ro"
+        project = self.projects.create(
+            name or target.name, goal, created_by=created_by,
+            workspace=target, workspace_mode=mode)
+        self.eventlog.append("project.attach.completed", {
+            "project_id": project.id,
+            "name": project.name,
+            "path": project.workspace,
+            "workspace_mode": mode,
+            "by": created_by,
+        }, source="operator", project_id=project.id)
+        card = self.project_card(project.id)
+        card["attached_now"] = True
+        card["existing"] = False
+        return card
+
+    async def set_project_access(self, project_id: str, *, allow_writes: bool,
+                                 by: str = "human:operator") -> dict:
+        mode = "attached-rw" if allow_writes else "attached-ro"
+        project = self.projects.set_workspace_mode(project_id, mode)
+        self.eventlog.append("project.access.changed", {
+            "project_id": project.id,
+            "workspace_mode": mode,
+            "by": by,
+        }, source="operator", project_id=project.id)
+        return self.project_card(project.id)
+
+    def _validate_attach_path(self, path: str) -> Path:
+        raw = str(path or "").strip()
+        if not raw:
+            raise BadRequest("path required")
+        target = Path(raw).expanduser()
+        try:
+            target = target.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise BadRequest(f"invalid path: {exc}") from exc
+        if not target.exists():
+            raise ValidationError(f"目录不存在：{target}")
+        if not target.is_dir():
+            raise ValidationError(f"不是目录：{target}")
+        if target == Path(target.anchor):
+            raise ValidationError("refusing to attach the filesystem root")
+        state = self.paths.state_dir.resolve()
+        if target == state or state in target.parents:
+            raise ValidationError("refusing to attach the StackFlowOS state directory")
+        denied = ("/etc", "/root", "/proc", "/sys", "/dev", "/boot",
+                  "/bin", "/sbin", "/lib", "/lib64", "/usr")
+        for prefix in denied:
+            denied_path = Path(prefix)
+            if target == denied_path or denied_path in target.parents:
+                raise ValidationError(f"refusing to attach system directory: {prefix}")
+        return target
+
     async def archive_project(self, project_id: str, *, by: str = "human:operator") -> dict:
         project = self.projects.get(project_id)
         killed = await self.supervisor.kill_project(project.id, reason="project_archived")
@@ -1105,7 +1178,10 @@ class App:
             self.log.debug("memory cleanup failed", exc_info=True)
         purged = False
         purge_error: str | None = None
-        if purge_workspace:
+        external_preserved = bool(record.external)
+        if purge_workspace and external_preserved:
+            purge_error = "external workspace is never deleted"
+        elif purge_workspace:
             try:
                 purged = self._purge_workspace(record)
             except Exception as exc:
@@ -1124,6 +1200,7 @@ class App:
             "approvals_canceled": canceled,
             "leases_released": leases,
             "workspace_purged": purged,
+            "external_workspace_preserved": external_preserved,
             "purge_error": purge_error,
         }, source="operator", project_id=project_id)
         return {
@@ -1135,6 +1212,7 @@ class App:
             "approvals_canceled": canceled,
             "leases_released": leases,
             "workspace_purged": purged,
+            "external_workspace_preserved": external_preserved,
             "purge_error": purge_error,
         }
 
@@ -1234,6 +1312,8 @@ class App:
 
     def _purge_workspace(self, project) -> bool:
         """Remove ``<projects_dir>/<project_id>`` after a containment check."""
+        if getattr(project, "external", False):
+            raise ValidationError("refusing to purge an attached external workspace")
         projects_root = self.paths.projects_dir.resolve()
         project_dir = (self.paths.projects_dir / project.id).resolve()
         if project_dir == projects_root or project_dir.parent != projects_root:

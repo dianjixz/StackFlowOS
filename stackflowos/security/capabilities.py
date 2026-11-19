@@ -47,6 +47,8 @@ CAPABILITIES: dict[str, CapabilityDef] = {
     "project.create": CapabilityDef("project.create", "low", "建项目", ()),
     "project.update": CapabilityDef("project.update", "medium", "改项目",
                                     ("project_id",)),
+    "project.attach": CapabilityDef("project.attach", "high",
+                                    "接入已有本地目录作为项目", ("path",)),
     "project.archive": CapabilityDef("project.archive", "medium",
                                      "归档项目并停止其 Agent", ("project_id",)),
     "project.delete": CapabilityDef("project.delete", "high",

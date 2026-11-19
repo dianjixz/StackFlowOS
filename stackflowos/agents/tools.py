@@ -214,10 +214,14 @@ class ToolExecutor:
 
     def __init__(self, sys: Any, *, agent: Any, workspace: Path,
                  security_config: Any, logger: Any = None,
-                 event_source: str | None = None) -> None:
+                 event_source: str | None = None,
+                 read_only: bool = False,
+                 deny_paths: list[Path] | None = None) -> None:
         self.sys = sys
         self.agent = agent
         self.workspace = Path(workspace).resolve()
+        self.read_only = bool(read_only)
+        self.deny_paths = [Path(item).resolve() for item in (deny_paths or [])]
         self.config = security_config
         self.log = logger or get_logger("agents.tools")
         self.source = event_source or str(getattr(agent, "id", "agent"))
@@ -260,6 +264,9 @@ class ToolExecutor:
             resolved.relative_to(self.workspace)
         except ValueError:
             raise ToolError(f"path escapes workspace: {raw!r}") from None
+        for denied in self.deny_paths:
+            if resolved == denied or denied in resolved.parents:
+                raise ToolError(f"path is not readable: {raw!r}")
         if must_exist and not resolved.exists():
             raise ToolError(f"path does not exist: {raw!r}")
         return resolved
@@ -411,6 +418,10 @@ class ToolExecutor:
     # -- scope / reason / preview (runs before any RPC) -------------------
     def _prepare(self, name: str, args: dict) -> tuple[dict, str, str]:
         limit = self.max_preview
+        if self.read_only and name in ("fs.write", "fs.delete", "shell.exec"):
+            raise ToolError(
+                "project workspace is attached read-only (attached-ro); "
+                "writing files or executing commands is disabled")
         base_scope: dict[str, Any] = {}
         if self.project_id is not None:
             base_scope["project_id"] = self.project_id

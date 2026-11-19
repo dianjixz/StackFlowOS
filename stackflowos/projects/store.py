@@ -28,6 +28,7 @@ from ..kernel.context import Context
 from ..util.jsonio import now_ms, read_json, write_json
 from ..util.logging import get_logger
 from .models import (
+    WorkspaceMode,
     Milestone,
     Project,
     ProjectStatus,
@@ -245,15 +246,40 @@ class ProjectStore:
         tags: list[str] | None = None,
         color: str | None = None,
         milestones: Any = None,
+        workspace: str | Path | None = None,
+        workspace_mode: str | None = None,
     ) -> Project:
-        """Create an active project, its workspace dir and its milestones."""
+        """Create an active project.
+
+        Without ``workspace`` the store creates a managed workspace under
+        ``<workspace_root>/<project_id>/workspace``. With ``workspace`` the
+        project *attaches* an existing directory and never creates/deletes it;
+        ``workspace_mode`` is then ``attached-ro`` (default) or ``attached-rw``.
+        """
         clean_name = (name or "").strip()
         if not clean_name:
             raise ValidationError("project name is required")
         now = now_ms()
         project_id = self._next_id("project")
-        workspace = (self.workspace_root / project_id / "workspace").resolve()
-        workspace.mkdir(parents=True, exist_ok=True)
+        if workspace is not None:
+            target = Path(str(workspace)).expanduser().resolve()
+            if not target.exists():
+                raise ValidationError(f"workspace does not exist: {target}")
+            if not target.is_dir():
+                raise ValidationError(f"workspace is not a directory: {target}")
+            mode = str(workspace_mode or WorkspaceMode.ATTACHED_RO)
+            if mode not in (WorkspaceMode.ATTACHED_RO, WorkspaceMode.ATTACHED_RW):
+                raise ValidationError(
+                    f"attached projects use attached-ro/attached-rw, got {mode!r}")
+            external = True
+            workspace_path = target
+        else:
+            if workspace_mode not in (None, WorkspaceMode.MANAGED):
+                raise ValidationError("managed projects cannot set an attached mode")
+            mode = WorkspaceMode.MANAGED
+            external = False
+            workspace_path = (self.workspace_root / project_id / "workspace").resolve()
+            workspace_path.mkdir(parents=True, exist_ok=True)
         project = Project(
             id=project_id,
             name=clean_name,
@@ -264,13 +290,21 @@ class ProjectStore:
             updated_at=now,
             tags=_as_str_list(tags),
             color=color or "#7c5cff",
-            workspace=str(workspace),
+            workspace=str(workspace_path),
+            workspace_mode=mode,
+            external=external,
         )
         for spec in milestones or []:
             project.milestones.append(self._new_milestone(project.id, spec, now))
         self._projects[project.id] = project
         self.save()
         self._emit("project.created", project.to_dict(), project_id=project.id)
+        if external:
+            self._emit("project.attached", {
+                "project_id": project.id,
+                "path": project.workspace,
+                "workspace_mode": project.workspace_mode,
+            }, project_id=project.id)
         return project
 
     def _new_milestone(self, project_id: str, spec: Any, now: int) -> Milestone:
@@ -371,6 +405,23 @@ class ProjectStore:
         self._emit("project.archived", project.to_dict(), project_id=project.id)
         return project
 
+    def set_workspace_mode(self, project_id: str, mode: str) -> Project:
+        """Switch an attached project between read-only and writable."""
+        project = self.get(project_id)
+        if not project.external:
+            raise ValidationError("workspace mode only applies to attached projects")
+        if mode not in (WorkspaceMode.ATTACHED_RO, WorkspaceMode.ATTACHED_RW):
+            raise ValidationError(
+                f"attached projects use attached-ro/attached-rw, got {mode!r}")
+        project.workspace_mode = mode
+        project.updated_at = now_ms()
+        self.save()
+        self._emit("project.access.updated", {
+            "project_id": project.id,
+            "workspace_mode": mode,
+        }, project_id=project.id)
+        return project
+
     def delete(self, project_id: str) -> Project:
         """Permanently remove one project and every task belonging to it.
 
@@ -391,6 +442,8 @@ class ProjectStore:
             "name": project.name,
             "status": project.status,
             "workspace": project.workspace,
+            "workspace_mode": project.workspace_mode,
+            "external": project.external,
             "tasks_removed": len(removed_tasks),
         }, project_id=project.id)
         return project
@@ -726,6 +779,8 @@ class ProjectStore:
             "updated_at": project.updated_at,
             "brief": project.brief,
             "workspace": project.workspace,
+            "workspace_mode": project.workspace_mode,
+            "external": project.external,
             "tags": list(project.tags),
             "color": project.color,
             "degraded": project.degraded,

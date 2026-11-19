@@ -70,9 +70,12 @@ class WebAPI:
 
         r("GET", r"/api/projects", self.projects_list)
         r("POST", r"/api/projects", self.projects_create)
+        r("POST", r"/api/projects/attach", self.projects_attach)
+        r("POST", r"/api/projects/open", self.projects_attach)
         r("GET", r"/api/projects/([^/]+)", self.project_get)
         r("PATCH", r"/api/projects/([^/]+)", self.project_patch)
         r("POST", r"/api/projects/([^/]+)/archive", self.project_archive)
+        r("POST", r"/api/projects/([^/]+)/access", self.project_access)
         r("DELETE", r"/api/projects/([^/]+)", self.project_delete)
         r("POST", r"/api/projects/([^/]+)/delete", self.project_delete)
         r("POST", r"/api/projects/([^/]+)/complete", self.project_complete)
@@ -162,6 +165,17 @@ class WebAPI:
                                              created_by="human:operator")
         return _ok(card, 201)
 
+    async def projects_attach(self, match, query, body):
+        path = str(body.get("path") or "").strip()
+        if not path:
+            raise BadRequest("path required")
+        card = await self.app.attach_project(
+            str(body.get("name") or ""), path,
+            goal=str(body.get("goal") or ""),
+            allow_writes=bool(body.get("allow_writes", False)),
+            created_by="human:operator")
+        return _ok(card, 201 if card.get("attached_now") else 200)
+
     async def project_get(self, match, query, body):
         return _ok(self.app.project_card(match.group(1)))
 
@@ -174,6 +188,11 @@ class WebAPI:
             return _ok(await self.app.complete_project(project_id))
         self.app.projects.update(project_id, patch)
         return _ok(self.app.project_card(project_id))
+
+    async def project_access(self, match, query, body):
+        allow = body.get("allow_writes", False)
+        return _ok(await self.app.set_project_access(
+            match.group(1), allow_writes=bool(allow), by="human:operator"))
 
     async def project_archive(self, match, query, body):
         return _ok(await self.app.archive_project(match.group(1),

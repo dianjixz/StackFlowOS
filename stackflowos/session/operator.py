@@ -40,8 +40,17 @@ OPERATOR_TOOLS: dict[str, OperatorTool] = {
     "project.get": OperatorTool(
         "project.get", "data.read", "读取一个项目", {"project_id": "string"}),
     "project.create": OperatorTool(
-        "project.create", "project.create", "创建项目",
+        "project.create", "project.create", "创建项目（系统分配工作区）",
         {"name": "string", "goal": "string"}),
+    "project.attach": OperatorTool(
+        "project.attach", "project.attach",
+        "接入已存在的本地目录作为项目（默认只读，不复制/删除该目录）",
+        {"name": "string?", "path": "string", "goal": "string?",
+         "allow_writes": "boolean?"}),
+    "project.access": OperatorTool(
+        "project.access", "project.attach",
+        "切换接入目录的读写模式（只读/可写）",
+        {"project_id": "string", "allow_writes": "boolean"}),
     "project.update": OperatorTool(
         "project.update", "project.update", "更新项目字段",
         {"project_id": "string", "patch": "object"}),
@@ -139,6 +148,12 @@ ALIASES: dict[str, str] = {
     "approval.accept": "approval.decide",
     "approval.deny": "approval.decide",
     "approval.reject": "approval.decide",
+    "project.open": "project.attach",
+    "project.set_mode": "project.access",
+    "project.set_access": "project.access",
+    "project.allow_writes": "project.access",
+    "project.import": "project.attach",
+    "project.add": "project.attach",
     "project.remove": "project.delete",
     "project.purge": "project.delete",
     "agent.stop": "agent.kill",
@@ -299,6 +314,13 @@ class OperatorTools:
         return await self.app.create_project(name, goal or name,
                                              created_by="agent-assistant")
 
+    async def _project_attach(self, args: dict) -> dict:
+        return await self.app.attach_project(
+            str(args.get("name") or ""), str(args.get("path") or ""),
+            goal=str(args.get("goal") or ""),
+            allow_writes=bool(args.get("allow_writes", False)),
+            created_by="agent-assistant")
+
     async def _project_update(self, args: dict) -> dict:
         project_id = str(args.get("project_id") or "")
         patch = args.get("patch")
@@ -306,6 +328,12 @@ class OperatorTools:
             raise BadRequest("project.update requires patch object")
         project = self.app.projects.update(project_id, patch)
         return self.app.project_card(project.id)
+
+    async def _project_access(self, args: dict) -> dict:
+        allow = bool(args.get("allow_writes", False))
+        return await self.app.set_project_access(
+            str(args.get("project_id") or ""), allow_writes=allow,
+            by="agent-assistant")
 
     async def _project_archive(self, args: dict) -> dict:
         return await self.app.archive_project(
@@ -344,12 +372,32 @@ class OperatorTools:
                 stat = item.stat()
             except OSError:
                 continue
+            if self._denied_path(item.resolve()):
+                continue
             entries.append({
                 "name": item.name,
                 "type": "file" if item.is_file() else "dir",
                 "size": stat.st_size if item.is_file() else None,
             })
         return {"path": relative, "entries": entries[:500]}
+
+    def _denied_path(self, target) -> bool:
+        from pathlib import Path
+
+        state = Path(self.app.paths.state_dir).resolve()
+        target = Path(target).resolve()
+        if target == state:
+            return True
+        if state in target.parents:
+            # Managed workspaces live under <state>/projects and must stay
+            # readable; everything else inside the state dir is private.
+            projects = (state / "projects").resolve()
+            return not (target == projects or projects in target.parents)
+        for name in ("config.json", "events", "logs", "run", "tmp", "state"):
+            denied = (state / name).resolve()
+            if target == denied or denied in target.parents:
+                return True
+        return False
 
     async def _project_read(self, args: dict) -> dict:
         from pathlib import Path
@@ -364,6 +412,8 @@ class OperatorTools:
             raise BadRequest("path escapes project workspace")
         if not target.is_file():
             raise BadRequest(f"not a file: {relative}")
+        if self._denied_path(target):
+            raise BadRequest("path is not readable (StackFlowOS state)")
         limit = min(int(args.get("max_bytes") or 200_000), 2_000_000)
         raw = target.read_bytes()[:limit]
         return {"path": relative, "content": raw.decode("utf-8", "replace"),

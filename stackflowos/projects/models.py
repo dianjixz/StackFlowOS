@@ -32,6 +32,16 @@ class TaskStatus:
     ALL: tuple[str, ...] = (TODO, DOING, REVIEW, DONE, BLOCKED)
 
 
+class WorkspaceMode:
+    """How a project's workspace is owned."""
+
+    MANAGED = "managed"            # created by StackFlowOS under projects/<id>
+    ATTACHED_RO = "attached-ro"    # existing directory, agents may only read
+    ATTACHED_RW = "attached-rw"    # existing directory, agents may write
+
+    ALL: tuple[str, ...] = (MANAGED, ATTACHED_RO, ATTACHED_RW)
+
+
 class ProjectStatus:
     """Constant set of project statuses."""
 
@@ -245,6 +255,8 @@ class Project:
     milestones: list[Milestone] = field(default_factory=list)
     brief: str = ""
     workspace: str = ""
+    workspace_mode: str = WorkspaceMode.MANAGED
+    external: bool = False
     degraded: bool = False
     archived_at: int | None = None
 
@@ -267,6 +279,8 @@ class Project:
             "milestones": [milestone.to_dict() for milestone in self.milestones],
             "brief": self.brief,
             "workspace": self.workspace,
+            "workspace_mode": self.workspace_mode,
+            "external": self.external,
             "degraded": self.degraded,
             "archived_at": self.archived_at,
         }
@@ -292,6 +306,8 @@ class Project:
             milestones=milestones,
             brief=str(data.get("brief", "")),
             workspace=str(data.get("workspace", "")),
+            workspace_mode=str(data.get("workspace_mode") or WorkspaceMode.MANAGED),
+            external=bool(data.get("external", False)),
             degraded=bool(data.get("degraded", False)),
             archived_at=data.get("archived_at"),
         )
@@ -304,6 +320,7 @@ __all__ = [
     "ProjectStatus",
     "TASK_PROGRESS_WEIGHTS",
     "Task",
+    "WorkspaceMode",
     "TaskStatus",
     "progress_for",
     "validate_task_transition",

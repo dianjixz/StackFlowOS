@@ -163,7 +163,9 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
 | `project.get` | `{project_id}` | `Project` |
 | `project.update` | `{project_id, patch}` | `Project` |
 | `project.archive` | `{project_id}` | `{project, agents_stopped, approvals_canceled, leases_released}` |
-| `project.delete` | `{project_id, confirm, purge_workspace?}` | `{deleted, name, tasks_removed, agents_stopped, workspace_purged}` |
+| `project.delete` | `{project_id, confirm, purge_workspace?}` | `{deleted, name, tasks_removed, agents_stopped, workspace_purged, external_workspace_preserved}` |
+| `project.attach` | `{name?, path, goal?, allow_writes?}` (HTTP/operator) | `CARD`（含 `external/workspace_mode/attached_now`） |
+| `project.access` | `{project_id, allow_writes}` (HTTP/operator) | `CARD`（workspace_mode 已切换） |
 | `task.create` | `{project_id, title, description?, role?, priority?, deps?, created_by?}` | `Task` |
 | `task.list` | `{project_id?, status?, assignee?}` | `[Task]` |
 | `task.get` | `{task_id}` | `Task` |
@@ -354,7 +356,9 @@ memory.updated / demo.seeded
 | `shell.exec` | high | cwd, command | 执行命令（危险模式升 high） |
 | `net.fetch` | medium | url | 出站 HTTP |
 | `llm.chat` | low | model | 调模型 |
-| `project.create` | low | — | 建项目 |
+| `project.create` | low | — | 建项目（系统工作区） |
+| `project.attach` | high | path | 接入已有本地目录（默认只读） |
+| `project.access` | high | path | 切换接入目录的只读/可写模式 |
 | `project.update` | medium | project_id | 改项目 |
 | `project.archive` | medium | project_id | 归档项目、停止其 Agent |
 | `project.delete` | high | project_id, purge_workspace | 永久删除项目记录与工作区 |
@@ -488,6 +492,8 @@ class Project:
     milestones: list[dict]
     brief: str             # 汇总 Agent 写的进展简述
     workspace: str         # 绝对路径
+    workspace_mode: str    # managed | attached-ro | attached-rw
+    external: bool         # True 表示工作区是接入的已有目录
     degraded: bool
 ```
 
@@ -496,11 +502,17 @@ class Project:
 * 任务状态机：`todo → doing → review → done`；`doing/review → blocked`；
   `blocked → todo`；`review → todo`（打回）。非法迁移报 `ValidationError`。
 * `claim` 是原子操作：只有 `todo` 且无 assignee 才能被认领，否则 `CONFLICT`。
+* 系统工作区：`<state>/projects/<p-id>/workspace`，由系统创建。
+* 接入已有目录：`project.attach`/`POST /api/projects/attach`，目录不由系统创建；
+  默认 `attached-ro`（Agent 只能读/列，`fs.write/fs.delete/shell.exec` 在 worker
+  侧直接拒绝），显式 `allow_writes=true` 才是 `attached-rw`。同一路径重复接入会
+  返回已有项目。归档/删除只删项目记录，**绝不删除外部目录**。
 * 归档：先停止该项目全部 Agent、取消其 pending 审批、释放项目租约，
   再把状态置 `archived`；工作区保留。
 * 删除：`project.delete` 需要 `confirm` 等于项目名（或 id）；先停 Agent、取消审批、
-  释放租约，再从 store 删除项目及其任务；`purge_workspace=true` 时校验路径后
-  `rmtree(<projects_dir>/<id>)`。事件流保留 `project.deleted` 记录。
+  释放租约，再从 store 删除项目及其任务；仅对系统工作区执行
+  `rmtree(<projects_dir>/<id>)`（路径校验）。外部目录永远保留，结果里
+  `external_workspace_preserved=true`。事件流保留 `project.deleted` 记录。
 * 持久化：`<state>/state/projects.json`（全量、原子替换）；
   ID 计数器在 `<state>/state/counters.json`。
 * 每次变更发事件；卡片投影 `project.card()` 由 app 拼上 agents 统计后返回。
@@ -671,7 +683,7 @@ tests/
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
-* 当前 `python3 -m unittest discover -s tests -t .` 为 256 个测试。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 263 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）

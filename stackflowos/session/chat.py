@@ -186,6 +186,10 @@ class ChatService:
     # -- composition ------------------------------------------------------
     async def _compose(self, text: str) -> str:
         intent = self._detect_intent(text)
+        if intent == "project_access":
+            return await self._do_project_access(text)
+        if intent == "attach_project":
+            return await self._do_attach_project(text)
         if intent == "create_project":
             return await self._do_create_project(text)
         if intent == "status":
@@ -204,6 +208,18 @@ class ChatService:
 
     def _detect_intent(self, text: str) -> str:
         low = text.lower()
+        if re.search(r"(打开|接入|导入|挂载|open|attach|import)", low) and re.search(
+                r"(?:~|/)[A-Za-z0-9._~+/@%-]{2,}", text):
+            return "attach_project"
+        if re.search(r"(允许写|可写|读写|只读|read[- ]?only|read[- ]?write|"
+                     r"write access)", low) and re.search(
+                r"(项目|project|p-[0-9]+)", low):
+            return "project_access"
+        if re.search(r"(允许写|可写|读写|只读|read[- ]?only|read[- ]?write|"
+                     r"write access)", low):
+            for project in self.app.projects.list():
+                if project.name and project.name.lower() in low:
+                    return "project_access"
         if re.search(r"(创建|新建|开一个|开个|建一个|立项|做一?个|build|create)\s*"
                      r"(一个|个|新的)?\s*(项目)?", low) and re.search(
                          r"(项目|游戏|工具|网站|系统|应用|服务|脚本|报告|调研)", low):
@@ -220,6 +236,56 @@ class ChatService:
         if re.search(r"(帮助|能做什么|怎么用|help|介绍一下)", low):
             return "help"
         return "chat"
+
+    async def _do_project_access(self, text: str) -> str:
+        low = text.lower()
+        target = None
+        match = re.search(r"(p-[0-9]+)", text)
+        if match:
+            project_id = match.group(1)
+            try:
+                target = self.app.projects.get(project_id)
+            except SfoError:
+                target = None
+        if target is None:
+            for project in self.app.projects.list():
+                if project.name and project.name.lower() in low:
+                    target = project
+                    break
+        if target is None:
+            return "请指明要修改读写模式的项目（项目 id 或名称）。"
+        if not target.external:
+            return f"项目 {target.id} 不是接入的外部目录，读写模式固定。"
+        allow = bool(re.search(r"(允许写|可写|读写|read[- ]?write|write access)",
+                               low)) and not re.search(r"(只读|read[- ]?only)", low)
+        result = await self.app.operator_tool("project.access", {
+            "project_id": target.id, "allow_writes": allow,
+        })
+        if not result.get("ok"):
+            return f"切换失败：{result.get('error') or '未知错误'}"
+        return (f"项目 **{target.name}** 已切换为"
+                f"{'可写' if allow else '只读'}。")
+
+    async def _do_attach_project(self, text: str) -> str:
+        match = re.search(r"((?:~|/)[A-Za-z0-9._~+/@%-]+)", text)
+        if not match:
+            return "请给出要接入的本地目录绝对路径（例如 /home/you/project）。"
+        path = match.group(1).rstrip("，。；;、)")
+        allow_writes = bool(re.search(
+            r"(可写|读写|允许写|read[- ]?write|\brw\b|\bwrite\b)", text, re.I))
+        result = await self.app.operator_tool("project.attach", {
+            "path": path,
+            "allow_writes": allow_writes,
+        })
+        if not result.get("ok"):
+            return f"接入失败：{result.get('error') or '未知错误'}"
+        data = result.get("data") or {}
+        mode = ("可写" if data.get("workspace_mode") == "attached-rw" else "只读")
+        verb = "已经接入" if data.get("existing") else "已接入"
+        return (f"{verb}目录 **{data.get('workspace')}** 作为项目"
+                f" **{data.get('name')}**（`{data.get('id')}`，{mode}）。\n"
+                "该目录不会被复制或删除；可以让我列出/读取其中的文件，"
+                "或为它创建任务、派 Agent。")
 
     async def _do_create_project(self, text: str) -> str:
         goal = self._extract_goal(text)
@@ -396,6 +462,14 @@ class ChatService:
                     f"停止 {int(data.get('agents_stopped') or 0)} 个 Agent。")
         if tool == "project.complete":
             return f"项目 **{data.get('name') or data.get('id') or ''}** 已确认完成。"
+        if tool in ("project.access", "project.set_mode", "project.set_access",
+                    "project.allow_writes"):
+            mode = "可写" if data.get("workspace_mode") == "attached-rw" else "只读"
+            return f"项目 **{data.get('name')}** 已切换为 {mode}。"
+        if tool in ("project.attach", "project.open", "project.import"):
+            mode = "只读" if data.get("workspace_mode") == "attached-ro" else "可写"
+            return (f"已接入项目 **{data.get('name')}**（`{data.get('id')}`，{mode}），"
+                    f"目录：{data.get('workspace')}")
         if tool == "project.create":
             return (f"项目 **{data.get('name')}** 已创建（`{data.get('id')}`），"
                     "主理人会开始拆解和派工。")
@@ -413,6 +487,28 @@ class ChatService:
             return "配置已更新（已热加载）。"
         if tool in ("task.update", "task.note", "task.create"):
             return f"任务 `{data.get('id') or ''}` 已更新。"
+        if tool == "project.files":
+            entries = data.get("entries") or []
+            names = [f"{item.get('name')}{'/' if item.get('type') == 'dir' else ''}"
+                     for item in entries[:40]]
+            more = f" 等 {len(entries)} 项" if len(entries) > 40 else ""
+            return (f"`{data.get('path') or '.'}` 下的内容："
+                    + ("、".join(names) + more if names else "（空）"))
+        if tool == "project.read":
+            content = str(data.get("content") or "")
+            suffix = "（已截断）" if data.get("truncated") else ""
+            return (f"`{data.get('path')}` 的内容{suffix}：\n```\n"
+                    + content[:1200] + "\n```")
+        if tool == "project.list":
+            projects = data.get("projects") or []
+            if not projects:
+                return "现在没有项目。"
+            return "项目：" + "、".join(
+                f"{p.get('name')}(`{p.get('id')}`)" for p in projects[:20])
+        if tool == "task.list":
+            tasks = data.get("tasks") or []
+            return f"共 {len(tasks)} 个任务：" + "、".join(
+                f"{t.get('title')}[{t.get('status')}]" for t in tasks[:20])
         return "操作完成。"
 
 

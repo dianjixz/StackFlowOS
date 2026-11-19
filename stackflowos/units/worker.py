@@ -162,7 +162,9 @@ async def run_worker(args: argparse.Namespace) -> int:
 
         workspace_dir = (Path(project["workspace"]) if project and project.get("workspace")
                          else state_dir / "agents" / work_id)
-        workspace_dir.mkdir(parents=True, exist_ok=True)
+        if not (project and project.get("workspace")):
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+        read_only = bool(project and project.get("workspace_mode") == "attached-ro")
 
         abilities = _abilities_for(args.role)
         await sys_api.call("unit.register", {
@@ -199,7 +201,16 @@ async def run_worker(args: argparse.Namespace) -> int:
 
         executor = ToolExecutor(sys_api, agent=agent, workspace=workspace_dir,
                                 security_config=cfg.security,
-                                logger=get_logger(f"tools.{work_id}"))
+                                logger=get_logger(f"tools.{work_id}"),
+                                read_only=read_only,
+                                deny_paths=[
+                                    cfg.paths.config_file,
+                                    cfg.paths.state_dir / "state",
+                                    cfg.paths.events_dir,
+                                    cfg.paths.logs_dir,
+                                    cfg.paths.run_dir,
+                                    cfg.paths.tmp_dir,
+                                ])
         brain = _make_brain(args.role, cfg)
         runner = AgentRunner(sys_api, agent, brain, executor, config=cfg.agents,
                              logger=get_logger(f"agent.{work_id}"),

@@ -81,10 +81,14 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
    run 目录；必要时删除 `.stackflowos/run/*.sock`。
 5. **事件流太大**：轮转文件可归档；`events.jsonl` 是权威审计，别随手删。
 6. **端口池耗尽**：确认没有泄漏的 worker 进程；重启 hub 会回收。
-7. **清理项目**：项目详情右下角「归档」（保留工作区）或「删除项目」
+7. **接入已有目录**：项目页「接入已有目录」或 `POST /api/projects/attach`
+   `{path, name?, allow_writes?}`。默认只读；外部目录不会被删除。
+   读写模式可用 `POST /api/projects/{id}/access` `{allow_writes}` 切换，
+   或在对话里说“把 <项目名> 改成可写/只读”。
+8. **清理项目**：项目详情右下角「归档」（保留工作区）或「删除项目」
    （输入项目名确认，永久删除记录/任务/工作区）。Agent 通过 `project.delete`
    工具发起时风险为 high，必须走审批；确认名不匹配会被拒绝。
-8. **过期审批一直挂着**：hub 每秒 sweep 过期项；Agent 死亡后其 pending 审批
+9. **过期审批一直挂着**：hub 每秒 sweep 过期项；Agent 死亡后其 pending 审批
    也会被自动 deny。重启 hub 会清理孤儿审批。
 
 ---

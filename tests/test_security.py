@@ -25,7 +25,8 @@ REPO = default_root()
 
 EXPECTED_CAPABILITIES = {
     "fs.read", "fs.list", "fs.write", "fs.delete", "shell.exec", "net.fetch",
-    "llm.chat", "project.create", "project.update", "project.archive",
+    "llm.chat", "project.create", "project.update", "project.attach",
+    "project.archive",
     "project.delete", "task.manage", "agent.spawn", "agent.kill",
     "unit.control", "sys.config", "approval.decide", "data.read",
     "data.write",

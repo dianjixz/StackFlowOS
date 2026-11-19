@@ -407,6 +407,7 @@ function renderProjectsList() {
   }
 
   wrap.append(renderNewProjectForm());
+  wrap.append(renderAttachProjectForm());
   return wrap;
 }
 
@@ -435,6 +436,48 @@ function projectRow(project) {
     el('span', { class: 'pr-age' }, agoShort(project.updated_at)),
     icon('chevron', 'ico ico-sm'),
   ));
+}
+
+function renderAttachProjectForm() {
+  const path = input({ placeholder: '/home/you/existing-project', 'aria-label': '本地目录路径' });
+  const name = input({ placeholder: '默认使用目录名', maxlength: '80', 'aria-label': '项目名称' });
+  const goal = input({ placeholder: '可选：接入后想推进什么', 'aria-label': '目标' });
+  const allow = input({ type: 'checkbox' });
+  const submit = el('button', { class: 'btn btn-ghost btn-sm', type: 'submit' }, icon('plus'), '接入目录');
+  const form = el('form', { class: 'form-card' },
+    el('h3', {}, '接入已有目录'),
+    el('p', { class: 'form-hint' },
+      '把一个已存在的本地目录接入为项目。目录不会被复制或删除；默认 Agent 只读，'
+      + '勾选后才允许写。'),
+    el('div', { class: 'form-grid' },
+      field('本地目录', path, { full: true, hint: '必须是已存在的绝对路径。' }),
+      field('项目名称', name),
+      field('目标', goal),
+    ),
+    el('label', { class: 'checkbox' }, allow, ' 允许 Agent 写入该目录（默认只读）'),
+    el('div', { class: 'form-actions' }, submit),
+  );
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const dir = path.value.trim();
+    if (!dir) { path.focus(); toast('请填写目录路径', 'info'); return; }
+    withBusy(submit, async () => {
+      try {
+        const card = await api.attachProject({
+          path: dir,
+          name: name.value.trim(),
+          goal: goal.value.trim(),
+          allow_writes: allow.checked,
+        });
+        toast(card.existing ? `目录已在项目「${card.name}」中` : `目录已接入项目「${card.name}」`, 'success');
+        await loadState({ quiet: true });
+        openApp('project', card.id);
+      } catch (error) {
+        toastError(error);
+      }
+    });
+  });
+  return form;
 }
 
 function renderNewProjectForm() {
@@ -530,6 +573,28 @@ function renderProjectDetail(project) {
     });
     actionRow.append(archiveBtn);
   }
+  if (project.external) {
+    const writable = project.workspace_mode === 'attached-rw';
+    const accessBtn = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' },
+      writable ? '改为只读' : '允许 Agent 写入');
+    accessBtn.addEventListener('click', () => {
+      const message = writable
+        ? `把「${project.name}」改为只读？Agent 将不能写文件或执行命令。`
+        : `允许 Agent 写入外部目录「${project.name}」？\n目录中的文件可能被修改，写操作仍会经过能力审批。`;
+      if (!window.confirm(message)) return;
+      withBusy(accessBtn, async () => {
+        try {
+          await api.setProjectAccess(project.id, !writable);
+          toast(writable ? '已改为只读' : '已允许写入', 'success');
+          await loadState({ quiet: true });
+          if (current) renderSheet();
+        } catch (error) {
+          toastError(error);
+        }
+      });
+    });
+    actionRow.append(accessBtn);
+  }
   const deleteBtn = el('button', { class: 'btn btn-danger btn-sm', type: 'button' },
     icon('trash'), '删除项目');
     deleteBtn.addEventListener('click', () => {
@@ -576,6 +641,10 @@ function renderProjectDetail(project) {
       el('p', { class: 'dh-goal' }, project.goal || project.brief || '没有填写目标。'),
       el('div', { class: 'dh-meta' },
         el('span', {}, '工作区 ', el('span', { class: 'mono' }, project.workspace || '—')),
+        project.external
+          ? el('span', {}, project.workspace_mode === 'attached-rw'
+              ? '外部目录 · 可写' : '外部目录 · 只读')
+          : null,
         el('span', {}, '更新于 ', el('span', { class: 'mono' }, ago(project.updated_at))),
         el('span', {}, '里程碑 ', el('span', { class: 'mono' },
           String(milestoneCount(project)))),
