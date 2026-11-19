@@ -286,10 +286,16 @@ class WebAPI:
         return _ok({"deleted": self.app.policy.delete_rule(match.group(1))})
 
     async def units_list(self, match, query, body):
-        units = self.app.registry.list(kind=query.get("kind") or None,
-                                       project_id=query.get("project_id") or None,
-                                       status=query.get("status") or None)
-        return _ok({"units": [u.to_dict() for u in units]})
+        kind = query.get("kind") or None
+        project_id = query.get("project_id") or None
+        status = query.get("status") or None
+        units = [
+            unit for unit in self.app.unit_cards()
+            if (kind is None or unit.get("kind") == kind)
+            and (project_id is None or unit.get("project_id") == project_id)
+            and (status is None or unit.get("status") == status)
+        ]
+        return _ok({"units": units})
 
     async def unit_kill(self, match, query, body):
         return _ok(await self.app.kill_unit(match.group(1)))

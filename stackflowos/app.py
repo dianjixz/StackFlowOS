@@ -1381,6 +1381,8 @@ class App:
         return await self.supervisor.kill(agent_id, reason="operator_requested")
 
     async def kill_unit(self, work_id: str) -> dict:
+        if work_id == "sys.0":
+            raise BadRequest("sys.0 is the hub itself; stop the hub process instead")
         return await self._unit_kill({"work_id": work_id, "reason": "operator_requested"},
                                      "operator")
 
@@ -1464,6 +1466,16 @@ class App:
 
     def stats(self) -> dict:
         units = self.registry.stats()
+        # sys.0 is a real unit; count it in headline stats as well as in the
+        # snapshot/units API so "在线单元" never reads 0 while the hub runs.
+        units["total"] = int(units.get("total", 0)) + 1
+        units["online"] = int(units.get("online", 0)) + 1
+        by_status = dict(units.get("by_status") or {})
+        by_status["online"] = int(by_status.get("online", 0)) + 1
+        units["by_status"] = dict(sorted(by_status.items()))
+        by_kind = dict(units.get("by_kind") or {})
+        by_kind["sys"] = int(by_kind.get("sys", 0)) + 1
+        units["by_kind"] = dict(sorted(by_kind.items()))
         agents = self.supervisor.stats()
         return {
             "units": units,
@@ -1488,6 +1500,35 @@ class App:
                  f"{len(approvals)} 个待审批"]
         return "，".join(parts)
 
+    def sys_unit(self) -> dict:
+        """The hub itself is a unit: sys.0 with addresses and a lifecycle."""
+        return {
+            "work_id": "sys.0",
+            "kind": "sys",
+            "label": "hub · 系统单元",
+            "project_id": None,
+            "pid": os.getpid(),
+            "host": self.config.system.host_label,
+            "transport": self.config.transport.mode,
+            "rpc_address": self.sys_addresses.rpc,
+            "events_address": self.sys_addresses.events,
+            "status": "online",
+            "abilities": [
+                {"name": "sys.rpc", "scope": "system"},
+                {"name": "sys.events", "scope": "system"},
+                {"name": "web.http", "scope": "console"},
+            ],
+            "hwinfo": {},
+            "started_at": self.started_at,
+            "last_seen": now_ms(),
+            "restart_count": 0,
+            "metadata": {"role": "hub", "web_port": self.config.web.port},
+        }
+
+    def unit_cards(self) -> list[dict]:
+        """sys unit plus every registered worker unit (the system's ``ps``)."""
+        return [self.sys_unit()] + [u.to_dict() for u in self.registry.list()]
+
     def snapshot(self) -> dict:
         try:
             projects = [self.project_card(p.id) for p in self.projects.list()]
@@ -1495,7 +1536,7 @@ class App:
             self.log.exception("project snapshot failed")
             projects = []
         agents = [a.to_dict() for a in self.supervisor.list()]
-        units = [u.to_dict() for u in self.registry.list()]
+        units = self.unit_cards()
         approvals = [a.to_dict() for a in self.approvals.list(status="pending", limit=100)]
         rules = [r.to_dict() for r in self.policy.list_rules(active_only=True)
                  if r.source == "rule"]

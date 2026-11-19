@@ -1196,7 +1196,7 @@ function renderUnitsApp() {
     ),
     el('div', { class: 'toolbar-right' }, refreshButton(() => loadState({ quiet: true }))),
   ));
-  wrap.append(appNote('单元是承载 Agent 的进程。强制终止会要求它退出；离线单元会在心跳超时后自动标记。', { iconName: 'units' }));
+  wrap.append(appNote('单元是带地址、租约与生命周期的执行体：sys.0 是 hub 本身，worker 单元通常一个 Agent 一个进程。强制终止会要求它退出；离线单元会在心跳超时后自动标记。', { iconName: 'units' }));
 
   if (!state.loaded) {
     wrap.append(loadingInline('载入单元…'));
@@ -1205,7 +1205,7 @@ function renderUnitsApp() {
   if (!units.length) {
     wrap.append(emptyState({
       iconName: 'units',
-      title: '还没有单元',
+      title: '还没有 worker 单元',
       text: '创建项目或派工后，工作进程会注册到这里，并显示它们的 RPC 地址与能力。',
     }));
     return wrap;
@@ -1228,7 +1228,8 @@ function renderUnitsApp() {
   )));
   const tbody = el('tbody');
   for (const unit of units) {
-    const killBtn = el('button', {
+    const isSys = unit.work_id === 'sys.0';
+    const killBtn = isSys ? el('span', { class: 'muted mono' }, 'hub') : el('button', {
       class: 'btn btn-xs btn-danger',
       type: 'button',
       'aria-label': `终止单元 ${unit.work_id}`,

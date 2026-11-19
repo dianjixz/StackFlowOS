@@ -1,7 +1,9 @@
 """Unit registry: who is alive, where to reach them, what they can do.
 
-A *unit* is one process hosting one agent (docs/architecture.md §5.1). The
-registry is the ``ps`` of StackFlowOS:
+A *unit* is a process with an address, a lifecycle and (usually) a lease;
+the hub itself is ``sys.0``, while a worker unit typically hosts one agent
+(docs/architecture.md §5.1). The registry lists worker units — the ``ps`` of
+StackFlowOS:
 
 * ``register`` is upsert-like: re-registering a ``work_id`` updates it in place;
 * heartbeats move ``suspect``/``offline`` units back to ``online``;

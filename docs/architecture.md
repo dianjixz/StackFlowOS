@@ -244,6 +244,11 @@ class UnitInfo:
     metadata: dict = {}
 ```
 
+**单元不是"Agent 的容器"这么窄**：单元是系统里的进程级执行体，有地址、租约、
+生命周期、能力清单与失败域。`sys.0` 是 hub 本身（提供 RPC/事件/Web），worker
+单元通常一个 Agent 一个进程；`UnitRegistry` 记录 worker 单元，`App.unit_cards()`
+把 `sys.0` 一并纳入快照和 `/api/units`，所以状态栏在线单元至少是 1，而不是 0。
+
 `UnitRegistry`：`register / heartbeat / release / get / list / sweep`。
 `sweep(now, offline_after)` 依据最后一次心跳把 online→suspect→offline；
 每次状态迁移写事件并调用失败域。能力目录 = 在线单位的 `abilities` 并集，
