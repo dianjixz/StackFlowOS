@@ -333,7 +333,19 @@ def _compact_state(view: Any) -> str:
         ],
         "workspace": getattr(view, "workspace", ""),
         "step": getattr(view, "step", 0),
+        "last_tool_results": [],
     }
+    for result in (getattr(view, "tool_results", None) or [])[-3:]:
+        if not isinstance(result, dict):
+            continue
+        data = result.get("data") or {}
+        rendered = json.dumps(data, ensure_ascii=False, default=str)
+        state["last_tool_results"].append({
+            "tool": result.get("tool"),
+            "ok": result.get("ok"),
+            "error": short(result.get("error"), 300),
+            "data": rendered[:4000],
+        })
     if isinstance(task, dict):
         state["task"] = {
             "id": task.get("id"),
@@ -380,7 +392,7 @@ class LLMBrain:
         ]
         tools = [
             {"name": spec.name, "description": spec.description,
-             "capability": spec.capability}
+             "capability": spec.capability, "args": spec.args}
             for spec in tools_for(self.role)
         ]
         last_error = ""

@@ -99,6 +99,7 @@ class AgentRunner:
         self._steps = 0
         self._last_seq = 0
         self._events: list[dict] = []
+        self._tool_results: list[dict] = []
 
     # -- control flags (unit.pause / unit.kill) --------------------------
     def pause(self) -> None:
@@ -162,6 +163,16 @@ class AgentRunner:
                                                  dict(action.args or {}))
                 self._steps += 1
                 self._bump_stats(result)
+                # The LLM needs the *content* of fs.read/shell output, not
+                # just a one-line event summary, otherwise it re-reads files
+                # forever. Keep a small, bounded window for the next prompt.
+                self._tool_results.append({
+                    "tool": action.tool,
+                    "ok": bool(result.ok),
+                    "data": result.data if result.ok else {},
+                    "error": result.error,
+                })
+                self._tool_results = self._tool_results[-3:]
                 await self._emit("agent.step", {
                     "agent_id": self.agent.id,
                     "role": self.agent.role,
@@ -270,6 +281,7 @@ class AgentRunner:
             step=self._steps,
             workspace=str(self.workspace),
             recent=list(self._events[-6:]),
+            tool_results=list(self._tool_results),
         )
 
     async def _pull_events(self) -> None:

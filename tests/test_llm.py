@@ -235,6 +235,21 @@ class LLMBrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("StackFlowOS", messages[0]["content"])
         self.assertTrue(any(tool["name"] == "fs.write" for tool in tools))
 
+    async def test_prompt_includes_tool_args_and_tool_results(self) -> None:
+        view = self._view()
+        view.tool_results = [{
+            "tool": "fs.read", "ok": True,
+            "data": {"path": "README.md", "content": "hello from file"},
+            "error": None,
+        }]
+        provider = ScriptedProvider(
+            ['{"finish": {"summary": "done", "status": "done"}}'])
+        await LLMBrain(provider, "coder").next_action(view)
+        messages, tools = provider.calls[0]
+        self.assertIn("hello from file", messages[1]["content"])
+        write_tool = next(tool for tool in tools if tool["name"] == "fs.write")
+        self.assertIn("content", write_tool["args"])
+
     async def test_parses_finish(self) -> None:
         provider = ScriptedProvider([
             '{"finish": {"summary": "完成", "status": "blocked"}}'])

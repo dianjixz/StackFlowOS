@@ -45,6 +45,7 @@ class AgentView:
     step: int = 0
     workspace: str = ""
     recent: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
 
 
 @dataclass

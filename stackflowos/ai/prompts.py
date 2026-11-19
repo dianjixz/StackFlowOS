@@ -7,6 +7,8 @@ tool misuse visible instead of silently ignored.
 
 from __future__ import annotations
 
+import json
+
 from ..errors import BadRequest
 from ..agents.roles import get_role
 
@@ -45,8 +47,11 @@ def tool_call_protocol() -> str:
         TOOLS = {}
     if not TOOLS:
         return _ACTION_PROTOCOL
-    lines = [f"- {spec.name}（{spec.capability}）：{spec.description}"
-             for spec in sorted(TOOLS.values(), key=lambda item: item.name)]
+    lines = []
+    for spec in sorted(TOOLS.values(), key=lambda item: item.name):
+        args = json.dumps(spec.args, ensure_ascii=False) if spec.args else "{}"
+        lines.append(f"- {spec.name}（{spec.capability}）：{spec.description}；"
+                     f"args={args}")
     return _ACTION_PROTOCOL + "\n可用工具：\n" + "\n".join(lines)
 
 
