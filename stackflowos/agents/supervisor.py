@@ -261,6 +261,10 @@ class AgentSupervisor:
         self._close_log(old_work_id)
 
         new_work_id = str(self.allocator.new_work_id(agent.role))
+        # Bind the roster entry to the new unit *before* launching so the
+        # worker's agent.register dedupes onto this agent instead of creating
+        # a second one for the same replacement process.
+        agent.unit_id = new_work_id
         try:
             addresses = await _maybe_await(self.allocator.allocate(new_work_id))
             self._addresses[new_work_id] = addresses
@@ -279,7 +283,6 @@ class AgentSupervisor:
             })
             return False
 
-        agent.unit_id = new_work_id
         if agent.status == "spawning":
             agent.status = "idle"
         agent.error = None

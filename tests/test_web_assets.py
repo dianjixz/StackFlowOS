@@ -117,6 +117,10 @@ class WebAssetsTest(unittest.TestCase):
         matches = re.findall(r"\son[a-z]+\s*=", self.html, flags=re.IGNORECASE)
         self.assertEqual(matches, [], "inline event handler attributes are not allowed")
 
+    def test_js_never_uses_innerhtml(self) -> None:
+        self.assertNotIn("innerHTML", self.js_text,
+                         "all DOM text must be written through textContent")
+
     # -- offline / no build step ----------------------------------------
     def test_no_external_http_assets(self) -> None:
         haystack = "\n".join([self.html, self.css, self.js_text])

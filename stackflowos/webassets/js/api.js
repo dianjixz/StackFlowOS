@@ -78,10 +78,10 @@ export const api = {
   health: () => requestJson('/api/health'),
   getState: () => requestJson('/api/state'),
   getConsole: ({ types = [], projectId = '', limit = 200 } = {}) =>
-    requestJson(`/api/console${qs({ types: types.join(','), project_id: projectId, limit })}`),
+    requestJson('/api/console' + qs({ types: types.join(','), project_id: projectId, limit })),
 
   /* ---- chat ---- */
-  getChat: (limit = 100) => requestJson(`/api/chat${qs({ limit })}`),
+  getChat: (limit = 100) => requestJson('/api/chat' + qs({ limit })),
   sendChat: (text) => requestJson('/api/chat', { method: 'POST', body: { text } }),
 
   /* ---- projects & tasks ---- */
@@ -98,7 +98,7 @@ export const api = {
   checkTask: (id, payload) => requestJson(`/api/tasks/${enc(id)}/check`, { method: 'POST', body: payload }),
 
   /* ---- approvals & rules ---- */
-  getApprovals: (status = 'pending') => requestJson(`/api/approvals${qs({ status })}`),
+  getApprovals: (status = 'pending') => requestJson('/api/approvals' + qs({ status })),
   decideApproval: (id, decision, mode = 'once', note = '') =>
     requestJson(`/api/approvals/${enc(id)}/decide`, { method: 'POST', body: { decision, mode, note } }),
   getRules: () => requestJson('/api/rules'),
@@ -108,7 +108,7 @@ export const api = {
   /* ---- units & agents ---- */
   getUnits: () => requestJson('/api/units'),
   killUnit: (workId) => requestJson(`/api/units/${enc(workId)}/kill`, { method: 'POST', body: {} }),
-  getAgents: (projectId = '') => requestJson(`/api/agents${qs({ project_id: projectId })}`),
+  getAgents: (projectId = '') => requestJson('/api/agents' + qs({ project_id: projectId })),
   spawnAgent: (role, projectId, taskId = null) =>
     requestJson('/api/agents', { method: 'POST', body: { role, project_id: projectId, task_id: taskId } }),
   killAgent: (id) => requestJson(`/api/agents/${enc(id)}`, { method: 'DELETE' }),

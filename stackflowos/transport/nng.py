@@ -176,6 +176,21 @@ def _reply_payload(env: Envelope, result: Any) -> Envelope:
     return env.reply({"value": result})
 
 
+def _configure_lane(ctx: pynng.Context, log: logging.Logger) -> None:
+    """Give a REP lane a send timeout so a vanished peer cannot wedge it.
+
+    NNG REQ/REP has no request id at the socket level: once a REQ peer
+    disconnects, a pending REP send has nobody to deliver to. Without a
+    timeout the lane blocks forever and the server slowly runs out of lanes
+    (observed after worker processes exit while a heartbeat reply is in
+    flight). The timeout lets ``_serve`` recycle the lane.
+    """
+    try:
+        ctx.send_timeout = 5000
+    except Exception:  # pragma: no cover - option unsupported
+        log.debug("could not set REP lane send_timeout")
+
+
 class RpcServer:
     """REP server with ``contexts`` concurrent request lanes."""
 
@@ -219,6 +234,7 @@ class RpcServer:
         try:
             for index in range(self._contexts):
                 ctx = sock.new_context()
+                _configure_lane(ctx, self._log)
                 contexts.append(ctx)
                 tasks.append(asyncio.create_task(
                     self._serve(ctx, index),
@@ -297,9 +313,23 @@ class RpcServer:
             except Exception as exc:
                 if not self._running:
                     return
-                self._log.warning("%s: send failed for %s: %s",
-                                  label, env.action, exc)
-                return
+                # A REQ peer that disappeared leaves a REP lane waiting for a
+                # peer forever (send timeout fires). Retire the wedged lane
+                # and open a fresh one so the server keeps serving.
+                self._log.info("%s: send failed (%s); recycling lane",
+                               label, exc)
+                try:
+                    new_ctx = self._sock.new_context() if self._sock else None
+                except Exception:
+                    new_ctx = None
+                if new_ctx is None:
+                    return
+                _configure_lane(new_ctx, self._log)
+                _safe_close(ctx)
+                ctx = new_ctx
+                if index < len(self._ctxs):
+                    self._ctxs[index] = new_ctx
+                continue
 
     async def _dispatch(self, env: Envelope, label: str) -> Envelope:
         handler = self._handlers.get(env.action)

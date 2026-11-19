@@ -37,7 +37,9 @@ python3 -m stackflowos status
 ```
 
 `demo --until-done` 会真的在 `.stackflowos/projects/<id>/workspace/` 里留下设计文档、
-实现文件、测试报告和评审意见，并在终端打印任务终态与产物路径。
+实现文件、测试报告和评审意见，并在终端打印任务终态与产物路径。演示项目目标是
+"Markdown → HTML 命令行工具"，产出的 `src/*.py` 是可运行的真实程序
+（`python3 src/t-3-*.py --selftest` 会通过），最后由 aggregator 写出项目简报。
 
 演示会预置一组**项目范围内**的放行规则（只允许项目工作区内的读写和无害命令），
 这是"人给系统定的规矩"，不是绕过审批；项目之外的写入仍然会弹审批。
@@ -58,7 +60,18 @@ python3 -m stackflowos status
 | 事件 | 全量事件流（可过滤、可展开原始 JSON） |
 | 设置 | 常规 / 网络 / AI / 安全 / 存储 / 关于 |
 
-（截图见 `docs/img/`。）
+### 截图（真实运行中的 hub）
+
+![对话与工作面板](docs/img/home.png)
+
+| 审批口（风险 / 范围 / 预览 / TTL） | 项目详情（任务看板 / 产物 / Agent） |
+|---|---|
+| ![审批](docs/img/approvals.png) | ![项目](docs/img/project.png) |
+
+| 手机宽度 | 设置 |
+|---|---|
+| ![移动端](docs/img/mobile.png) | ![设置](docs/img/settings.png) |
+
 
 ---
 

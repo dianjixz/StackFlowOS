@@ -10,6 +10,7 @@ never callable by worker units over RPC.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import platform
 import shutil
@@ -73,6 +74,7 @@ class App:
         self._rpc_cache: dict[str, tuple[float, dict]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._stopped = False
+        self._lock_fd: int | None = None
         self._assistant_executor: ToolExecutor | None = None
         self._assistant_agent = None
         self.log = get_logger("app")
@@ -93,6 +95,7 @@ class App:
                  cfg.system.name, self.version, cfg.transport.mode, self.paths.state_dir)
 
         self.ctx = Context(name="root")
+        self._acquire_hub_lock()
         self.eventlog = EventLog(self.paths.events_dir, logger=get_logger("events"))
         self.allocator = AddressAllocator(
             mode=cfg.transport.mode,
@@ -237,6 +240,47 @@ class App:
             await self.ctx.dispose()
         except Exception:
             self.log.exception("context dispose failed")
+        self._release_hub_lock()
+
+    # ------------------------------------------------------------------
+    # single-hub lock
+    # ------------------------------------------------------------------
+    def _acquire_hub_lock(self) -> None:
+        """Prevent two hubs from sharing one state directory.
+
+        Overlapping hubs would unlink each other's IPC sockets on shutdown
+        (the old process cleans up paths that a new process already rebound).
+        A POSIX flock is released by the kernel when the process dies, so a
+        stale lock file is harmless.
+        """
+        lock_path = self.paths.run_dir / "hub.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            raise Unavailable(f"cannot open hub lock {lock_path}: {exc}") from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise Unavailable(
+                f"another StackFlowOS hub is using {self.paths.state_dir}") from exc
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        self._lock_fd = fd
+
+    def _release_hub_lock(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # RPC dispatch

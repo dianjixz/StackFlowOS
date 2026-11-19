@@ -2,8 +2,8 @@
  * ui.js — tiny DOM toolkit + formatting helpers.
  *
  * Security rule for the whole frontend: user/agent supplied strings are only
- * ever written through `textContent` (never innerHTML). The only innerHTML in
- * the app is the static icon sprite embedded in index.html.
+ * ever written through `textContent`. No markup-injection API is used anywhere in the JS modules;
+ * the only SVG markup lives in the static sprite inside index.html.
  */
 
 /** @typedef {string|Node|number|null|undefined|false} Child */
@@ -30,10 +30,7 @@ function applyAttrs(node, attrs) {
     else if (key === 'text') node.textContent = String(value);
     else if (key === 'dataset') Object.assign(node.dataset, value);
     else if (key === 'style' && typeof value === 'object') Object.assign(node.style, value);
-    else if (key === 'html') {
-      // Reserved for static, developer-authored SVG only. Never pass user text.
-      node.innerHTML = String(value);
-    } else if (key.startsWith('on') && typeof value === 'function') {
+    else if (key.startsWith('on') && typeof value === 'function') {
       node.addEventListener(key.slice(2).toLowerCase(), value);
     } else if (value === true) node.setAttribute(key, '');
     else node.setAttribute(key, String(value));

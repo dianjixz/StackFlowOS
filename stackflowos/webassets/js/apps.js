@@ -86,6 +86,7 @@ const view = {
   tasksError: '',
   tasksToken: 0,
   selectedTaskId: null,
+  scrollToTask: false,
   agentFilter: 'active',
   rules: [],
   rulesLoading: false,
@@ -137,7 +138,6 @@ export function initApps() {
       pendingRender = true;
       return;
     }
-    if (current.name === 'approvals' && !view.rulesLoading) view.rules = state.rules;
     scheduleSheetRender();
   });
   on('event', (event) => {
@@ -177,10 +177,15 @@ function applyHash() {
 
 /** Open an app (or a project detail) and reflect it in the URL hash. */
 export function openApp(name, projectId = null) {
+  if (name === 'project') {
+    if (!projectId) return;
+    const target = `#project/${encodeURIComponent(projectId)}`;
+    if (location.hash === target) applyHash();
+    else location.hash = target;
+    return;
+  }
   if (!Object.prototype.hasOwnProperty.call(APP_META, name)) return;
-  const target = name === 'projects' && projectId
-    ? `#project/${encodeURIComponent(projectId)}`
-    : `#${name}`;
+  const target = `#${name}`;
   if (location.hash === target) applyHash();
   else location.hash = target;
 }
@@ -327,6 +332,12 @@ function renderSheet({ preserveScroll = true } = {}) {
   els.body.append(content);
   els.body.scrollTop = scrollTop;
   tickCountdowns();
+  if (view.scrollToTask) {
+    view.scrollToTask = false;
+    window.requestAnimationFrame(() => {
+      els.body.querySelector('.task-detail')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
+  }
 }
 
 /* ================================================================== */
@@ -493,7 +504,7 @@ function renderProjectDetail(project) {
         try {
           await api.completeProject(project.id);
           toast('项目已标记完成', 'success');
-          await loadState({ quiet: true });
+          await Promise.all([loadState({ quiet: true }), loadTasks(project.id, { force: true })]);
           if (current) renderSheet();
         } catch (error) {
           toastError(error);
@@ -602,9 +613,9 @@ function renderProjectDetail(project) {
       text: '主理人会拆解目标；也可以手动在下面添加一个任务。',
     }));
   } else {
-    wrap.append(renderTaskBoard());
     const selected = view.projectTasks.find((task) => task.id === view.selectedTaskId);
     if (selected) wrap.append(renderTaskDetail(selected));
+    wrap.append(renderTaskBoard());
   }
 
   wrap.append(renderAddTaskForm(project));
@@ -659,6 +670,7 @@ function renderTaskCard(task) {
     onclick: (event) => {
       event.stopPropagation();
       view.selectedTaskId = selected ? null : task.id;
+      view.scrollToTask = !selected;
       renderSheet();
     },
   }, el('span', { class: 'tc-title' }, task.title || task.id));
@@ -933,7 +945,7 @@ function renderAgentsApp() {
     { key: 'all', label: '全部' },
     { key: 'ended', label: '已结束' },
   ];
-  wrap.append(el('div', { class: 'filter-chips', style: { 'margin-top': '16px' } },
+  wrap.append(el('div', { class: 'filter-chips', style: { 'margin-top': '16px', 'margin-bottom': '12px' } },
     ...filters.map((filter) => el('button', {
       class: `chip${view.agentFilter === filter.key ? ' is-active' : ''}`,
       type: 'button',
@@ -1103,9 +1115,19 @@ function renderUnitsApp() {
     return wrap;
   }
 
-  const table = el('table', { class: 'data-table' });
+  const table = el('table', { class: 'data-table units-table' });
+  table.append(el('colgroup', {},
+    el('col', { style: { width: '19%' } }),
+    el('col', { style: { width: '9%' } }),
+    el('col', { style: { width: '7%' } }),
+    el('col', { style: { width: '26%' } }),
+    el('col', { style: { width: '7%' } }),
+    el('col', { style: { width: '10%' } }),
+    el('col', { style: { width: '15%' } }),
+    el('col', { style: { width: '7%' } }),
+  ));
   table.append(el('thead', {}, el('tr', {},
-    ...['单元', '状态', '传输', 'RPC 地址', '事件地址', 'PID', '最近心跳', '能力', '']
+    ...['单元', '状态', '传输', '地址', 'PID', '最近心跳', '能力', '']
       .map((label) => el('th', { scope: 'col' }, label)),
   )));
   const tbody = el('tbody');
@@ -1134,16 +1156,16 @@ function renderUnitsApp() {
       typeof ability === 'string' ? ability : (ability.name || ability.tool || 'ability'));
     tbody.append(el('tr', {},
       el('td', {},
-        el('div', { class: 'unit-id' }, unit.work_id),
-        el('div', { class: 'muted', style: { 'font-size': '9px' } },
+        el('div', { class: 'unit-id', title: unit.work_id }, unit.work_id),
+        el('div', { class: 'unit-sub muted', title: [unit.label, unit.kind].filter(Boolean).join(' · ') },
           [unit.label, unit.kind].filter(Boolean).join(' · ') || '—'),
       ),
       el('td', {}, statusPill(unit.status)),
       el('td', { class: 'mono' }, String(unit.transport || '—').toUpperCase()),
-      el('td', {}, el('div', { class: 'unit-addr', title: unit.rpc_address || '' }, unit.rpc_address || '—')),
-      el('td', {}, el('div', { class: 'unit-addr', title: unit.events_address || '' }, unit.events_address || '—')),
+      el('td', {}, el('div', { class: 'unit-addr', title: unit.rpc_address || '' }, unit.rpc_address || '—'),
+        el('div', { class: 'unit-addr is-secondary', title: unit.events_address || '' }, unit.events_address || '—')),
       el('td', { class: 'mono' }, String(unit.pid ?? '—')),
-      el('td', { class: 'mono', title: fmtDateTime(unit.last_seen) }, ago(unit.last_seen)),
+      el('td', { class: 'mono unit-last-seen', title: fmtDateTime(unit.last_seen) }, ago(unit.last_seen)),
       el('td', {},
         abilities.length
           ? el('div', { class: 'ability-list' },
@@ -1214,16 +1236,22 @@ function renderApprovalsApp() {
       onclick: () => loadDecisions().catch(toastError),
     }, icon('refresh', 'ico ico-sm'), '刷新'),
   }));
-  if (view.decisionsLoading && !view.recentDecisions.length) {
+  const decisions = view.recentDecisions.filter(isDecisionEvent);
+  if (view.decisionsLoading && !decisions.length) {
     wrap.append(loadingInline('载入决定记录…'));
-  } else if (!view.recentDecisions.length) {
+  } else if (!decisions.length) {
     wrap.append(appNote('还没有审批决定记录。', { iconName: 'events' }));
   } else {
     const list = el('div', { class: 'decision-list' });
-    for (const event of view.recentDecisions.slice(0, 20)) {
+    for (const event of decisions.slice(0, 20)) {
       const data = event.data || {};
+      const decision = data.decision
+        || (data.status === 'expired' ? 'expired' : data.status === 'canceled' ? 'canceled' : '');
+      const label = {
+        allow: '允许', deny: '拒绝', expired: '已过期', canceled: '已取消',
+      }[decision] || '已决定';
       const main = data.request_id
-        ? `${data.request_id} · ${data.decision === 'allow' ? '允许' : data.decision === 'deny' ? '拒绝' : '决定'}` +
+        ? `${data.request_id} · ${label}` +
           `${data.mode ? ` · ${data.mode}` : ''}${data.by ? ` · ${data.by}` : ''}`
         : eventSummary(event);
       list.append(el('div', { class: 'decision-row' },
@@ -1267,7 +1295,7 @@ function renderApprovalCard(approval) {
       .then(async () => {
         toast(decision === 'allow' ? `已允许 ${approval.capability}` : `已拒绝 ${approval.capability}`,
           decision === 'allow' ? 'success' : 'info');
-        await Promise.all([loadState({ quiet: true }), loadDecisions()]);
+        await Promise.all([loadState({ quiet: true }), loadDecisions(), loadRules()]);
         renderSheet();
       })
       .catch((error) => {
@@ -1311,6 +1339,12 @@ function renderApprovalCard(approval) {
     actions,
   );
   return card;
+}
+
+function isDecisionEvent(event) {
+  const data = event?.data || {};
+  if (data.decision) return true;
+  return ['approved', 'denied', 'expired', 'canceled'].includes(data.status);
 }
 
 function formatScopeValue(value) {

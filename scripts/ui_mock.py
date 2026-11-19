@@ -335,6 +335,11 @@ class Fixture:
                       description="用 curses 做双缓冲渲染；每 tick 处理输入、移动蛇身、重绘。",
                       checks=checks_for(("固定 60ms tick", True), ("输入不阻塞", False),
                                         ("退出时恢复终端", False)),
+                      artifacts=[
+                          {"type": "file",
+                           "path": ".stackflowos/projects/p-1/workspace/src/snake.py",
+                           "title": "snake.py · 输入缓冲", "ts": now_ms() - 90_000},
+                      ],
                       notes=[{"ts": now_ms() - 120_000, "author": "agent-coder-2",
                               "text": "已经能跑通移动，正在补输入缓冲。"}]),
             make_task("t-103", "p-1", "实现食物、计分与加速", status="done", priority=1,
@@ -770,6 +775,12 @@ class Fixture:
         add("approval.ui_decided", {"request_id": "apr-seed-1", "decision": "allow",
                                     "mode": "once", "by": "human:operator"},
             source="operator", project_id="p-1", age_s=2 * 3600 + 200)
+        add("approval.ui_decided", {"request_id": "apr-seed-2", "decision": "deny",
+                                    "mode": None, "by": "human:operator"},
+            source="operator", project_id="p-2", age_s=1 * 3600 + 800)
+        add("approval.ui_decided", {"request_id": "apr-seed-3", "decision": "allow",
+                                    "mode": "session", "by": "human:operator"},
+            source="operator", project_id="p-1", age_s=1 * 3600 + 200)
         add("rule.created", {"rule_id": "rule-6c1a2f00", "effect": "allow",
                              "capability": "data.read", "principal": "*"},
             source="operator", age_s=2 * 3600 + 150)

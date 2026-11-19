@@ -20,6 +20,7 @@ from pathlib import Path
 from stackflowos.app import App
 from stackflowos.cli import seed_demo
 from stackflowos.config import Config, default_root
+from stackflowos.errors import Unavailable
 from stackflowos.web.server import WebServer
 
 REPO = default_root()
@@ -122,6 +123,13 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn(final["status"], ("review", "done"))
         self.assertGreater(files_count(final["workspace"]), 0)
 
+    async def test_hub_lock_prevents_second_hub(self):
+        self.app = await _boot_app(self.tmp, transport="ipc")
+        second = App(Config.load(root=Path(self.tmp), state_dir=Path(self.tmp)))
+        with self.assertRaises(Unavailable):
+            await second.start()
+        await second.stop()
+
     async def test_approval_flow_through_sys_actions(self):
         self.app = await _boot_app(self.tmp, transport="ipc")
         request = await self.app.handle_rpc_action("approval.request", {
@@ -166,6 +174,56 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(self.app.projects.task_list(project_id=project.id)), 4)
         reply = await _wait_chat_reply(self.app)
         self.assertIn("项目", reply)
+
+    async def test_failure_domain_resets_dead_worker(self):
+        import signal
+
+        self.app = await _boot_app(self.tmp, transport="ipc")
+        # Speed up liveness detection for the test.
+        self.app.registry.offline_after_s = 2.0
+        project = await self.app.create_project("故障域", "做一个能被测出崩溃恢复的工具",
+                                                spawn_lead=False)
+        task = self.app.projects.task_list(project_id=project["id"])[0]
+        agent = await self.app.spawn_agent("coder", project["id"], task.id)
+        unit_id = agent["unit_id"]
+        # The coder will block on an fs.write approval (no rules seeded), so
+        # the process is reliably alive while we kill it.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self.app.approvals.list(status="pending"):
+                break
+            await asyncio.sleep(0.2)
+        unit = self.app.registry.get(unit_id)
+        self.assertEqual(unit.status, "online")
+        self.app.leases.acquire(f"unit:{unit_id}", unit_id, 60)
+        os.kill(int(unit.pid), signal.SIGKILL)
+
+        deadline = time.monotonic() + 20
+        saw_offline = False
+        while time.monotonic() < deadline:
+            try:
+                current = self.app.registry.get(unit_id)
+                if current.status in ("suspect", "offline"):
+                    saw_offline = True
+                if current.status == "offline":
+                    break
+            except Exception:
+                saw_offline = True
+                break
+            await asyncio.sleep(0.3)
+        self.assertTrue(saw_offline, "dead unit was never detected")
+        self.assertEqual(self.app.leases.list(holder=unit_id), [])
+        # The failure policy must have started a replacement within budget.
+        deadline = time.monotonic() + 25
+        replacement = None
+        while time.monotonic() < deadline:
+            refreshed = self.app.supervisor.get(agent["id"])
+            if refreshed.unit_id and refreshed.unit_id != unit_id:
+                replacement = refreshed
+                break
+            await asyncio.sleep(0.3)
+        self.assertIsNotNone(replacement, "failure domain did not restart the worker")
+        self.assertIn(replacement.status, ("spawning", "idle", "working", "done", "dead", "failed"))
 
     async def test_web_api_and_sse(self):
         self.app = await _boot_app(self.tmp, transport="ipc")

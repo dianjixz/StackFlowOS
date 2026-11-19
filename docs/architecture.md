@@ -93,6 +93,9 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
 * ipc 路径长度必须 < 100 字节；超长时 `AddressAllocator` 用哈希缩短。
 * tcp 端口从 `transport.port_pool_start` 起顺序分配，类似 StackFlow 的端口池。
 * 单元停止后释放端口与 socket 文件；启动前清理陈旧 ipc 文件。
+* 同一 state 目录只允许一个 hub：`<state>/run/hub.lock` 用 `flock` 独占，
+  第二个 hub 启动即报 `UNAVAILABLE`。否则旧 hub 关闭时的 `allocator.cleanup`
+  会删掉新 hub 已经绑定的 socket。
 
 ---
 
@@ -124,8 +127,12 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
   `{"type","source","ts","data","project_id"?}`，`seq` 由 hub 事件日志统一编号。
 * 消息上限 2MB；超出拒收。
 * pynng 保留消息边界，不需要额外分帧。
-* 重试语义：RPC 超时由客户端重试一次（同一 `id` 可去重）；事件是**至少一次**，
-  消费者按 `seq` 去重。控制面操作必须幂等（例如 `task.claim` 返回冲突而不是重复认领）。
+* 重试语义：RPC 超时由客户端重试一次（**复用同一 `id`**）；hub 按
+  `(src, id)` 做 in-flight 合并与 5 分钟结果缓存，保证 `agent.spawn` 这类
+  非幂等动作只会执行一次。事件是**至少一次**，消费者按 `seq` 去重；
+  控制面操作本身仍应幂等（例如 `task.claim` 返回冲突而不是重复认领）。
+* REP 服务端每一路 lane 设置 5s 发送超时；对端 REQ 进程消失导致 lane 卡死时
+  自动回收重建，避免 8 条 lane 被慢泄漏耗尽。
 
 ### 3.1 RPC 动作清单（sys 侧）
 
@@ -134,7 +141,9 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
 | `sys.ping` | `{}` | `{ok, ts}` |
 | `sys.info` | `{}` | 版本、uptime、transport、seq |
 | `sys.hwinfo` | `{}` | `{cpu, mem, load, disk}` |
+| `sys.stats` | `{}` | 单元/Agent/项目/租约/事件计数 |
 | `unit.allocate` | `{kind, label?, project_id?}` | `{work_id, rpc_address, events_address, sys_events_address, transport}` |
+| `unit.addresses` | `{work_id}` | 同上（worker 启动时获取 supervisor 预先分配的地址） |
 | `unit.register` | 单元完整信息（见 5.1） | `{work_id, registered_at}` |
 | `unit.heartbeat` | `{work_id, stats?}` | `{server_ts}` |
 | `unit.release` | `{work_id, reason?}` | `{released}` |
@@ -160,6 +169,7 @@ work_id 里带 `kind`，是为了让"这是什么进程"从地址上就能读出
 | `task.claim` | `{task_id, agent_id}` | `Task`（被占则 CONFLICT） |
 | `task.update` | `{task_id, patch}` | `Task` |
 | `task.artifact` | `{task_id, artifact}` | `Task` |
+| `task.note` | `{task_id, text, author?}` | `Task` |
 | `task.check` | `{task_id, item_id?, text?, done?}` | `Task` |
 | `agent.register` | `{role, project_id, unit_id, task_id?, model?}` | `Agent` |
 | `agent.update` | `{agent_id, patch}` | `Agent` |
@@ -296,17 +306,17 @@ sys.booted / sys.ready / sys.shutdown / sys.config.updated
 unit.allocated / unit.registered / unit.online / unit.suspect / unit.offline
 unit.released / unit.quarantined / unit.restarted / unit.paused / unit.resumed
 lease.acquired / lease.renewed / lease.released / lease.expired / lease.preempted
-project.created / project.updated / project.archived / project.progress / project.degraded
+project.created / project.updated / project.archived / project.progress / project.degraded / project.completed
 task.created / task.updated / task.claimed / task.started / task.review
 task.completed / task.blocked / task.artifact / task.note
 agent.spawned / agent.registered / agent.working / agent.waiting / agent.finished
-agent.failed / agent.terminated / agent.heartbeat
-approval.requested / approval.decided / approval.auto / approval.expired / approval.used
+agent.failed / agent.terminated / agent.heartbeat / agent.step
+approval.requested / approval.decided / approval.auto / approval.expired / approval.used / approval.ui_decided
 rule.created / rule.updated / rule.deleted
 tool.invoked / tool.result / tool.denied / tool.failed
 failure.detected / failure.action
 chat.message / chat.delta / chat.typing
-memory.updated
+memory.updated / demo.seeded
 ```
 
 事件 `data` 必须自包含：UI 不查库也能渲染一张卡片。
@@ -486,6 +496,8 @@ connect(sys.rpc) → unit.allocate → bind own rpc/events → unit.register
 ```
 
 * 心跳：每 `agents.heartbeat_s` 一次 `unit.heartbeat`。
+* 循环上限 `agents.max_steps`（默认 32）。lead 在容量满/工人尚在启动时不会直接
+  结束，而是冷却 → 重新 `task.list` → 重试派工，直到没有 todo/doing 才交回人工评审。
 * pause/kill 通过单元侧 RPC 实现；kill 走优雅 dispose。
 * 崩溃由 hub 发现（心跳超时）并按失败域处理。
 
@@ -612,7 +624,9 @@ tests/
 * 全部用 stdlib `unittest`（不装 pytest）：`python3 -m unittest discover -s tests -v`。
 * 每个模块自带单测；异步用 `unittest.IsolatedAsyncioTestCase`。
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
-  验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API。
+  验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
+  以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 235 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）
@@ -621,3 +635,30 @@ tests/
 * 强沙箱（容器/命名空间）：用路径白名单 + 命令策略，文档写清限制。
 * 多用户与鉴权：默认单机单操作员，绑定 127.0.0.1。
 * 大规模调度：单 hub，租约语义优先于吞吐。
+
+
+---
+
+## 14. 实现补充与已知偏差（落地时）
+
+1. **Worker 自注册**：supervisor 先 `unit.allocate` 再拉起进程；worker 启动后用
+   `unit.addresses` 取回地址并绑定，随后 `unit.register`。因此 unit 的地址由
+   hub 分配，进程只负责监听，跨设备时地址里的 host 由 `advertise_host` 决定。
+2. **快速退出**：worker 可能在 supervisor 的 200ms 轮询前就 register→finish→exit。
+   hub 在 `unit.register` 时 `note_online`，spawn 不再误判超时。
+3. **非幂等动作去重**：RPC 重试复用 `Envelope.id`，hub 合并 in-flight 请求并缓存
+   结果，避免 `agent.spawn` 被超时重试执行两次。
+4. **Replacement 绑定**：`supervisor.restart` 在拉起新进程前把 agent 的 `unit_id`
+   改成新 work_id，使 worker 的 `agent.register` 复用同一 roster 记录。
+5. **项目级评审**：planner 的最后一个 "评审" 任务没有任务内产物；reviewer 会检查
+   兄弟任务是否都已关闭，若是则按项目工作区做整体验收，而不是误判 blocked。
+6. **演示规则**：`demo` 只是替操作员预置一组项目范围内的 allow 规则
+   （fs.read/list/write、无害 shell、agent.spawn、project.update、data.*），
+   不是绕过审批；项目外写入仍是 pending，等待人工。
+7. **MockBrain 是开环的**：它按角色/步数决定动作，不解析工具返回值（避免把
+   演示写成假智能）。真实模型用 `LLMBrain`，动作协议是 JSON tool call。
+8. **Chat 助手**：`mock` provider 下是确定性意图（状态/建项目/审批/帮助）；
+   `openai` provider 下把实时状态放进 system prompt，工具调用仍走审批口。
+9. **Web**：SSE 断线按 `since` 续传；静态页支持 `?no-sse=1` 快照模式（截图/测试用）。
+10. **测试目录**：IPC socket 受 ~100 字节路径限制，集成测试把 state_dir 放在
+    浅层临时目录；正常仓库路径 `<repo>/.stackflowos/run` 足够短。
