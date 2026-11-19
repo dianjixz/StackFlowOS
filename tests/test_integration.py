@@ -246,6 +246,18 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("sys", payload["data"])
 
+        def test_llm():
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.server.port}/api/llm/test",
+                method="POST", data=b"{}")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return json.loads(response.read().decode())
+
+        llm = await asyncio.to_thread(test_llm)
+        self.assertTrue(llm["ok"])
+        self.assertEqual(llm["data"]["provider"], "mock")
+
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
         writer.write(b"GET /api/events/stream HTTP/1.1\r\nHost: t\r\n\r\n")
         await writer.drain()

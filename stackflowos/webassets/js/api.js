@@ -116,5 +116,6 @@ export const api = {
   /* ---- config & leases ---- */
   getConfig: () => requestJson('/api/config'),
   patchConfig: (patch) => requestJson('/api/config', { method: 'PATCH', body: { patch } }),
+  testLlm: () => requestJson('/api/llm/test', { method: 'POST', body: {} }),
   getLeases: () => requestJson('/api/leases'),
 };

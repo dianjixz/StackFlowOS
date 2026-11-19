@@ -1756,6 +1756,32 @@ function renderSettingsApp() {
       cfgField('Max Tokens', 'llm.max_tokens', 'int'),
       cfgField('超时（秒）', 'llm.timeout_s', 'float'),
     )),
+    formCard('连接测试', '用当前生效的 provider 发一个最小请求。改完设置请先保存再测试。',
+      (() => {
+        const result = el('p', { class: 'form-hint' }, '尚未测试。');
+        const button = el('button', { class: 'btn btn-sm btn-primary', type: 'button' }, '测试连接');
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          result.textContent = '测试中…';
+          try {
+            const data = await api.testLlm();
+            if (data.ok) {
+              result.textContent = `连接成功 · ${data.provider}/${data.model}`
+                + (data.latency_ms != null ? ` · ${data.latency_ms}ms` : '');
+              toast('模型连接正常', 'success');
+            } else {
+              result.textContent = `连接失败 · ${data.error || '未知错误'}`;
+              toast(data.error || '模型连接失败', 'error');
+            }
+          } catch (error) {
+            result.textContent = `连接失败 · ${error.message || error}`;
+            toastError(error);
+          } finally {
+            button.disabled = false;
+          }
+        });
+        return el('div', {}, button, result);
+      })()),
     appNote('API Key 以掩码显示，不会回传明文；留空保存会清除已配置的 Key。', { iconName: 'approvals' }),
   );
 

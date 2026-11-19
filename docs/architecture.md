@@ -641,7 +641,7 @@ tests/
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
-* 当前 `python3 -m unittest discover -s tests -t .` 为 236 个测试。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 242 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）

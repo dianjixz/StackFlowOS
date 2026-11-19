@@ -135,8 +135,12 @@ class OpenAICompatibleProvider:
         self.model = str(model)
         self.api_key = str(api_key or "")
         self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens)
+        # Models rarely accept a million output tokens; a pasted context-window
+        # value used to turn every request into an HTTP 400. Clamp to a sane
+        # ceiling instead of failing at the provider.
+        self.max_tokens = max(1, min(int(max_tokens), 32768))
         self.timeout_s = float(timeout_s)
+        self._endpoint: str | None = None
 
     async def chat(self, messages: list[dict], *,
                    tools: list[dict] | None = None) -> str:
@@ -147,7 +151,7 @@ class OpenAICompatibleProvider:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max(1, min(int(self.max_tokens), 32768)),
         }
         # `tools` is accepted for interface parity; the JSON action protocol
         # keeps provider-native tool calling out of the critical path.
@@ -166,8 +170,30 @@ class OpenAICompatibleProvider:
             raise Unavailable("LLM returned an empty message")
         return text
 
+    def _candidate_urls(self) -> list[str]:
+        """Plausible chat-completion URLs for the configured base URL.
+
+        Operators paste ``http://host:port`` as often as ``.../v1``. Trying
+        the conventional suffixes avoids a confusing 404 for a correct
+        endpoint. The first working URL is cached for later calls.
+        """
+        base = self.base_url
+        if base.endswith("/chat/completions"):
+            urls = [base]
+        elif base.endswith("/v1") or "/v1/" in base:
+            urls = [base + "/chat/completions"]
+        else:
+            urls = [
+                base + "/v1/chat/completions",
+                base + "/chat/completions",
+                base + "/api/chat/completions",
+            ]
+        if self._endpoint is not None and self._endpoint in urls:
+            urls.remove(self._endpoint)
+            urls.insert(0, self._endpoint)
+        return urls
+
     def _post(self, body: dict) -> str:
-        url = f"{self.base_url}/chat/completions"
         raw_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -175,24 +201,39 @@ class OpenAICompatibleProvider:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        request = Request(url, data=raw_body, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=self.timeout_s) as response:
-                return response.read().decode("utf-8", "replace")
-        except HTTPError as exc:
-            detail = ""
+        last_error: Unavailable | None = None
+        for url in self._candidate_urls():
+            request = Request(url, data=raw_body, headers=headers, method="POST")
             try:
-                detail = exc.read()[:300].decode("utf-8", "replace")
-            except Exception:  # pragma: no cover - body may be unreadable
+                with urlopen(request, timeout=self.timeout_s) as response:
+                    raw = response.read().decode("utf-8", "replace")
+                self._endpoint = url
+                return raw
+            except HTTPError as exc:
                 detail = ""
-            detail = _redact(_compact(detail, 200), self.api_key)
-            suffix = f": {detail}" if detail else ""
-            raise Unavailable(f"LLM HTTP {exc.code}{suffix}") from exc
-        except URLError as exc:
-            raise Unavailable(f"LLM connection failed: {exc.reason}") from exc
-        except Exception as exc:  # socket timeout, malformed URL, ...
-            raise Unavailable(
-                f"LLM request failed: {type(exc).__name__}") from exc
+                try:
+                    detail = exc.read()[:300].decode("utf-8", "replace")
+                except Exception:  # pragma: no cover - body may be unreadable
+                    detail = ""
+                detail = _redact(_compact(detail, 200), self.api_key)
+                suffix = f": {detail}" if detail else ""
+                error = Unavailable(f"LLM HTTP {exc.code}{suffix}")
+                if exc.code in (404, 405) or (exc.code == 400 and "model" in detail.lower()):
+                    # Wrong path (or a proxy that only accepts another one);
+                    # try the next candidate. 400/model errors are not path
+                    # problems, so surface them immediately.
+                    if exc.code in (404, 405):
+                        last_error = error
+                        continue
+                raise error from exc
+            except URLError as exc:
+                raise Unavailable(f"LLM connection failed: {exc.reason}") from exc
+            except Exception as exc:  # socket timeout, malformed URL, ...
+                raise Unavailable(
+                    f"LLM request failed: {type(exc).__name__}") from exc
+        if last_error is not None:
+            raise last_error
+        raise Unavailable("LLM request failed: no endpoint candidate")
 
     async def ping(self) -> dict:
         """Round-trip a tiny chat request and report latency."""

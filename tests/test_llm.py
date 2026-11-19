@@ -32,6 +32,15 @@ class _Handler(BaseHTTPRequestHandler):
             "headers": dict(self.headers),
             "body": body,
         })
+        accept_path = getattr(server, "accept_path", None)
+        if accept_path and self.path != accept_path:
+            payload = b'{"error": {"message": "not found"}}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if server.fail:
             payload = b'{"error": {"message": "boom"}}'
             self.send_response(500)
@@ -131,6 +140,24 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["body"]["messages"], messages)
         self.assertEqual(request["body"]["temperature"], 0.1)
         self.assertEqual(request["body"]["max_tokens"], 64)
+
+    async def test_base_url_without_v1_falls_back(self) -> None:
+        self.httpd.accept_path = "/chat/completions"
+        host, port = self.httpd.server_address[:2]
+        provider = OpenAICompatibleProvider(
+            base_url=f"http://{host}:{port}", model="test-model",
+            api_key="sk-test", max_tokens=64, timeout_s=5.0)
+        reply = await provider.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(reply, "你好，这是假模型回复")
+        paths = [request["path"] for request in self.httpd.requests]
+        self.assertIn("/chat/completions", paths)
+        self.assertEqual(provider._endpoint, f"http://{host}:{port}/chat/completions")
+
+    async def test_max_tokens_is_clamped(self) -> None:
+        provider = self._provider()
+        provider.max_tokens = 10_000_000
+        await provider.chat([{"role": "user", "content": "x"}])
+        self.assertEqual(self.httpd.requests[0]["body"]["max_tokens"], 32768)
 
     async def test_ping_round_trip(self) -> None:
         result = await self._provider().ping()

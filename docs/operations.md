@@ -75,6 +75,8 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
    常见原因是 sys RPC 地址不可达、端口池耗尽、项目不存在。
 3. **任务卡在 waiting/审批**：UI「审批」里看 pending；规则没覆盖到当前
    scope。批准后 Agent 下一次轮询就会继续（默认 0.5s）。
+   **对话仍提示离线模型**：确认设置页 provider=openai 且已保存；新版保存后会
+   立即重建 provider，无需重启。用「测试连接」看具体 HTTP/连接错误。
 4. **IPC 地址冲突/陈旧 socket**：停掉旧进程；allocator 启动时会清理自己的
    run 目录；必要时删除 `.stackflowos/run/*.sock`。
 5. **事件流太大**：轮转文件可归档；`events.jsonl` 是权威审计，别随手删。

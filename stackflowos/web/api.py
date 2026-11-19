@@ -92,6 +92,8 @@ class WebAPI:
         r("POST", r"/api/agents", self.agents_spawn)
         r("DELETE", r"/api/agents/([^/]+)", self.agent_kill)
 
+        r("GET", r"/api/llm/test", self.llm_test)
+        r("POST", r"/api/llm/test", self.llm_test)
         r("GET", r"/api/config", self.config_get)
         r("PATCH", r"/api/config", self.config_patch)
         r("GET", r"/api/leases", self.leases_list)
@@ -276,6 +278,20 @@ class WebAPI:
 
     async def agent_kill(self, match, query, body):
         return _ok({"ok": await self.app.kill_agent(match.group(1))})
+
+    async def llm_test(self, match, query, body):
+        """Round-trip a tiny completion against the *live* provider."""
+        provider = getattr(self.app, "provider", None)
+        if provider is None:
+            raise BadRequest("no llm provider configured")
+        result = await provider.ping()
+        return _ok({
+            "provider": getattr(provider, "name", ""),
+            "model": getattr(provider, "model", ""),
+            "ok": bool(result.get("ok")),
+            "latency_ms": result.get("latency_ms"),
+            "error": result.get("error"),
+        })
 
     async def config_get(self, match, query, body):
         return _ok(self.app.config.public_dict())

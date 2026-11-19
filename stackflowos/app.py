@@ -461,6 +461,10 @@ class App:
             "web_port": self.config.web.port,
             "last_seq": self.eventlog.last_seq,
             "units": self.registry.stats(),
+            "llm": {
+                "provider": getattr(self.provider, "name", ""),
+                "model": getattr(self.provider, "model", ""),
+            },
         }
 
     async def _sys_hwinfo(self, data, src):
@@ -1063,8 +1067,24 @@ class App:
                                      "operator")
 
     async def update_config(self, patch: dict) -> dict:
+        if not isinstance(patch, dict) or not patch:
+            raise BadRequest("config patch required")
+        patch = dict(patch)
+        llm_patch = patch.get("llm")
+        if isinstance(llm_patch, dict):
+            llm_patch = dict(llm_patch)
+            # The UI shows the key as "***"; echoing that back must not
+            # overwrite the real secret.
+            if llm_patch.get("api_key") == "***":
+                llm_patch.pop("api_key")
+            patch["llm"] = llm_patch
         previous_mode = self.config.transport.mode
         previous_port = self.config.web.port
+        previous_provider = getattr(self.provider, "name", "")
+        # Build the candidate provider before persisting so an invalid model
+        # or base URL cannot leave a broken config on disk.
+        candidate = self.config.with_overrides(patch)
+        new_provider = make_provider(candidate.llm)
         cfg = self.config.update(patch)
         self.config = cfg
         # Apply what can be applied live.
@@ -1074,10 +1094,21 @@ class App:
             self.policy.auto_allow_low = cfg.security.auto_allow_low
             self.policy.medium_default = cfg.security.medium_default
             self.policy.high_default = cfg.security.high_default
-            if hasattr(self.provider, "configure"):
-                self.provider.configure(cfg.llm)
         except Exception:
             self.log.exception("live config application failed")
+        # Chat sessions hold a provider instance; rebuild it so a model
+        # switch takes effect on the next message instead of on hub restart.
+        self.provider = new_provider
+        if getattr(self, "chat", None) is not None:
+            self.chat.provider = new_provider
+        if getattr(new_provider, "name", "") != previous_provider:
+            self.eventlog.append("sys.llm.updated", {
+                "provider": getattr(new_provider, "name", ""),
+                "model": getattr(new_provider, "model", ""),
+            }, source="sys")
+            self.log.info("llm provider switched to %s (%s)",
+                          getattr(new_provider, "name", "?"),
+                          getattr(new_provider, "model", ""))
         restart_required = []
         if cfg.transport.mode != previous_mode:
             restart_required.append("transport.mode")
@@ -1220,6 +1251,10 @@ class App:
             "sys_events": self.sys_addresses.events,
             "web_port": self.config.web.port,
             "last_seq": self.eventlog.last_seq,
+            "llm": {
+                "provider": getattr(self.provider, "name", ""),
+                "model": getattr(self.provider, "model", ""),
+            },
             "stats": self.stats(),
         }
         return {

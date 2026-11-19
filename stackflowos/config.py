@@ -233,8 +233,13 @@ def _validate_section(name: str, section: Any) -> None:
     elif name == "llm":
         if section.provider not in ("mock", "openai"):
             raise ConfigError("llm.provider must be mock|openai")
-        if section.provider == "openai" and not section.base_url:
-            raise ConfigError("llm.base_url is required for the openai provider")
+        if section.provider == "openai":
+            if not section.base_url:
+                raise ConfigError("llm.base_url is required for the openai provider")
+            if not section.model:
+                raise ConfigError("llm.model is required for the openai provider")
+        if section.max_tokens < 1:
+            raise ConfigError("llm.max_tokens must be positive")
     elif name == "agents":
         if section.heartbeat_s <= 0 or section.offline_after_s <= section.heartbeat_s:
             raise ConfigError("agents.offline_after_s must exceed heartbeat_s")
