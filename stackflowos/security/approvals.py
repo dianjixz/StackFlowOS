@@ -15,6 +15,8 @@ and the last 200 decided ones are persisted atomically.
 from __future__ import annotations
 
 import logging
+import re
+import shlex
 import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -207,6 +209,34 @@ class ApprovalBroker:
                    grant_id=request.grant_id)
         return request
 
+    def _always_scope(self, request: ApprovalRequest) -> dict:
+        """Generalise a shell ``always`` decision to a command family.
+
+        Approving ``sed -n '1p' file`` with mode=always used to create an
+        exact-command rule, so the next ``sed -n '2p' other`` asked again.
+        Generalise to the first executable token inside the same project/cwd.
+        Other capabilities keep their exact scope (a file grant is a file grant).
+        """
+        scope = dict(request.scope or {})
+        if request.capability != "shell.exec":
+            return scope
+        command = str(scope.get("command") or "").strip()
+        if not command:
+            return scope
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        token = next((part for part in parts if "=" not in part and part), "")
+        if not token:
+            return scope
+        general: dict = {}
+        if scope.get("cwd"):
+            general["path_prefix"] = str(scope["cwd"])
+        general["command_regex"] = (
+            rf"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*{re.escape(token)}(?:\s|$)")
+        return general
+
     def _materialise_grant(self, request: ApprovalRequest, mode: str,
                            by: str, now: int) -> Any:
         if mode == "once":
@@ -229,10 +259,14 @@ class ApprovalBroker:
                 created_by=by, source="grant")
         return self.policy.add_rule(
             effect="allow", capability=request.capability,
-            principal=request.principal, scope=request.scope,
+            principal=request.principal,
+            scope=(self._always_scope(request) if mode == "always"
+                   else request.scope),
             risk_max=request.risk,
             expires_at=None, uses_left=None,
-            note=f"approval {request.id} (always)",
+            note=(f"approval {request.id} (always, command family)"
+                  if request.capability == "shell.exec"
+                  else f"approval {request.id} (always)"),
             created_by=by, source="rule")
 
     # -- usage / expiry ---------------------------------------------------

@@ -1400,10 +1400,11 @@ function renderApprovalCard(approval) {
       });
   };
 
+  const alwaysLabel = approval.capability === 'shell.exec' ? '总是允许此类命令' : '总是允许';
   actions.append(
     el('button', { class: 'btn btn-sm btn-ok', type: 'button', onclick: () => decide('allow', 'once', '一次') }, '允许一次'),
     el('button', { class: 'btn btn-sm', type: 'button', onclick: () => decide('allow', 'session', '1 小时') }, '允许 1 小时'),
-    el('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => decide('allow', 'always', '总是') }, '总是允许'),
+    el('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => decide('allow', 'always', '总是') }, alwaysLabel),
     el('span', { class: 'spacer' }),
     el('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => decide('deny', 'once', '拒绝') }, '拒绝'),
   );

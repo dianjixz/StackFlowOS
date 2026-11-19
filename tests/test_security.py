@@ -488,8 +488,33 @@ class ApprovalTests(SecurityTestBase):
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make"}, risk="high").outcome,
             "allow")
+        # "always" generalises to the command family, so a different target
+        # of the same binary does not ask again.
+        self.assertEqual(self.policy.evaluate(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "make test"},
+            risk="high").outcome, "allow")
         self.assertTrue(self.broker.use(rule.id))
         self.assertIsNotNone(self.policy.get_rule(rule.id))
+
+    def test_decide_always_generalises_shell_command_family(self):
+        request = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace),
+             "command": "sed -n '1p' README.md"}, project_id="p-1")
+        decided = self.broker.decide(request.id, decision="allow",
+                                     mode="always")
+        rule = self.policy.get_rule(decided.grant_id)
+        self.assertIn("command_regex", rule.scope)
+        self.assertNotIn("command", rule.scope)
+        self.assertEqual(self.policy.evaluate(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "sed -n '2p' docs/x.md"},
+            risk="high").outcome, "allow")
+        self.assertEqual(self.policy.evaluate(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "cat README.md"},
+            risk="high").outcome, "ask")
 
     def test_decide_deny(self):
         request = self.broker.request(
