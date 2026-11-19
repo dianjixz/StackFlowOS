@@ -262,8 +262,12 @@ stackflowos hub      [--transport ipc|tcp] [--port 17800] [--no-web]
 stackflowos demo     [--until-done] [--timeout 240] [--goal ...]
 stackflowos doctor
 stackflowos status   [--url http://127.0.0.1:17800]
+stackflowos attach   --sys tcp://<hub>:17820 --role coder --project p-1
 stackflowos worker   （内部：由 supervisor 拉起）
 ```
+
+`attach` 让一台设备/一个终端手动接入运行中的 hub：向 hub 申请一个 unit 地址，
+在本机起一个 worker 进程；它是 supervisor 内部拉起工人的同一条路径。
 
 ---
 

@@ -52,6 +52,15 @@ class ConfigTests(unittest.TestCase):
             cfg.update({"nonsense": {"x": 1}})
         self.assertFalse(cfg.paths.config_file.exists())
 
+    def test_cli_overrides_are_not_persisted(self):
+        cfg = Config.load(self.root)
+        changed = cfg.with_overrides({"web": {"port": 17955},
+                                     "transport": {"mode": "tcp"}})
+        self.assertEqual(changed.web.port, 17955)
+        self.assertEqual(changed.transport.mode, "tcp")
+        self.assertFalse(cfg.paths.config_file.exists())
+        self.assertEqual(Config.load(self.root).web.port, 17800)
+
     def test_public_masks_secret(self):
         cfg = Config.load(self.root)
         cfg = cfg.update({"llm": {"api_key": "sk-secret"}})

@@ -279,6 +279,18 @@ class Config:
 
     def update(self, patch: dict) -> "Config":
         """Deep-merge a validated patch, persist it, return a new Config."""
+        return self.apply(patch, persist=True)
+
+    def with_overrides(self, patch: dict) -> "Config":
+        """Apply CLI/runtime overrides without writing config.json.
+
+        Flags like ``--port`` or ``--transport`` are meant for one process;
+        persisting them used to leak a demo's TCP mode into the next hub boot.
+        """
+        return self.apply(patch, persist=False)
+
+    def apply(self, patch: dict, *, persist: bool = True) -> "Config":
+        """Validate a patch against the current config; optionally persist it."""
         if not isinstance(patch, dict) or not patch:
             raise ConfigError("config patch must be a non-empty object")
         for name in patch:
@@ -288,10 +300,11 @@ class Config:
         # touching disk first, so a rejected patch persists nothing.
         merged_raw = deep_merge(self.to_dict(), patch)
         sections = {name: _build_section(name, merged_raw[name]) for name in _SECTIONS}
-        current_overrides = read_json(self.paths.config_file, default={})
-        if not isinstance(current_overrides, dict):
-            current_overrides = {}
-        write_json(self.paths.config_file, deep_merge(current_overrides, patch))
+        if persist:
+            current_overrides = read_json(self.paths.config_file, default={})
+            if not isinstance(current_overrides, dict):
+                current_overrides = {}
+            write_json(self.paths.config_file, deep_merge(current_overrides, patch))
         return Config(paths=self.paths, **sections)
 
     def save(self) -> None:

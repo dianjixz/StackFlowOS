@@ -54,6 +54,17 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="print a running hub's state")
     status.add_argument("--url", default=None, help="hub base URL (default: config web host/port)")
 
+    attach = sub.add_parser("attach", help="attach one worker unit to a running hub")
+    attach.add_argument("--sys", required=True, help="hub sys rpc address (ipc:// or tcp://)")
+    attach.add_argument("--role", required=True,
+                        choices=("lead", "architect", "coder", "tester", "reviewer",
+                                 "researcher", "aggregator"))
+    attach.add_argument("--project")
+    attach.add_argument("--task")
+    attach.add_argument("--label", default="")
+    attach.add_argument("--root", default=None)
+    attach.add_argument("--state-dir", default=None)
+
     worker = sub.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--sys", required=True)
     worker.add_argument("--work-id", required=True)
@@ -83,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             args.no_web = False
         args.open = False
 
+    if args.command == "attach":
+        return _run_cli(lambda: asyncio.run(_attach(args)))
     if args.command == "worker":
         from .units.worker import worker_parser, run_worker
 
@@ -100,6 +113,42 @@ def main(argv: list[str] | None = None) -> int:
     return _run_cli(lambda: _hub(args))
 
 
+async def _attach(args) -> int:
+    """Allocate a unit on a running hub and run one worker process here.
+
+    This is the manual/remote path: the supervisor uses it internally for
+    local workers, but an operator can also point it at tcp://hub:port from
+    another device (the unit binds the addresses the hub allocated).
+    """
+    import argparse as _argparse
+
+    from .transport import RpcClient
+    from .units.worker import run_worker
+
+    cfg = Config.load(root=Path(args.root) if args.root else None,
+                      state_dir=Path(args.state_dir) if args.state_dir else None)
+    setup_logging("INFO", cfg.paths.log_file)
+    client = RpcClient(args.sys, src="attach", dst="sys", timeout=15.0)
+    await client.start()
+    try:
+        allocation = await client.call("unit.allocate", {
+            "kind": args.role,
+            "project_id": args.project,
+            "label": args.label or args.role,
+        })
+    finally:
+        await client.stop()
+    work_id = allocation["work_id"]
+    print(f"attached as {work_id} to {args.sys}")
+    ns = _argparse.Namespace(
+        sys=args.sys, work_id=work_id, role=args.role,
+        project=args.project, task=args.task,
+        state_dir=str(cfg.paths.state_dir), root=str(cfg.paths.root),
+        label=args.label or args.role,
+    )
+    return await run_worker(ns)
+
+
 def _build_config(args, *, for_web: bool = True) -> Config:
     cfg = Config.load(root=Path(args.root) if args.root else None,
                       state_dir=Path(args.state_dir) if args.state_dir else None)
@@ -111,7 +160,8 @@ def _build_config(args, *, for_web: bool = True) -> Config:
     if getattr(args, "host", None):
         patch.setdefault("web", {})["host"] = args.host
     if patch:
-        cfg = cfg.update(patch)
+        # CLI flags are per-process; only the Settings UI persists changes.
+        cfg = cfg.with_overrides(patch)
     return cfg
 
 

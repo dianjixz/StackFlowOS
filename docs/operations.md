@@ -58,7 +58,8 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
 
 ## 3. 进程模型与观察
 
-- hub：一个进程，`work_id = sys.0`。
+- hub：一个进程，`work_id = sys.0`；同一 state 目录只允许一个 hub
+  （`run/hub.lock` 独占，第二个会直接报错退出）。
 - worker：每个 Agent 一个进程，由 supervisor 用
   `python -m stackflowos.worker` 拉起；日志在 `.stackflowos/logs/agents/`。
 - 查看 `ps -ef | grep stackflowos.worker` 能看到每个工人的真实进程。
@@ -88,8 +89,13 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
 1. hub 配置 `transport.mode = "tcp"`，`transport.host` 设为设备可达地址，
    `transport.advertise_host` 设为**远端能拨到的 hub 地址**（例如局域网 IP）。
 2. 放行防火墙上的 sys RPC 端口与单元端口池。
-3. 远端设备安装同一份代码（需要 `pynng`），把 `.stackflowos/` 放在本地；
-   将 worker 的 `--sys` 指向 `tcp://<hub-ip>:<port>`。
+3. 远端设备安装同一份代码（需要 `pynng`），在本地有自己的 `.stackflowos/`；
+   用 attach 接入：
+   ```bash
+   stackflowos attach --sys tcp://<hub-ip>:17820 --role coder --project p-1
+   ```
+   它会向 hub 申请 work_id 与地址，在本机起一个 worker 进程；任务结束自动退出。
+   也可以手动指定 `--task t-3`。
 
 当前版本**没有设备发现**：地址要显式配置；sys 仍是单点；远端设备上的
 worker 会绑定 hub 分配端口池中的端口，需要保证该端口在该设备上可用。

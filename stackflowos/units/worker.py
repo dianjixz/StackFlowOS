@@ -117,6 +117,11 @@ async def run_worker(args: argparse.Namespace) -> int:
         runner_ref = state.get("runner")
         if runner_ref is not None:
             runner_ref.kill()
+        # A runner blocked in a tool call/approval poll must be interrupted;
+        # the flag alone is only checked between steps.
+        run_task = state.get("run_task")
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
         stop_event.set()
         return {"killed": True}
 
@@ -225,13 +230,19 @@ async def run_worker(args: argparse.Namespace) -> int:
         heartbeat_task = asyncio.create_task(heartbeat_loop())
 
         run_task = asyncio.create_task(runner.run())
+        state["run_task"] = run_task
         stop_waiter = asyncio.create_task(stop_event.wait())
         done, _pending = await asyncio.wait({run_task, stop_waiter},
                                             return_when=asyncio.FIRST_COMPLETED)
         if run_task in done:
-            result = run_task.result()
-            state["status"] = result.status
-            log.info("agent finished: %s (%s steps)", result.status, result.steps)
+            try:
+                result = run_task.result()
+            except asyncio.CancelledError:
+                state["status"] = "killed"
+                log.info("agent cancelled by unit.kill")
+            else:
+                state["status"] = result.status
+                log.info("agent finished: %s (%s steps)", result.status, result.steps)
         else:
             runner.kill()
             try:
