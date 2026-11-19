@@ -1,0 +1,427 @@
+"""Command line entry points.
+
+    stackflowos hub      boot the hub (sys unit + web console)
+    stackflowos demo     boot + seed a self-contained project and watch it work
+    stackflowos worker   internal: one worker unit (spawned by the supervisor)
+    stackflowos doctor   environment / configuration checks
+    stackflowos status   print a running hub's state as text
+
+Everything is local-first: the hub binds 127.0.0.1 by default and writes only
+under ``<repo>/.stackflowos``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import signal
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from . import __version__
+from .config import Config, ConfigError
+from .util.logging import get_logger, setup_logging
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="stackflowos",
+                                     description="StackFlowOS — an agent-native operating system")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    hub = sub.add_parser("hub", help="boot the hub and the web console")
+    _add_common(hub)
+    hub.add_argument("--no-web", action="store_true", help="do not start the HTTP console")
+
+    demo = sub.add_parser("demo", help="boot, seed a demo project and watch agents work")
+    _add_common(demo)
+    demo.add_argument("--goal", default="构建一个把 Markdown 转成 HTML 的命令行工具，包含实现、测试和文档")
+    demo.add_argument("--name", default="演示：Markdown → HTML 工具")
+    demo.add_argument("--until-done", action="store_true",
+                      help="exit once the demo project reaches review/done (for CI)")
+    demo.add_argument("--timeout", type=int, default=240)
+    demo.add_argument("--no-web", action="store_true")
+
+    doctor = sub.add_parser("doctor", help="check environment and configuration")
+    _add_common(doctor)
+
+    status = sub.add_parser("status", help="print a running hub's state")
+    status.add_argument("--url", default=None, help="hub base URL (default: config web host/port)")
+
+    worker = sub.add_parser("worker", help=argparse.SUPPRESS)
+    worker.add_argument("--sys", required=True)
+    worker.add_argument("--work-id", required=True)
+    worker.add_argument("--role", required=True)
+    worker.add_argument("--project")
+    worker.add_argument("--task")
+    worker.add_argument("--state-dir", required=True)
+    worker.add_argument("--root", required=True)
+    worker.add_argument("--label", default="")
+    return parser
+
+
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--root", default=None, help="repository root (default: auto)")
+    parser.add_argument("--state-dir", default=None, help="runtime state directory")
+    parser.add_argument("--transport", choices=("ipc", "tcp"), default=None)
+    parser.add_argument("--port", type=int, default=None, help="web console port")
+    parser.add_argument("--host", default=None, help="web console bind host")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command is None:
+        args.command = "hub"
+        args.root = args.state_dir = args.transport = args.port = args.host = None
+        if not hasattr(args, "no_web"):
+            args.no_web = False
+        args.open = False
+
+    if args.command == "worker":
+        from .units.worker import worker_parser, run_worker
+
+        # Reuse the worker parser so both entry points share one contract.
+        worker_args = worker_parser().parse_args(
+            [a for a in (argv if argv is not None else sys.argv[1:])][1:]
+        )
+        return _worker_main(worker_args)
+    if args.command == "doctor":
+        return _doctor(args)
+    if args.command == "status":
+        return _status(args)
+    if args.command == "demo":
+        return _run_cli(lambda: asyncio.run(_demo(args)))
+    return _run_cli(lambda: _hub(args))
+
+
+def _build_config(args, *, for_web: bool = True) -> Config:
+    cfg = Config.load(root=Path(args.root) if args.root else None,
+                      state_dir=Path(args.state_dir) if args.state_dir else None)
+    patch: dict = {}
+    if getattr(args, "transport", None):
+        patch.setdefault("transport", {})["mode"] = args.transport
+    if getattr(args, "port", None):
+        patch.setdefault("web", {})["port"] = args.port
+    if getattr(args, "host", None):
+        patch.setdefault("web", {})["host"] = args.host
+    if patch:
+        cfg = cfg.update(patch)
+    return cfg
+
+
+def _run_cli(factory) -> int:
+    try:
+        return factory()
+    except ConfigError as exc:
+        print(f"config error: {exc.message}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+# ---------------------------------------------------------------------------
+# hub / demo
+# ---------------------------------------------------------------------------
+
+def _hub(args) -> int:
+    return asyncio.run(_run_hub(args))
+
+
+async def _run_hub(args, *, demo: bool = False) -> int:
+    from .app import App
+    from .web.server import WebServer
+
+    cfg = _build_config(args)
+    setup_logging("INFO", cfg.paths.log_file)
+    app = App(cfg)
+    await app.start()
+    server = None
+    if not getattr(args, "no_web", False):
+        server = WebServer(app, host=cfg.web.host, port=cfg.web.port)
+        url = await server.start()
+        print(f"\n  StackFlowOS 已启动  →  {url}")
+        print(f"  transport: {cfg.transport.mode}   state: {cfg.paths.state_dir}")
+        print("  Ctrl-C 退出\n")
+        if getattr(args, "open", False):
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+    else:
+        print(f"hub started (transport={cfg.transport.mode}, web disabled)")
+    stop_event = asyncio.Event()
+
+    def _stop(*_args):
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:  # pragma: no cover
+            pass
+    try:
+        await stop_event.wait()
+    finally:
+        if server is not None:
+            await server.stop()
+        await app.stop()
+    return 0
+
+
+async def _demo(args) -> int:
+    from .app import App
+    from .web.server import WebServer
+
+    cfg = _build_config(args)
+    setup_logging("INFO", cfg.paths.log_file)
+    app = App(cfg)
+    await app.start()
+    server = None
+    if not getattr(args, "no_web", False):
+        server = WebServer(app, host=cfg.web.host, port=cfg.web.port)
+        url = await server.start()
+        print(f"\n  StackFlowOS demo  →  {url}\n")
+
+    await seed_demo(app, name=args.name, goal=args.goal)
+    if getattr(args, "until_done", False):
+        return await _watch_demo(app, timeout=args.timeout, server=server)
+    stop_event = asyncio.Event()
+
+    def _stop(*_args):
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:  # pragma: no cover
+            pass
+    try:
+        await stop_event.wait()
+    finally:
+        if server is not None:
+            await server.stop()
+        await app.stop()
+    return 0
+
+
+async def seed_demo(app, *, name: str, goal: str) -> dict:
+    """Create one project, seed safe project-scoped rules, and let the OS work."""
+    existing = [p for p in app.projects.list() if p.status in ("active", "review")]
+    if existing:
+        return app.project_card(existing[0].id)
+
+    projects_root = str(app.paths.projects_dir)
+    app.policy.add_rule(
+        effect="allow", capability="fs.read", principal="*",
+        scope={"path_prefix": projects_root}, risk_max="high",
+        note="demo: project workspaces are readable", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="fs.list", principal="*",
+        scope={"path_prefix": projects_root}, risk_max="high",
+        note="demo: project workspaces are listable", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="fs.write", principal="*",
+        scope={"path_prefix": projects_root}, risk_max="high",
+        note="demo: workers may write inside project workspaces", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="shell.exec", principal="*",
+        scope={"command_regex": r"^(python3?|pytest|ls|cat|echo|mkdir|cp|mv|true|git)(\s|$)"},
+        risk_max="high",
+        note="demo: harmless project-local commands", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="agent.spawn", principal="*",
+        scope={}, risk_max="high",
+        note="demo: the lead may hire workers", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="project.update", principal="*",
+        scope={}, risk_max="high",
+        note="demo: the lead may hand a project to review", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="data.read", principal="*",
+        scope={}, risk_max="high",
+        note="demo: read-only project data", created_by="demo",
+    )
+    app.policy.add_rule(
+        effect="allow", capability="data.write", principal="*",
+        scope={}, risk_max="high",
+        note="demo: project memory writes", created_by="demo",
+    )
+    app.eventlog.append("demo.seeded", {
+        "name": name, "goal": goal,
+        "rules": ["fs.read", "fs.list", "fs.write", "shell.exec",
+                  "agent.spawn", "data.read", "data.write"],
+    }, source="operator")
+    return await app.create_project(name=name, goal=goal, created_by="demo")
+
+
+async def _watch_demo(app, *, timeout: int, server=None) -> int:
+    deadline = time.time() + timeout
+    project_id = None
+    cards = [p for p in app.projects.list() if p.status in ("active", "review", "degraded")]
+    if cards:
+        project_id = cards[0].id
+    while time.time() < deadline:
+        await asyncio.sleep(2.0)
+        if project_id is None:
+            break
+        card = app.project_card(project_id)
+        counts = card.get("counts") or {}
+        print(f"[demo] {card.get('status'):8s} progress={card.get('progress', 0):3d}% "
+              f"todo={counts.get('todo', 0)} doing={counts.get('doing', 0)} "
+              f"review={counts.get('review', 0)} done={counts.get('done', 0)} "
+              f"agents={len(card.get('agents') or [])} "
+              f"approvals={card.get('pending_approvals', 0)}")
+        if card.get("status") in ("review", "done"):
+            break
+    card = app.project_card(project_id) if project_id else {}
+    print("\n=== demo finished ===")
+    print(json.dumps({k: card.get(k) for k in
+                      ("id", "name", "status", "progress", "counts")},
+                     ensure_ascii=False, indent=2))
+    tasks = app.projects.task_list(project_id=project_id) if project_id else []
+    for task in tasks:
+        print(f"  [{task.status:7s}] {task.title}  ({task.role or '-'})")
+    print(f"\nartifacts: {app.paths.projects_dir / project_id / 'workspace' if project_id else '-'}")
+    if server is not None:
+        await server.stop()
+    await app.stop()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# worker / doctor / status
+# ---------------------------------------------------------------------------
+
+def _worker_main(args) -> int:
+    from .units.worker import run_worker
+
+    async def _run() -> int:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+
+        def _signal(*_a):
+            if task is not None:
+                task.cancel()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal)
+            except NotImplementedError:  # pragma: no cover
+                pass
+        try:
+            return await run_worker(args)
+        except asyncio.CancelledError:
+            return 0
+
+    return asyncio.run(_run())
+
+
+def _doctor(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        import pynng
+        print(f"[ok] pynng {pynng.__version__}")
+    except Exception as exc:
+        problems.append(f"pynng import failed: {exc}")
+
+    print(f"[ok] python {sys.version.split()[0]} at {sys.executable}")
+    print(f"[ok] root      {cfg.paths.root}")
+    print(f"[ok] state dir  {cfg.paths.state_dir}")
+    try:
+        cfg.paths.ensure()
+        probe = cfg.paths.tmp_dir / ".write-probe"
+        probe.write_text("ok", "utf-8")
+        probe.unlink()
+        print("[ok] state dir writable")
+    except Exception as exc:
+        problems.append(f"state dir not writable: {exc}")
+
+    # web port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((cfg.web.host, cfg.web.port))
+        print(f"[ok] web port {cfg.web.port} is free ({cfg.web.host})")
+    except OSError as exc:
+        warnings.append(f"web port {cfg.web.port} unavailable: {exc}")
+    finally:
+        sock.close()
+
+    # transport pool
+    if cfg.transport.mode == "tcp":
+        start, end = cfg.transport.port_pool_start, cfg.transport.port_pool_end
+        print(f"[ok] tcp port pool {start}-{end}")
+    else:
+        print(f"[ok] ipc directory {cfg.transport.ipc_dir or cfg.paths.run_dir}")
+
+    print(f"[ok] llm provider {cfg.llm.provider}"
+          + (f" model={cfg.llm.model}" if cfg.llm.model else ""))
+
+    log_size = 0
+    current = cfg.paths.events_dir / "events.jsonl"
+    if current.exists():
+        log_size = current.stat().st_size
+    print(f"[ok] event log {current} ({log_size} bytes)")
+
+    for warning in warnings:
+        print(f"[warn] {warning}")
+    for problem in problems:
+        print(f"[fail] {problem}")
+    if problems:
+        return 1
+    print("\nAll checks passed. Start with: python3 -m stackflowos hub")
+    return 0
+
+
+def _status(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    url = args.url or f"http://{cfg.web.host}:{cfg.web.port}"
+    try:
+        with urllib.request.urlopen(f"{url}/api/state", timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"cannot reach hub at {url}: {exc}", file=sys.stderr)
+        return 1
+    data = payload.get("data") or {}
+    info = data.get("sys") or {}
+    stats = data.get("stats") or {}
+    print(f"{info.get('name')} {info.get('version')} @ {info.get('host')} "
+          f"({info.get('transport')})  uptime={stats.get('uptime_s')}s")
+    print(f"units={stats.get('units', {}).get('online', 0)} "
+          f"agents={len(data.get('agents') or [])} "
+          f"projects={len(data.get('projects') or [])} "
+          f"leases={stats.get('leases', 0)} "
+          f"approvals={stats.get('pending_approvals', 0)} "
+          f"events={stats.get('events', 0)}")
+    for card in data.get("projects") or []:
+        counts = card.get("counts") or {}
+        print(f"  {card.get('id')}  {card.get('name')}  {card.get('status')}  "
+              f"{card.get('progress', 0)}%  "
+              f"(todo {counts.get('todo', 0)}, doing {counts.get('doing', 0)}, "
+              f"review {counts.get('review', 0)}, done {counts.get('done', 0)})")
+    for ap in data.get("approvals") or []:
+        print(f"  approval {ap.get('id')} {ap.get('capability')} "
+              f"risk={ap.get('risk')} principal={ap.get('principal')}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

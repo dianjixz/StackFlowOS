@@ -1,0 +1,726 @@
+"""Persistent project store.
+
+The store is the only writer of the project domain: it owns the JSON state
+file, the id counter file, the project workspaces and the event emission
+(``project.*`` / ``task.*``) described in docs/architecture.md §5.6 and §7.
+
+Design notes:
+
+* every mutation is persisted before its event is emitted, so an event
+  listener that reloads state never sees a half-written domain;
+* ``<state>/state/projects.json`` is ``{"projects": [...], "version": 1}``.
+  Tasks are embedded in their project record under ``"tasks"`` because the
+  architecture file keeps the whole project domain in one file and
+  :class:`~stackflowos.projects.models.Project` itself has no task field;
+* ``<state>/state/counters.json`` is ``{"project": n, "task": n,
+  "milestone": n}`` with the same atomic-write semantics as
+  :class:`stackflowos.util.jsonio.Counter`;
+* the store is not thread-safe by design; StackFlowOS runs one asyncio loop.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from ..errors import Conflict, NotFound, ValidationError
+from ..kernel.context import Context
+from ..util.jsonio import now_ms, read_json, write_json
+from ..util.logging import get_logger
+from .models import (
+    Milestone,
+    Project,
+    ProjectStatus,
+    TASK_PROGRESS_WEIGHTS,
+    Task,
+    TaskStatus,
+    progress_for,
+    validate_task_transition,
+)
+
+_COUNTER_KINDS = ("project", "task", "milestone")
+_ID_PREFIX = {"project": "p", "task": "t", "milestone": "m"}
+_UPDATE_FIELDS = ("name", "goal", "status", "tags", "color", "brief", "degraded")
+_TASK_UPDATE_FIELDS = (
+    "title",
+    "description",
+    "status",
+    "priority",
+    "assignee",
+    "role",
+    "error",
+)
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def _validate_priority(priority: Any) -> int:
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise ValidationError(f"priority must be an integer 0..3, got {priority!r}")
+    if priority < 0 or priority > 3:
+        raise ValidationError(f"priority must be within 0..3, got {priority}")
+    return priority
+
+
+def _id_number(ident: str, prefix: str) -> int:
+    """Parse ``p-12`` into ``12``; return 0 for foreign ids."""
+    if not ident.startswith(prefix + "-"):
+        return 0
+    try:
+        return int(ident.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+class ProjectStore:
+    """Load, mutate and persist projects, tasks and milestones.
+
+    ``ctx`` may be ``None`` (tests, seeding tools); when it is a
+    :class:`~stackflowos.kernel.context.Context` the store emits every event
+    through it and logs through ``ctx.log``. ``events`` is an optional
+    event-log sink with ``append(type, data, *, source, project_id)``.
+    """
+
+    def __init__(
+        self,
+        ctx: Context,
+        *,
+        state_path: Path,
+        counter_path: Path,
+        events: Any = None,
+        workspace_root: Path | None = None,
+    ) -> None:
+        self.ctx = ctx
+        self.state_path = Path(state_path)
+        self.counter_path = Path(counter_path)
+        self.events = events
+        base = Path(workspace_root) if workspace_root is not None \
+            else self.state_path.parent / "projects"
+        self.workspace_root = base
+        self._log = ctx.log if ctx is not None else get_logger("projects")
+        self._projects: dict[str, Project] = {}
+        self._tasks: dict[str, Task] = {}
+        self._counters: dict[str, int] = self._read_counters()
+        self.load()
+
+    # -- persistence ------------------------------------------------------
+    def load(self) -> None:
+        """(Re)load projects and tasks from :attr:`state_path`.
+
+        A missing file means an empty store. Id counters are raised to at
+        least the highest id found on disk so a lost counter file cannot make
+        the store hand out duplicate ids.
+        """
+        raw = read_json(self.state_path, default=None)
+        self._projects.clear()
+        self._tasks.clear()
+        if raw is not None:
+            if not isinstance(raw, dict):
+                raise ValueError(f"invalid project state file: {self.state_path}")
+            for item in raw.get("projects") or []:
+                if not isinstance(item, dict):
+                    continue
+                project = Project.from_dict(item)
+                self._projects[project.id] = project
+                for task_item in item.get("tasks") or []:
+                    if not isinstance(task_item, dict):
+                        continue
+                    task = Task.from_dict(task_item)
+                    if not task.project_id:
+                        task.project_id = project.id
+                    self._tasks[task.id] = task
+        self._counters = self._read_counters()
+        self._sync_counters()
+
+    def save(self) -> None:
+        """Atomically write the whole project domain to :attr:`state_path`."""
+        projects: list[dict] = []
+        for project in sorted(self._projects.values(),
+                              key=lambda item: (item.created_at, item.id)):
+            record = project.to_dict()
+            tasks = sorted(
+                (task for task in self._tasks.values()
+                 if task.project_id == project.id),
+                key=lambda task: (-task.priority, task.created_at, task.id),
+            )
+            record["tasks"] = [task.to_dict() for task in tasks]
+            projects.append(record)
+        write_json(self.state_path, {"projects": projects, "version": 1})
+
+    def _read_counters(self) -> dict[str, int]:
+        raw = read_json(self.counter_path, default=None)
+        counters = {kind: 0 for kind in _COUNTER_KINDS}
+        if isinstance(raw, dict):
+            for kind in _COUNTER_KINDS:
+                try:
+                    counters[kind] = max(0, int(raw.get(kind, 0) or 0))
+                except (TypeError, ValueError):
+                    counters[kind] = 0
+        return counters
+
+    def _write_counters(self) -> None:
+        write_json(self.counter_path, dict(self._counters))
+
+    def _sync_counters(self) -> None:
+        """Raise counters to the highest id present in the loaded data."""
+        maxima = {kind: 0 for kind in _COUNTER_KINDS}
+        for project_id, project in self._projects.items():
+            maxima["project"] = max(
+                maxima["project"], _id_number(project_id, _ID_PREFIX["project"]))
+            for milestone in project.milestones:
+                maxima["milestone"] = max(
+                    maxima["milestone"],
+                    _id_number(milestone.id, _ID_PREFIX["milestone"]))
+        for task_id in self._tasks:
+            maxima["task"] = max(
+                maxima["task"], _id_number(task_id, _ID_PREFIX["task"]))
+        changed = False
+        for kind, value in maxima.items():
+            if value > self._counters.get(kind, 0):
+                self._counters[kind] = value
+                changed = True
+        if changed:
+            self._write_counters()
+
+    def _next_id(self, kind: str) -> str:
+        number = self._counters.get(kind, 0) + 1
+        self._counters[kind] = number
+        self._write_counters()
+        return f"{_ID_PREFIX[kind]}-{number}"
+
+    # -- events -----------------------------------------------------------
+    def _emit(self, event_type: str, data: dict, *,
+              project_id: str | None = None) -> None:
+        """Append to the event log (if any) and emit through the context."""
+        record: Any = None
+        if self.events is not None:
+            try:
+                record = self.events.append(
+                    event_type, data, source="sys", project_id=project_id)
+            except TypeError:
+                # Duck-typed sink with the minimal append(type, data) shape.
+                record = self.events.append(event_type, data)
+        if record is not None and hasattr(record, "to_dict"):
+            payload = record.to_dict()
+        elif isinstance(record, dict):
+            payload = record
+        else:
+            payload = {
+                "type": event_type,
+                "data": data,
+                "source": "sys",
+                "project_id": project_id,
+                "ts": now_ms(),
+            }
+        if self.ctx is not None:
+            self.ctx.emit(event_type, payload)
+        self._log.debug("project event %s", event_type)
+
+    def _emit_progress(self, project: Project) -> None:
+        """Emit ``project.progress`` for ``project``."""
+        info = self.project_progress(project.id)
+        self._emit(
+            "project.progress",
+            {
+                "project_id": project.id,
+                "progress": info["progress"],
+                "counts": info["counts"],
+            },
+            project_id=project.id,
+        )
+
+    # -- projects ---------------------------------------------------------
+    def create(
+        self,
+        name: str,
+        goal: str = "",
+        *,
+        created_by: str = "operator",
+        tags: list[str] | None = None,
+        color: str | None = None,
+        milestones: Any = None,
+    ) -> Project:
+        """Create an active project, its workspace dir and its milestones."""
+        clean_name = (name or "").strip()
+        if not clean_name:
+            raise ValidationError("project name is required")
+        now = now_ms()
+        project_id = self._next_id("project")
+        workspace = (self.workspace_root / project_id / "workspace").resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        project = Project(
+            id=project_id,
+            name=clean_name,
+            goal=goal or "",
+            status=ProjectStatus.ACTIVE,
+            created_by=created_by or "operator",
+            created_at=now,
+            updated_at=now,
+            tags=_as_str_list(tags),
+            color=color or "#7c5cff",
+            workspace=str(workspace),
+        )
+        for spec in milestones or []:
+            project.milestones.append(self._new_milestone(project.id, spec, now))
+        self._projects[project.id] = project
+        self.save()
+        self._emit("project.created", project.to_dict(), project_id=project.id)
+        return project
+
+    def _new_milestone(self, project_id: str, spec: Any, now: int) -> Milestone:
+        """Build a milestone from a title string, dict or Milestone."""
+        if isinstance(spec, Milestone):
+            title, description, status = spec.title, spec.description, spec.status
+            task_ids = list(spec.task_ids)
+        elif isinstance(spec, str):
+            title, description, status, task_ids = spec, "", "todo", []
+        elif isinstance(spec, dict):
+            title = str(spec.get("title", ""))
+            description = str(spec.get("description", ""))
+            status = str(spec.get("status", "todo"))
+            task_ids = _as_str_list(spec.get("task_ids"))
+        else:
+            raise ValidationError(f"invalid milestone spec: {spec!r}")
+        return Milestone(
+            id=self._next_id("milestone"),
+            project_id=project_id,
+            title=title.strip(),
+            description=description,
+            status=status,
+            task_ids=task_ids,
+            created_at=now,
+        )
+
+    def get(self, project_id: str) -> Project:
+        """Return a project or raise :class:`NotFound`."""
+        project = self._projects.get(str(project_id))
+        if project is None:
+            raise NotFound(f"project {project_id!r} not found")
+        return project
+
+    def list(self, *, status: str | None = None) -> list[Project]:
+        """Return projects, optionally filtered by status, in creation order."""
+        projects = [
+            project for project in self._projects.values()
+            if status is None or project.status == status
+        ]
+        return sorted(projects, key=lambda project: (project.created_at, project.id))
+
+    def update(self, project_id: str, patch: dict) -> Project:
+        """Apply a whitelisted project patch and emit ``project.updated``.
+
+        Archiving is not allowed through this method: use :meth:`archive`
+        because it also stamps ``archived_at``.
+        """
+        if not isinstance(patch, dict):
+            raise ValidationError("project patch must be a dict")
+        project = self.get(project_id)
+        self._require_mutable(project)
+        if "name" in patch:
+            name = str(patch.get("name") or "").strip()
+            if not name:
+                raise ValidationError("project name is required")
+            project.name = name
+        if "goal" in patch:
+            project.goal = str(patch.get("goal") or "")
+        if "status" in patch:
+            status = str(patch.get("status") or "")
+            if status == ProjectStatus.ARCHIVED:
+                raise ValidationError(
+                    "use archive() to archive a project",
+                    detail={"status": status},
+                )
+            if status not in ProjectStatus.UPDATABLE:
+                raise ValidationError(
+                    f"invalid project status: {status!r}",
+                    detail={"status": status,
+                            "allowed": list(ProjectStatus.UPDATABLE)},
+                )
+            project.status = status
+        if "tags" in patch:
+            project.tags = _as_str_list(patch.get("tags"))
+        if "color" in patch:
+            color = str(patch.get("color") or "").strip()
+            if color:
+                project.color = color
+        if "brief" in patch:
+            project.brief = str(patch.get("brief") or "")
+        if "degraded" in patch:
+            project.degraded = bool(patch.get("degraded"))
+        now = now_ms()
+        project.updated_at = now
+        self.save()
+        self._emit("project.updated", project.to_dict(), project_id=project.id)
+        return project
+
+    def archive(self, project_id: str) -> Project:
+        """Move a project to ``archived`` and stamp ``archived_at``."""
+        project = self.get(project_id)
+        self._require_mutable(project)
+        now = now_ms()
+        project.status = ProjectStatus.ARCHIVED
+        project.archived_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("project.archived", project.to_dict(), project_id=project.id)
+        return project
+
+    def _require_mutable(self, project: Project) -> None:
+        if project.status == ProjectStatus.ARCHIVED:
+            raise ValidationError(
+                "project archived",
+                detail={"project_id": project.id},
+            )
+
+    # -- tasks ------------------------------------------------------------
+    def add_task(
+        self,
+        project_id: str,
+        title: str,
+        description: str = "",
+        *,
+        role: str | None = None,
+        priority: int = 0,
+        deps: list[str] | None = None,
+        created_by: str = "operator",
+        milestone_id: str | None = None,
+    ) -> Task:
+        """Add a ``todo`` task to a project and emit ``task.created``."""
+        project = self.get(project_id)
+        self._require_mutable(project)
+        clean_title = (title or "").strip()
+        if not clean_title:
+            raise ValidationError("task title is required")
+        _validate_priority(priority)
+        milestone = self._find_milestone(project, milestone_id)
+        now = now_ms()
+        task = Task(
+            id=self._next_id("task"),
+            project_id=project.id,
+            title=clean_title,
+            description=description or "",
+            status=TaskStatus.TODO,
+            priority=priority,
+            role=role,
+            assignee=None,
+            created_by=created_by or "operator",
+            deps=list(deps or []),
+            created_at=now,
+            updated_at=now,
+            milestone_id=milestone.id if milestone is not None else None,
+        )
+        if milestone is not None:
+            milestone.task_ids.append(task.id)
+        self._tasks[task.id] = task
+        project.updated_at = now
+        self.save()
+        self._emit("task.created", task.to_dict(), project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    def _find_milestone(self, project: Project,
+                        milestone_id: str | None) -> Milestone | None:
+        if not milestone_id:
+            return None
+        for milestone in project.milestones:
+            if milestone.id == milestone_id:
+                return milestone
+        raise NotFound(
+            f"milestone {milestone_id!r} not found in project {project.id!r}")
+
+    def task_get(self, task_id: str) -> Task:
+        """Return a task or raise :class:`NotFound`."""
+        task = self._tasks.get(str(task_id))
+        if task is None:
+            raise NotFound(f"task {task_id!r} not found")
+        return task
+
+    def task_list(
+        self,
+        *,
+        project_id: str | None = None,
+        status: str | None = None,
+        assignee: str | None = None,
+    ) -> list[Task]:
+        """List tasks deterministically: priority desc, created_at asc, id."""
+        tasks = [
+            task for task in self._tasks.values()
+            if (project_id is None or task.project_id == str(project_id))
+            and (status is None or task.status == status)
+            and (assignee is None or task.assignee == assignee)
+        ]
+        return sorted(tasks, key=lambda task: (-task.priority, task.created_at, task.id))
+
+    def _task_project(self, task: Task) -> Project:
+        project = self.get(task.project_id)
+        self._require_mutable(project)
+        return project
+
+    def task_claim(self, task_id: str, agent_id: str) -> Task:
+        """Atomically claim a ``todo`` task: ``todo -> doing``.
+
+        Only an unassigned, not-yet-started task may be claimed; anything else
+        raises :class:`Conflict` (the caller should not silently steal work).
+        """
+        if not (agent_id or "").strip():
+            raise ValidationError("agent_id is required to claim a task")
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        if task.assignee:
+            raise Conflict(
+                f"task {task.id} already claimed by {task.assignee}",
+                detail={"task_id": task.id, "assignee": task.assignee},
+            )
+        if task.status != TaskStatus.TODO:
+            raise Conflict(
+                f"task {task.id} is not claimable (status={task.status})",
+                detail={"task_id": task.id, "status": task.status},
+            )
+        now = now_ms()
+        task.status = TaskStatus.DOING
+        task.assignee = agent_id
+        task.started_at = now
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit(
+            "task.claimed",
+            {**task.to_dict(), "assignee": agent_id},
+            project_id=project.id,
+        )
+        self._emit_progress(project)
+        return task
+
+    def task_update(self, task_id: str, patch: dict) -> Task:
+        """Apply a whitelisted task patch, validating status transitions.
+
+        Status changes also emit the specific lifecycle event
+        (``task.started`` / ``task.review`` / ``task.completed`` /
+        ``task.blocked``) in addition to ``task.updated``.
+        """
+        if not isinstance(patch, dict):
+            raise ValidationError("task patch must be a dict")
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        old_status = task.status
+        if "title" in patch:
+            title = str(patch.get("title") or "").strip()
+            if not title:
+                raise ValidationError("task title is required")
+            task.title = title
+        if "description" in patch:
+            task.description = str(patch.get("description") or "")
+        if "status" in patch:
+            new_status = str(patch.get("status") or "")
+            validate_task_transition(task.status, new_status)
+            task.status = new_status
+        if "priority" in patch:
+            task.priority = _validate_priority(patch.get("priority"))
+        if "assignee" in patch:
+            assignee = patch.get("assignee")
+            task.assignee = None if assignee is None else str(assignee)
+        if "role" in patch:
+            role = patch.get("role")
+            task.role = None if role is None else str(role)
+        if "error" in patch:
+            error = patch.get("error")
+            task.error = None if error is None else str(error)
+        now = now_ms()
+        if task.status != old_status:
+            if task.status == TaskStatus.DOING and not task.started_at:
+                task.started_at = now
+            if task.status == TaskStatus.DONE:
+                task.finished_at = now
+            elif old_status == TaskStatus.DONE:
+                task.finished_at = None
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("task.updated", task.to_dict(), project_id=project.id)
+        if task.status != old_status:
+            lifecycle = {
+                TaskStatus.DOING: "task.started",
+                TaskStatus.REVIEW: "task.review",
+                TaskStatus.DONE: "task.completed",
+                TaskStatus.BLOCKED: "task.blocked",
+            }.get(task.status)
+            if lifecycle is not None:
+                self._emit(lifecycle, task.to_dict(), project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    def task_artifact(self, task_id: str, artifact: dict) -> Task:
+        """Attach an artifact (``type``/``path``/``title`` + ``ts``) to a task."""
+        if not isinstance(artifact, dict):
+            raise ValidationError("artifact must be a dict")
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        now = now_ms()
+        entry = {
+            "type": str(artifact.get("type", "file")),
+            "path": str(artifact.get("path", "")),
+            "title": str(artifact.get("title", "")),
+            "ts": now,
+        }
+        task.artifacts.append(entry)
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("task.artifact", {**task.to_dict(), "artifact": entry},
+                   project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    def task_add_note(self, task_id: str, text: str, *, author: str) -> Task:
+        """Append a note (``ts``/``author``/``text``) to a task."""
+        clean_text = (text or "").strip()
+        if not clean_text:
+            raise ValidationError("note text is required")
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        now = now_ms()
+        note = {"ts": now, "author": author or "operator", "text": clean_text}
+        task.notes.append(note)
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("task.note", {**task.to_dict(), "note": note},
+                   project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    def task_add_check(self, task_id: str, text: str) -> Task:
+        """Append an acceptance-check item to a task."""
+        clean_text = (text or "").strip()
+        if not clean_text:
+            raise ValidationError("check text is required")
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        now = now_ms()
+        item = {
+            "id": self._next_check_id(task),
+            "text": clean_text,
+            "done": False,
+            "note": "",
+        }
+        task.checks.append(item)
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("task.updated", task.to_dict(), project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    @staticmethod
+    def _next_check_id(task: Task) -> str:
+        existing = {str(item.get("id")) for item in task.checks}
+        number = len(task.checks) + 1
+        while f"c-{number}" in existing:
+            number += 1
+        return f"c-{number}"
+
+    def task_check(
+        self,
+        task_id: str,
+        *,
+        item_id: str | None = None,
+        text: str | None = None,
+        done: bool = True,
+        note: str = "",
+    ) -> Task:
+        """Mark a check item done/undone by id or exact text."""
+        task = self.task_get(task_id)
+        project = self._task_project(task)
+        item: dict | None = None
+        if item_id is not None:
+            item = next(
+                (check for check in task.checks if check.get("id") == item_id),
+                None,
+            )
+        elif text is not None:
+            clean = text.strip()
+            item = next(
+                (check for check in task.checks
+                 if str(check.get("text", "")).strip() == clean),
+                None,
+            )
+        else:
+            raise ValidationError("task_check needs item_id or text")
+        if item is None:
+            target = item_id if item_id is not None else text
+            raise NotFound(f"check item {target!r} not found in task {task.id}")
+        item["done"] = bool(done)
+        item["note"] = str(note or "")
+        now = now_ms()
+        task.updated_at = now
+        project.updated_at = now
+        self.save()
+        self._emit("task.updated", {**task.to_dict(), "check": dict(item)},
+                   project_id=project.id)
+        self._emit_progress(project)
+        return task
+
+    # -- projections ------------------------------------------------------
+    def project_progress(self, project_id: str) -> dict:
+        """Return ``{progress, counts, total, done}`` for a project."""
+        self.get(project_id)
+        tasks = self.task_list(project_id=project_id)
+        counts = {status: 0 for status in TaskStatus.ALL}
+        for task in tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+        return {
+            "progress": progress_for(tasks),
+            "counts": counts,
+            "total": len(tasks),
+            "done": counts[TaskStatus.DONE],
+        }
+
+    def card(self, project_id: str) -> dict:
+        """Return the UI summary card for a project."""
+        project = self.get(project_id)
+        info = self.project_progress(project.id)
+        current = next(
+            (task for task in self.task_list(project_id=project.id)
+             if task.status == TaskStatus.DOING),
+            None,
+        )
+        return {
+            "id": project.id,
+            "name": project.name,
+            "goal": project.goal,
+            "status": project.status,
+            "progress": info["progress"],
+            "counts": info["counts"],
+            "current_task": self.task_card(current.id) if current is not None else None,
+            "milestones": len(project.milestones),
+            "updated_at": project.updated_at,
+            "brief": project.brief,
+            "workspace": project.workspace,
+            "tags": list(project.tags),
+            "color": project.color,
+            "degraded": project.degraded,
+            "archived_at": project.archived_at,
+        }
+
+    def task_card(self, task_id: str) -> dict:
+        """Flatten a task plus the derived progress fields the UI needs."""
+        task = self.task_get(task_id)
+        weight = TASK_PROGRESS_WEIGHTS.get(task.status, 0.0)
+        data = task.to_dict()
+        data.update({
+            "progress": int(weight * 100 + 0.5),
+            "progress_weight": weight,
+            "check_total": len(task.checks),
+            "check_done": sum(1 for item in task.checks if item.get("done")),
+            "is_done": task.status == TaskStatus.DONE,
+        })
+        return data
+
+
+__all__ = ["ProjectStore"]

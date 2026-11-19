@@ -91,7 +91,7 @@ class AgentsCfg:
     heartbeat_s: float = 2.0
     offline_after_s: float = 8.0
     max_workers: int = 6
-    max_steps: int = 16
+    max_steps: int = 32
     task_poll_s: float = 1.5
     auto_spawn_project_lead: bool = True
     aggregator_interval_s: float = 240.0

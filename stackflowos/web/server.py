@@ -1,0 +1,276 @@
+"""A small, dependency-free HTTP/1.1 server with Server-Sent Events.
+
+Why hand-rolled: StackFlowOS already depends on pynng only. The web surface
+needs exactly three things — static files, JSON endpoints and an event stream —
+and the stdlib covers all three. No build step, no ASGI stack, nothing to
+install on a robot or a phone-adjacent device.
+
+The server binds loopback by default and has no authentication; it is an
+operator console for one person on one machine. Binding it elsewhere is an
+explicit configuration decision (documented in the README).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import mimetypes
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from ..errors import SfoError
+from ..protocol import dumps
+from ..util.logging import get_logger
+
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
+MAX_BODY = 1024 * 1024
+HEARTBEAT_S = 15.0
+
+_EXTRA_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json; charset=utf-8",
+    ".woff2": "font/woff2",
+}
+
+
+class WebServer:
+    def __init__(self, app, *, host: str = "127.0.0.1", port: int = 17800,
+                 assets_dir: Path | None = None, logger=None) -> None:
+        self.app = app
+        self.host = host
+        self.port = port
+        self.assets_dir = Path(assets_dir or ASSETS_DIR)
+        self.log = logger or get_logger("web")
+        self._server: asyncio.AbstractServer | None = None
+        self._clients: set[asyncio.Task] = set()
+        # Imported lazily to keep server.py reusable in tests.
+        from .api import WebAPI
+        self.api = WebAPI(app)
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    async def start(self) -> str:
+        self._server = await asyncio.start_server(self._handle_client, self.host, self.port,
+                                                  limit=MAX_BODY + 65536)
+        sockets = self._server.sockets or []
+        if sockets:
+            self.port = sockets[0].getsockname()[1]
+        self.log.info("web listening on %s", self.url)
+        return self.url
+
+    async def stop(self) -> None:
+        # Python 3.12's Server.wait_closed() waits for live connections too,
+        # so clients must be cancelled first or an open SSE stream deadlocks
+        # shutdown.
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+        for task in list(self._clients):
+            task.cancel()
+        if self._clients:
+            await asyncio.gather(*self._clients, return_exceptions=True)
+        if server is not None:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=3.0)
+            except asyncio.TimeoutError:
+                self.log.debug("http server wait_closed timed out")
+
+    # ------------------------------------------------------------------
+    # connection handling
+    # ------------------------------------------------------------------
+    async def _handle_client(self, reader: asyncio.StreamReader,
+                             writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._clients.add(task)
+        try:
+            request = await self._read_request(reader)
+            if request is None:
+                return
+            method, target, headers, body = request
+            parts = urlsplit(target)
+            path = unquote(parts.path)
+            query = {k: v[-1] if v else "" for k, v in parse_qs(parts.query).items()}
+            if path == "/api/events/stream":
+                await self._serve_sse(writer, query)
+                return
+            if path.startswith("/api/"):
+                status, payload = await self.api.handle(method, path, query, body, headers)
+                await self._send_json(writer, status, payload)
+                return
+            await self._serve_static(writer, method, path)
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+            pass
+        except asyncio.CancelledError:
+            raise
+        except SfoError as exc:
+            try:
+                await self._send_json(writer, exc.http_status, {"ok": False,
+                                                                "error": exc.to_dict()})
+            except Exception:
+                pass
+        except Exception:
+            self.log.exception("web request failed")
+            try:
+                await self._send_json(writer, 500, {"ok": False, "error": {
+                    "code": "INTERNAL", "message": "internal server error"}})
+            except Exception:
+                pass
+        finally:
+            if task is not None:
+                self._clients.discard(task)
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except Exception:
+                pass
+
+    async def _read_request(self, reader: asyncio.StreamReader):
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+        except asyncio.TimeoutError:
+            return None
+        if not request_line or not request_line.strip():
+            return None
+        try:
+            method, target, _version = request_line.decode("latin-1").strip().split(" ", 2)
+        except ValueError:
+            return None
+        headers: dict[str, str] = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=30)
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            key, _, value = line.decode("latin-1").partition(":")
+            headers[key.strip().lower()] = value.strip()
+        length = 0
+        try:
+            length = int(headers.get("content-length") or 0)
+        except ValueError:
+            length = 0
+        if length > MAX_BODY:
+            raise SfoError("request body too large", code="BAD_REQUEST")
+        body = b""
+        if length:
+            body = await asyncio.wait_for(reader.readexactly(length), timeout=30)
+        return method.upper(), target, headers, body
+
+    async def _send_json(self, writer: asyncio.StreamWriter, status: int, payload: Any) -> None:
+        body = dumps(payload).encode("utf-8")
+        header = (
+            f"HTTP/1.1 {status} {_reason(status)}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("latin-1")
+        writer.write(header + body)
+        await writer.drain()
+
+    async def _serve_static(self, writer: asyncio.StreamWriter, method: str, path: str) -> None:
+        if method not in ("GET", "HEAD"):
+            await self._send_json(writer, 405, {"ok": False, "error": {
+                "code": "METHOD_NOT_ALLOWED", "message": "method not allowed"}})
+            return
+        if path in ("/", ""):
+            path = "/index.html"
+        relative = path.lstrip("/")
+        candidate = (self.assets_dir / relative).resolve()
+        try:
+            candidate.relative_to(self.assets_dir.resolve())
+        except ValueError:
+            await self._send_json(writer, 403, {"ok": False, "error": {
+                "code": "DENIED", "message": "forbidden"}})
+            return
+        if not candidate.is_file():
+            # SPA-ish fallback for unknown app routes
+            if "." not in Path(path).name:
+                candidate = self.assets_dir / "index.html"
+            if not candidate.is_file():
+                await self._send_json(writer, 404, {"ok": False, "error": {
+                    "code": "NOT_FOUND", "message": "not found"}})
+                return
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            await self._send_json(writer, 404, {"ok": False, "error": {
+                "code": "NOT_FOUND", "message": "not found"}})
+            return
+        ctype = _EXTRA_TYPES.get(candidate.suffix.lower())
+        if ctype is None:
+            ctype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+        header = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: {ctype}\r\n"
+            f"Content-Length: {len(data)}\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("latin-1")
+        writer.write(header)
+        if method == "GET":
+            writer.write(data)
+        await writer.drain()
+
+    async def _serve_sse(self, writer: asyncio.StreamWriter, query: dict) -> None:
+        queue = self.app.eventlog.subscribe()
+        try:
+            header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream; charset=utf-8\r\n"
+                "Cache-Control: no-cache, no-store\r\n"
+                "Connection: close\r\n"
+                "X-Accel-Buffering: no\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n"
+            ).encode("latin-1")
+            writer.write(header)
+            writer.write(b"retry: 2000\n\n")
+            since = 0
+            try:
+                since = int(query.get("since") or 0)
+            except ValueError:
+                since = 0
+            if since > 0:
+                for record in self.app.eventlog.since(since, limit=500):
+                    writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
+            else:
+                for record in self.app.eventlog.tail(30):
+                    writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
+            await writer.drain()
+            heartbeat = float(query.get("heartbeat") or HEARTBEAT_S)
+            while True:
+                try:
+                    record = await asyncio.wait_for(queue.get(), timeout=heartbeat)
+                except asyncio.TimeoutError:
+                    writer.write(b": ping\n\n")
+                    await writer.drain()
+                    continue
+                writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            return
+        except Exception:
+            self.log.debug("sse stream ended", exc_info=True)
+        finally:
+            try:
+                self.app.eventlog.unsubscribe(queue)
+            except Exception:
+                pass
+
+
+def _reason(status: int) -> str:
+    return {
+        200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+        400: "Bad Request", 403: "Forbidden", 404: "Not Found",
+        405: "Method Not Allowed", 409: "Conflict", 500: "Internal Server Error",
+        503: "Service Unavailable", 504: "Gateway Timeout",
+    }.get(status, "OK")
