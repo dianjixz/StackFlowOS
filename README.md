@@ -276,8 +276,8 @@ Agent 的工具调用一律经过 `ToolExecutor`：
 保存后**立即生效**：hub 会重建 chat provider，下一次对话就使用新模型，不需要重启。
 `base_url` 可以写 `http://host:port` 或 `http://host:port/v1`，客户端会依次尝试
 `/v1/chat/completions`、`/chat/completions`、`/api/chat/completions`；设置页的
-「测试连接」会发一个最小请求并显示耗时/错误。`max_tokens` 超过 32768 会按 32768 发送，
-避免把上下文窗口大小误填成输出上限导致 HTTP 400。
+「测试连接」会发一个最小请求并显示耗时/错误。`max_tokens` 会原样发送，不再被系统裁剪；上限由模型端点决定，
+填错时「测试连接」会显示端点的具体错误。
 
 worker 的新进程会读取新配置；已在跑的 Agent 用 spawn 时的配置。
 模型只影响"怎么想"，不影响"能不能动"——工具调用仍走审批。

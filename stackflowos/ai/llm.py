@@ -135,10 +135,9 @@ class OpenAICompatibleProvider:
         self.model = str(model)
         self.api_key = str(api_key or "")
         self.temperature = float(temperature)
-        # Models rarely accept a million output tokens; a pasted context-window
-        # value used to turn every request into an HTTP 400. Clamp to a sane
-        # ceiling instead of failing at the provider.
-        self.max_tokens = max(1, min(int(max_tokens), 32768))
+        # Sent verbatim: the upstream endpoint/model is the authority on its
+        # own limit. Do not silently rewrite an operator's setting.
+        self.max_tokens = max(1, int(max_tokens))
         self.timeout_s = float(timeout_s)
         self._endpoint: str | None = None
 
@@ -151,7 +150,7 @@ class OpenAICompatibleProvider:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": max(1, min(int(self.max_tokens), 32768)),
+            "max_tokens": max(1, int(self.max_tokens)),
         }
         # `tools` is accepted for interface parity; the JSON action protocol
         # keeps provider-native tool calling out of the critical path.

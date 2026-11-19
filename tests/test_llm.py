@@ -153,11 +153,11 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/chat/completions", paths)
         self.assertEqual(provider._endpoint, f"http://{host}:{port}/chat/completions")
 
-    async def test_max_tokens_is_clamped(self) -> None:
+    async def test_max_tokens_is_sent_verbatim(self) -> None:
         provider = self._provider()
-        provider.max_tokens = 10_000_000
+        provider.max_tokens = 1_048_576
         await provider.chat([{"role": "user", "content": "x"}])
-        self.assertEqual(self.httpd.requests[0]["body"]["max_tokens"], 32768)
+        self.assertEqual(self.httpd.requests[0]["body"]["max_tokens"], 1_048_576)
 
     async def test_ping_round_trip(self) -> None:
         result = await self._provider().ping()
