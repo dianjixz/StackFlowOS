@@ -132,8 +132,20 @@ function renderAll() {
     fragment.append(node);
   }
   els.log.append(fragment);
+  // A refresh must land at the bottom instantly. Do not let any CSS
+  // scroll-behavior (or a future style) animate the whole history past the
+  // operator's eyes.
+  const previousBehavior = els.scroll.style.scrollBehavior;
+  els.scroll.style.scrollBehavior = 'auto';
   els.scroll.scrollTop = els.scroll.scrollHeight;
-  window.requestAnimationFrame(() => scrollToBottom('auto'));
+  els.scroll.style.scrollBehavior = previousBehavior;
+  window.requestAnimationFrame(() => {
+    const behavior = els.scroll.style.scrollBehavior;
+    els.scroll.style.scrollBehavior = 'auto';
+    els.scroll.scrollTop = els.scroll.scrollHeight;
+    els.scroll.style.scrollBehavior = behavior;
+    updateScrollButton();
+  });
 }
 
 function renderEmptyIfNeeded() {
@@ -373,7 +385,16 @@ function isNearBottom() {
 function scrollToBottom(behavior = 'auto') {
   if (!els.scroll) return;
   window.requestAnimationFrame(() => {
-    els.scroll.scrollTo({ top: els.scroll.scrollHeight, behavior });
+    if (behavior === 'auto') {
+      // Explicit instant scroll; CSS smooth scrolling is intentionally not
+      // used for layout/refresh-driven jumps.
+      const previous = els.scroll.style.scrollBehavior;
+      els.scroll.style.scrollBehavior = 'auto';
+      els.scroll.scrollTop = els.scroll.scrollHeight;
+      els.scroll.style.scrollBehavior = previous;
+    } else {
+      els.scroll.scrollTo({ top: els.scroll.scrollHeight, behavior });
+    }
     updateScrollButton();
   });
 }

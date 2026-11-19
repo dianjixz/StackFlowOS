@@ -152,6 +152,16 @@ class WebAssetsTest(unittest.TestCase):
         missing = sorted(path for path in used if path not in routes)
         self.assertEqual(missing, [], f"UI calls endpoints absent from api.py: {missing}")
 
+    def test_chat_refresh_is_instant_not_animated(self) -> None:
+        """Refreshing must land at the bottom, not smooth-scroll the history."""
+        css = read(CSS_DIR / "os.css")
+        match = re.search(r"\.chat-scroll\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(match)
+        self.assertNotIn("scroll-behavior", match.group(1))
+        chat = read(JS_DIR / "chat.js")
+        self.assertIn("scrollBehavior = 'auto'", chat)
+        self.assertIn("scrollTop = els.scroll.scrollHeight", chat)
+
 
 if __name__ == "__main__":
     unittest.main()

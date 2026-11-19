@@ -222,7 +222,7 @@ table { border-collapse: collapse; }
   radial-gradient(700px 400px at 80% -10%, rgba(124, 92, 255, 0.075), transparent 60%),
   linear-gradient(170deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.016)),
   rgba(10, 11, 16, 0.55); }
-.chat-scroll { position: relative; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px 18px 10px; scroll-behavior: smooth; display: flex; flex-direction: column; }
+.chat-scroll { position: relative; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px 18px 10px; display: flex; flex-direction: column; }
 
 .chat-log { display: flex; flex-direction: column; gap: 16px; padding-bottom: 8px; margin-top: auto; }
 .msg { display: flex; gap: 10px; max-width: 94%; animation: msgIn 0.22s ease-out; }
