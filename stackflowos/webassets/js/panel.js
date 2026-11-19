@@ -149,8 +149,14 @@ function renderProjects() {
   const projects = sortedProjects();
   if (els.projectCount) {
     const active = projects.filter((project) =>
-      ['active', 'review', 'degraded'].includes(project.status)).length;
-    els.projectCount.textContent = `${active} 活跃 / ${projects.length} 总计`;
+      ['active', 'degraded'].includes(project.status)).length;
+    const review = projects.filter((project) => project.status === 'review').length;
+    const bits = [];
+    if (active) bits.push(`${active} 进行中`);
+    if (review) bits.push(`${review} 待验收`);
+    els.projectCount.textContent = bits.length
+      ? `${bits.join(' · ')} / ${projects.length} 总计`
+      : `${projects.length} 总计`;
   }
 
   if (!projects.length) {
