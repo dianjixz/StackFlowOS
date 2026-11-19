@@ -36,6 +36,21 @@ from typing import Any, Awaitable, Callable
 
 import pynng
 
+# pynng 0.9's Context.__del__ calls close() again after the owner already
+# closed it, which prints "Exception ignored ... Closed" at shutdown. The
+# close is harmless; silence the noise without changing socket semantics.
+_orig_ctx_del = getattr(pynng.Context, "__del__", None)
+if _orig_ctx_del is not None:
+    def _quiet_ctx_del(self):  # pragma: no cover - shutdown noise only
+        try:
+            _orig_ctx_del(self)
+        except Exception:
+            pass
+    try:
+        pynng.Context.__del__ = _quiet_ctx_del
+    except Exception:
+        pass
+
 from ..errors import SfoError, Timeout, Unavailable, error_from_dict
 from ..protocol import (
     KIND_EVENT,

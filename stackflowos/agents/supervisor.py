@@ -184,9 +184,15 @@ class AgentSupervisor:
         env = os.environ.copy()
         env["SFO_ROOT"] = str(self.root)
         env["SFO_STATE_DIR"] = str(self.state_dir)
+        # The worker runs with cwd=<root> (the operator's workspace), which is
+        # not necessarily where this package lives (tests use a temp root).
+        # Put both on sys.path so `python -m stackflowos.worker` resolves.
+        package_root = Path(__file__).resolve().parents[2]
+        parts = [str(self.root), str(package_root)]
         existing = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = (str(self.root) + (os.pathsep + existing
-                                               if existing else ""))
+        if existing:
+            parts.append(existing)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
         kwargs = {
             "cwd": str(self.root),
             "env": env,

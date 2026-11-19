@@ -269,6 +269,28 @@ async def seed_demo(app, *, name: str, goal: str) -> dict:
     return await app.create_project(name=name, goal=goal, created_by="demo")
 
 
+
+async def _run_aggregator(app, project_id: str, timeout: float = 25.0) -> None:
+    """Run one data-aggregation agent so the project brief is filled in."""
+    from .errors import SfoError
+
+    existing = [a for a in app.supervisor.list(project_id=project_id)
+                if a.role == "aggregator"]
+    if any(a.status not in ("dead", "failed") for a in existing):
+        return
+    try:
+        agent = await app.spawn_agent("aggregator", project_id)
+    except SfoError as exc:
+        print(f"[demo] could not run aggregator: {exc.message}")
+        return
+    agent_id = agent["id"] if isinstance(agent, dict) else agent.id
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(0.5)
+        current = app.supervisor.get(agent_id)
+        if current.status in ("done", "failed", "dead"):
+            break
+
 async def _watch_demo(app, *, timeout: int, server=None) -> int:
     deadline = time.time() + timeout
     project_id = None
@@ -288,6 +310,8 @@ async def _watch_demo(app, *, timeout: int, server=None) -> int:
               f"approvals={card.get('pending_approvals', 0)}")
         if card.get("status") in ("review", "done"):
             break
+    if project_id:
+        await _run_aggregator(app, project_id)
     card = app.project_card(project_id) if project_id else {}
     print("\n=== demo finished ===")
     print(json.dumps({k: card.get(k) for k in

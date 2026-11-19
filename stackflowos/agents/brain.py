@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from .roles import ROLES
+from .templates import GENERIC_TEMPLATE, MD_TOOL_TEMPLATE, README_TEMPLATE
 
 #: Recipe roles used by :class:`MockBrain` when a lead breaks down a goal.
 _LEAD_RECIPE: tuple[tuple[str, str, str], ...] = (
@@ -283,7 +284,10 @@ class MockBrain:
         # already `doing` when the worker claimed it skips the update step
         # instead of repeating the write or wasting a step.
         if not self._artifact_path:
-            if self._is_code_task(task):
+            if self._is_doc_task(task):
+                path = "README.md"
+                body = self._readme_body(tid, title, description, task, view.tasks)
+            elif self._is_code_task(task):
                 path = (f"src/{_safe_id(tid)}-{_slug(title)}.py")
                 body = self._python_body(tid, title, description)
             else:
@@ -295,7 +299,9 @@ class MockBrain:
         if not self._compiled:
             self._compiled = True
             if self._artifact_path.endswith(".py"):
-                command = f"python3 -m py_compile {_shell_quote(self._artifact_path)}"
+                quoted = _shell_quote(self._artifact_path)
+                command = (f"python3 -m py_compile {quoted} && "
+                           f"python3 {quoted} --selftest")
             else:
                 command = "true"
             return _call("shell.exec", command=command)
@@ -470,17 +476,44 @@ class MockBrain:
         return any(hint in text for hint in _CODE_HINTS)
 
     @staticmethod
+    def _is_doc_task(task: dict) -> bool:
+        # Only an explicitly documentation-shaped *title* selects README.md;
+        # descriptions often mention "文档" without being the docs task.
+        text = str(task.get("title") or "").lower()
+        return any(hint in text for hint in ("文档", "readme", "使用说明", "手册"))
+
+    @staticmethod
     def _python_body(tid: str, title: str, description: str) -> str:
         cleaned_title = _sanitize_block(title)
         cleaned_desc = _sanitize_block(description or "（无描述）")
-        return (
-            f'"""任务 {tid}：{cleaned_title}\n\n'
-            f"{cleaned_desc}\n"
-            '"""\n\n'
-            "from __future__ import annotations\n\n\n"
-            "def run() -> str:\n"
-            f'    """{cleaned_title} 的最小实现入口。"""\n'
-            f'    return "{tid}: ok"\n')
+        haystack = f"{title} {description}".lower()
+        if "markdown" in haystack:
+            template = MD_TOOL_TEMPLATE
+        else:
+            template = GENERIC_TEMPLATE
+        return (template
+                .replace("__TID__", tid)
+                .replace("__TITLE__", cleaned_title)
+                .replace("__DESC__", cleaned_desc))
+
+    @staticmethod
+    def _readme_body(tid: str, title: str, description: str, task: dict,
+                     tasks: list[dict] | None = None) -> str:
+        source = f"{tid}-impl.py"
+        for item in tasks or []:
+            if _task_id(item) == tid:
+                continue
+            if (str(item.get("role") or "") == "coder"
+                    and _task_status(item) in ("done", "review")):
+                other_id = _task_id(item)
+                source = f"{_safe_id(other_id)}-{_slug(_task_title(item))}.py"
+                break
+        readme_title = "使用说明" if "文档" in title else _sanitize_md(title)
+        return (README_TEMPLATE
+                .replace("__TITLE__", readme_title)
+                .replace("__GOAL__", _sanitize_md(description or "项目说明"))
+                .replace("__SRC__", source))
+
     @staticmethod
     def _note_body(tid: str, title: str, description: str) -> str:
         return (
@@ -494,6 +527,10 @@ class MockBrain:
             "## 自检记录\n"
             "- 本文件由 coder agent 在 workspace 内生成；\n"
             "- 语法/行为检查结果以 shell.exec 输出为准。\n")
+
+
+def _sanitize_md(text: str) -> str:
+    return str(text).replace("\n", " ").strip()
 
 
 def _sanitize_block(text: str) -> str:
