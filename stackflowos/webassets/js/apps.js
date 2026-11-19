@@ -567,8 +567,9 @@ function renderProjectDetail(project) {
   ));
 
   /* agents on this project */
+  const activeOnProject = agents.filter((agent) => ACTIVE_AGENT_STATUSES.has(agent.status)).length;
   wrap.append(sectionHead('本项目 Agent', {
-    hint: agents.length ? `${agents.length} 个在岗` : '暂无 Agent',
+    hint: agents.length ? `${agents.length} 个 Agent · ${activeOnProject} 在岗` : '暂无 Agent',
   }));
   if (agents.length) {
     wrap.append(el('div', { class: 'agent-strip' },

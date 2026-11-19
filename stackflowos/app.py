@@ -73,6 +73,7 @@ class App:
         self._rpc_inflight: dict[str, asyncio.Task] = {}
         self._rpc_cache: dict[str, tuple[float, dict]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
+        self._aggregator_task: asyncio.Task | None = None
         self._stopped = False
         self._lock_fd: int | None = None
         self._assistant_executor: ToolExecutor | None = None
@@ -172,6 +173,8 @@ class App:
         await self.transport.start()
         self.ctx.on("unit.offline", self._on_unit_offline)
         await self.failure.start()
+        self.unit_lease_ttl_s = max(30, int(cfg.agents.offline_after_s * 3))
+        self._start_aggregation_loop(cfg.agents.aggregator_interval_s)
 
         self.provider = make_provider(cfg.llm)
         self.chat = ChatService(
@@ -195,11 +198,51 @@ class App:
                  self.sys_addresses.rpc, self.sys_addresses.events, cfg.web.port)
         return self
 
+    def _start_aggregation_loop(self, interval_s: float) -> None:
+        """Periodically run one aggregation agent per active project."""
+        if interval_s <= 0:
+            return
+
+        async def loop() -> None:
+            while not self._stopped:
+                await asyncio.sleep(max(30.0, float(interval_s)))
+                if self._stopped:
+                    return
+                try:
+                    for project in self.projects.list():
+                        if project.status not in ("active", "review", "degraded"):
+                            continue
+                        if self.projects.task_list(project_id=project.id) == []:
+                            continue
+                        running = [a for a in self.supervisor.list(project_id=project.id)
+                                   if a.role == "aggregator"
+                                   and a.status not in ("done", "failed", "dead")]
+                        if running:
+                            continue
+                        try:
+                            await self.supervisor.spawn(
+                                "aggregator", project.id,
+                                reason="scheduled_summary")
+                        except SfoError:
+                            self.log.debug("scheduled aggregator skipped for %s",
+                                           project.id)
+                except Exception:
+                    self.log.exception("aggregation loop iteration failed")
+
+        self._aggregator_task = asyncio.create_task(loop(), name="aggregation-loop")
+
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
         self.log.info("shutting down")
+        if self._aggregator_task is not None:
+            self._aggregator_task.cancel()
+            try:
+                await self._aggregator_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._aggregator_task = None
         for task in list(self._bg_tasks):
             task.cancel()
         if self._bg_tasks:
@@ -499,6 +542,17 @@ class App:
         self.transport.add_unit(info.work_id, info.rpc_address)
         if hasattr(self.supervisor, "note_online"):
             self.supervisor.note_online(info.work_id)
+        # A unit holds a renewable lease on its own identity/address. This is
+        # the process-level "I occupy this until T" claim that the failure
+        # domain releases when the heartbeat stops.
+        try:
+            self.leases.acquire(f"unit:{info.work_id}", info.work_id,
+                                self.unit_lease_ttl_s, renewable=True,
+                                metadata={"kind": info.kind,
+                                          "project_id": info.project_id})
+        except Exception:
+            self.log.debug("unit lease acquisition failed for %s", info.work_id,
+                           exc_info=True)
         return {"work_id": info.work_id, "registered_at": info.last_seen}
 
     async def _unit_heartbeat(self, data, src):
@@ -506,6 +560,18 @@ class App:
         unit = self.registry.heartbeat(work_id, stats=data.get("stats"))
         if unit is None:  # pragma: no cover - registry raises in practice
             raise NotFound(f"unit {work_id} not registered")
+        try:
+            active = self.leases.list(resource=f"unit:{work_id}", active_only=True)
+            if active:
+                self.leases.renew(active[0].id, work_id, self.unit_lease_ttl_s)
+            else:
+                self.leases.acquire(f"unit:{work_id}", work_id,
+                                    self.unit_lease_ttl_s, renewable=True,
+                                    metadata={"kind": unit.kind,
+                                              "project_id": unit.project_id})
+        except Exception:
+            self.log.debug("unit lease renewal failed for %s", work_id,
+                           exc_info=True)
         now = now_ms()
         for agent in self.supervisor.list():
             if agent.unit_id == work_id and agent.status not in ("dead", "done", "failed"):
@@ -792,6 +858,13 @@ class App:
             task_id=data.get("task_id"),
             model=str(data.get("model") or ""),
         )
+        if role == "lead" and agent.project_id:
+            try:
+                project = self.projects.get(agent.project_id)
+                if project.degraded:
+                    self.projects.update(agent.project_id, {"degraded": False})
+            except Exception:
+                pass
         return agent.to_dict()
 
     async def _agent_update(self, data, src):
@@ -852,6 +925,15 @@ class App:
             "status": "dead",
             "error": "unit offline",
         })
+        if agent.role == "lead" and agent.project_id:
+            try:
+                self.projects.update(agent.project_id, {"degraded": True})
+                self.eventlog.append("project.degraded", {
+                    "project_id": agent.project_id,
+                    "reason": "lead unit offline",
+                }, source="sys", project_id=agent.project_id)
+            except Exception:
+                self.log.debug("could not mark project degraded", exc_info=True)
         # Free the task so a restarted or replacement worker can pick it up.
         if agent.task_id:
             try:

@@ -111,6 +111,12 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         # Every task has at least one artifact or a review record.
         tasks = self.app.projects.task_list(project_id=project_id)
         self.assertTrue(all(t.status == "done" for t in tasks))
+        # Human confirmation moves the project to done and stops its agents.
+        completed = await self.app.complete_project(project_id)
+        self.assertEqual(completed["status"], "done")
+        active = [a for a in self.app.supervisor.list(project_id=project_id)
+                  if a.status not in ("done", "failed", "dead")]
+        self.assertEqual(active, [])
 
     async def test_tcp_transport_runs_end_to_end(self):
         self.app = await _boot_app(self.tmp, transport="tcp",
@@ -195,7 +201,8 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
         unit = self.app.registry.get(unit_id)
         self.assertEqual(unit.status, "online")
-        self.app.leases.acquire(f"unit:{unit_id}", unit_id, 60)
+        self.assertTrue(self.app.leases.list(holder=unit_id),
+                        "the unit should hold an identity lease")
         os.kill(int(unit.pid), signal.SIGKILL)
 
         deadline = time.monotonic() + 20

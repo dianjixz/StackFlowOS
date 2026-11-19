@@ -153,6 +153,10 @@ lease = {
 到期自动释放并广播 `lease.expired`。**没有租约，AI 不敢接长任务**——
 "我占着这块资源到什么时候"必须能被回答。
 
+每个 unit 注册时会自动持有 `unit:<work_id>` 的身份租约，心跳续期、退出或失联时
+由失败域释放；它让"进程占着这个地址到什么时候"成为可查询事实，也直接显示在
+状态栏的租约计数里。
+
 ### 失败域（Failure Domain）
 
 单位死亡不是"一个报错"，是一组后果：
@@ -204,7 +208,7 @@ append-only JSONL（`<state>/events/events.jsonl`），全局单调 `seq`，
 |---|---|---|
 | `lead` | 随项目 | 拆解目标、建任务、派工、推进、汇总 |
 | `architect` / `coder` / `tester` / `reviewer` / `researcher` | 随任务 | 设计 / 实现 / 测试 / 评审 / 调研 |
-| `aggregator` | 项目内周期 | 读事件与任务，更新项目 brief |
+| `aggregator` | 项目内周期（默认 240s / demo 收尾时一次） | 读事件与任务，更新项目 brief |
 | `assistant` | hub 常驻 | 对话框里的系统助手 |
 
 Agent 的工具调用一律经过 `ToolExecutor`：

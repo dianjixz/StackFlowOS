@@ -265,6 +265,10 @@ class Lease:
 * `sweep(now)` 把过期租约置 `expired` 并发 `lease.expired`。
 * 单位死亡时 `release_holder(work_id)` 释放其全部租约。
 * **AI 敢接长任务的物理前提**：拿租约时要能回答"我占到什么时候"。
+* **unit 身份租约**：每个 worker `unit.register` 时自动获取 `unit:<work_id>`
+  的 renewable 租约（TTL = max(30s, 3×offline_after)），心跳续期；unit 退出、
+  心跳超时或失败域回收时由 `release_holder` 释放。它让"我占着这个身份/地址到 T"
+  成为可查询事实，也是 UI 状态栏"租约"计数的来源。
 
 ### 5.3 失败域（FailureManager）
 
@@ -282,15 +286,22 @@ class FailurePolicy:
   释放租约 → 发 `failure.detected` → 按策略重启（budget 内）或隔离；
   超过 quarantine 阈值 → `unit.quarantined`。
 * 重启由 `AgentSupervisor.restart(unit)` 回调完成；不允许无限重启。
-* 项目承载者死亡：项目 `degraded=true`，发 `project.degraded`，由 lead 或人处理。
+* 项目承载者（lead）死亡：项目 `degraded=true`，发 `project.degraded`；
+  lead 重新注册时清除 degraded。其他工人死亡只重置任务，不降级项目。
 
-### 5.4 调度（Scheduler）
+### 5.4 周期性汇总
+
+`App` 内还有一个聚合循环：按 `agents.aggregator_interval_s`（默认 240s）扫描
+active/review/degraded 项目，若项目有任务且当前没有在跑的 aggregator，就拉起一个
+（受 max_workers 约束）。demo 在项目进入 review 后也会立刻跑一次，确保 brief 不为空。
+
+### 5.5 调度（Scheduler）
 
 `select(ability, project_id=None, exclude=())`：在在线单位里按
 "能力匹配 → 同项目优先 → 租约负载最低"打分返回。
 只做建议，不替 Agent 做决定；调用方仍要显式 `agent.spawn` 或 `lease.acquire`。
 
-### 5.5 事件日志（EventLog）
+### 5.6 事件日志（EventLog）
 
 * append-only JSONL：`<state>/events/events.jsonl`，超过 8MB 轮转。
 * 全局单调 `seq`；`since(seq)` 支持重放（UI 刷新/断线重连）。
@@ -299,7 +310,7 @@ class FailurePolicy:
 * `EPHEMERAL_TYPES = ("chat.delta", "stream.chunk")` 不落盘、不占 seq 持久位置
   （仍递增 seq，只是不写文件；重启后 seq 从文件最大值继续）。
 
-### 5.6 事件目录（稳定契约）
+### 5.7 事件目录（稳定契约）
 
 ```
 sys.booted / sys.ready / sys.shutdown / sys.config.updated
@@ -611,7 +622,9 @@ stackflowos/
   agents/          models.py roles.py tools.py brain.py runner.py supervisor.py api.py [C]
   ai/              llm.py prompts.py           [C]
   session/         chat.py                     [C/lead]
-  units/           base.py sys_unit.py worker.py  [lead]
+  app.py           sys 单元装配（RPC 动作表 + 服务接线）           [lead]
+  units/           worker.py（每 Agent 一进程）                    [lead]
+  session/         chat.py（对话、流式、助手）                       [lead]
   web/             server.py api.py            [D/lead]
   webassets/       index.html css/ js/         [D]
 tests/
@@ -626,7 +639,7 @@ tests/
 * 集成测试：真实起 hub + worker 子进程（ipc 与 tcp 各一遍），
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
-* 当前 `python3 -m unittest discover -s tests -t .` 为 235 个测试。
+* 当前 `python3 -m unittest discover -s tests -t .` 为 236 个测试。
 * 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
 
 ## 13. 非目标（这一版不做）
