@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stackflowos"
+version = "0.1.0"
+description = "An agent-native operating system: pynng transport, Cordis-style kernel, leases, projects, approvals."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "StackFlowOS" }]
+dependencies = ["pynng>=0.9.0"]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+stackflowos = "stackflowos.cli:main"
+sfo = "stackflowos.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stackflowos*"]
+
+[tool.setuptools.package-data]
+stackflowos = ["webassets/**/*"]
