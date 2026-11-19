@@ -115,7 +115,7 @@ function renderStatus() {
   }
   if (els.workHeading) {
     els.workHeading.textContent = state.loaded
-      ? `工作面板 · ${Number(stats.active_projects) || 0} 活跃`
+      ? `工作面板 · ${Number(stats.active_projects) || 0} 个项目`
       : '工作面板';
   }
 }
@@ -150,7 +150,7 @@ function renderProjects() {
   if (els.projectCount) {
     const active = projects.filter((project) =>
       ['active', 'review', 'degraded'].includes(project.status)).length;
-    els.projectCount.textContent = `${active} 进行中 / ${projects.length} 总计`;
+    els.projectCount.textContent = `${active} 活跃 / ${projects.length} 总计`;
   }
 
   if (!projects.length) {
@@ -189,7 +189,7 @@ function projectCard(project, index) {
   const status = project.degraded ? 'degraded' : project.status;
   const counts = project.counts || {};
   const agents = (project.agents || state.agents.filter((agent) => agent.project_id === project.id))
-    .filter((agent) => !['dead', 'failed'].includes(agent.status));
+    .filter((agent) => ACTIVE_AGENT_STATUSES.has(agent.status));
   const workers = agents.slice(0, 3);
   const extra = Math.max(0, agents.length - workers.length);
   const pending = Number(project.pending_approvals) || 0;

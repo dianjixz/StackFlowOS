@@ -439,6 +439,28 @@ class AgentSupervisor:
             agents = [agent for agent in agents if agent.status == status]
         return agents
 
+    def prune_finished(self, *, keep_aggregators: int = 5) -> int:
+        """Drop old finished aggregator records; events keep the full history.
+
+        Aggregators are periodic, so without this the roster (and the project
+        card avatars) grows without bound even when the project is idle.
+        """
+        finished = [agent for agent in self._agents.values()
+                    if agent.role == "aggregator" and agent.is_terminal]
+        by_project: dict[str | None, list[Agent]] = {}
+        for agent in finished:
+            by_project.setdefault(agent.project_id, []).append(agent)
+        remove: set[str] = set()
+        for agents in by_project.values():
+            agents.sort(key=lambda item: item.last_seen, reverse=True)
+            remove.update(agent.id for agent in agents[int(keep_aggregators):])
+        if not remove:
+            return 0
+        for agent_id in remove:
+            self._agents.pop(agent_id, None)
+        self.save()
+        return len(remove)
+
     def get(self, agent_id: str) -> Agent:
         """Return one agent or raise :class:`NotFound`."""
         agent = self._agents.get(agent_id)

@@ -76,6 +76,7 @@ class App:
         self._rpc_cache: dict[str, tuple[float, dict]] = {}
         self._bg_tasks: set[asyncio.Task] = set()
         self._aggregator_task: asyncio.Task | None = None
+        self._aggregated_signatures: dict[str, tuple] = {}
         self._maintenance_task: asyncio.Task | None = None
         self._stopped = False
         self._lock_fd: int | None = None
@@ -156,6 +157,7 @@ class App:
             logger=get_logger("agents"),
         )
         self.supervisor.load()
+        self.supervisor.prune_finished()
         self.failure = FailureManager(
             self.ctx, self.registry, self.leases, self.eventlog,
             policies={
@@ -204,6 +206,17 @@ class App:
                  self.sys_addresses.rpc, self.sys_addresses.events, cfg.web.port)
         return self
 
+    @staticmethod
+    def aggregation_signature(project: Any, tasks: list[Any]) -> tuple:
+        """What makes a new summary necessary: task identity/status changes."""
+        return (
+            str(getattr(project, "status", "")),
+            tuple((str(getattr(task, "id", "")),
+                   str(getattr(task, "status", "")),
+                   int(getattr(task, "updated_at", 0) or 0))
+                  for task in tasks),
+        )
+
     def _start_aggregation_loop(self, interval_s: float) -> None:
         """Periodically run one aggregation agent per active project."""
         if interval_s <= 0:
@@ -215,10 +228,15 @@ class App:
                 if self._stopped:
                     return
                 try:
+                    self.supervisor.prune_finished()
                     for project in self.projects.list():
                         if project.status not in ("active", "review", "degraded"):
                             continue
-                        if self.projects.task_list(project_id=project.id) == []:
+                        tasks = self.projects.task_list(project_id=project.id)
+                        if tasks == []:
+                            continue
+                        signature = self.aggregation_signature(project, tasks)
+                        if self._aggregated_signatures.get(project.id) == signature:
                             continue
                         running = [a for a in self.supervisor.list(project_id=project.id)
                                    if a.role == "aggregator"
@@ -228,7 +246,11 @@ class App:
                         try:
                             await self.supervisor.spawn(
                                 "aggregator", project.id,
-                                reason="scheduled_summary")
+                                reason="task_changed")
+                            # Only re-summarise when the task shape actually
+                            # changed; otherwise a finished aggregator would
+                            # respawn every interval forever.
+                            self._aggregated_signatures[project.id] = signature
                         except SfoError:
                             self.log.debug("scheduled aggregator skipped for %s",
                                            project.id)

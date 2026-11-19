@@ -300,8 +300,11 @@ class FailurePolicy:
 ### 5.4 周期性汇总
 
 `App` 内还有一个聚合循环：按 `agents.aggregator_interval_s`（默认 240s）扫描
-active/review/degraded 项目，若项目有任务且当前没有在跑的 aggregator，就拉起一个
-（受 max_workers 约束）。demo 在项目进入 review 后也会立刻跑一次，确保 brief 不为空。
+active/review/degraded 项目，只有**任务签名变化**（任务 id/status/updated_at 或项目
+状态）且当前没有在跑的 aggregator 时才拉起一个（受 max_workers 约束），避免空闲项目
+每 4 分钟无限生成汇总 Agent。aggregator 只通过 `project.update` 写项目 brief，不再往
+workspace 写 `brief.md`；每个项目保留最近 5 条已结束 aggregator 记录，完整历史仍在
+事件流里。demo 在项目进入 review 后也会立刻跑一次，确保 brief 不为空。
 
 ### 5.5 调度（Scheduler）
 
