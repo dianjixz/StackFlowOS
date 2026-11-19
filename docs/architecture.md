@@ -474,6 +474,8 @@ class Project:
 * 持久化：`<state>/state/projects.json`（全量、原子替换）；
   ID 计数器在 `<state>/state/counters.json`。
 * 每次变更发事件；卡片投影 `project.card()` 由 app 拼上 agents 统计后返回。
+  `card.milestones` 是**数量**（不是数组），`card.total_tasks` 由 app 补上；
+  UI 对两种形状都兼容。
 
 ---
 

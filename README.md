@@ -27,6 +27,7 @@ python3 -m stackflowos hub
 
 # 2) 一键演示：自动建项目、派 Agent、真实写文件、跑自检
 python3 -m stackflowos demo --until-done
+#    不带 --until-done 时 hub 会保持运行，方便打开 http://127.0.0.1:17800 看界面
 
 # 3) 换 TCP 传输（同一套协议，地址从 ipc:// 变成 tcp://）
 python3 -m stackflowos hub --transport tcp
