@@ -11,13 +11,16 @@
 | tier | 单元 |
 | --- | --- |
 | system | `sys.0`、`store.eventlog`、`store.project`、`store.memory`、`scheduler.0`、`gateway.0`、`context.0` |
-| service | `approval.0`、`llm.0`、`tool.0`、`skill.0`、`plugin.0` |
+| service | `approval.0`、`llm.0`、`tool.0`、`skill.0`、`plugin.0`、`mcp.0` |
 
 - 服务单元是 **in-process logical unit**：`runtime.mode=in_process`，`pid/rpc_address` 为 `null`，
   不伪造地址；调用侧使用 `unit://<id>`。
 - `sys.0` 保留真实 PID 与 NNG RPC/events 地址；worker 单元仍是一个 Agent 一个进程。
 - `skill.0` 已登记但状态为 `disabled`（SkillRegistry 属于规划 Phase 2）；
   `plugin.0` 是插件宿主（当前 0 个插件）；`tool.0` 是工具目录（执行仍在 worker 内）。
+- `mcp.0` 是 MCP 宿主/连接器；当前未配置 server（0 个）。每个已配置的 MCP
+  server 在 Phase 2 会登记为 `mcp.<name>`，其工具是 capability 目录条目，
+  不是单元；`mcp.call_tool` 走审批与审计。
 - `/api/units` 支持 `tier/kind/state/project_id/status` 过滤；状态栏在线口径为
   `ready|degraded|online|suspect|draining`。
 

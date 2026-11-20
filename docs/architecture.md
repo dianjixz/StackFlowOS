@@ -246,7 +246,7 @@ class UnitInfo:
 
 **单元不是"Agent 的容器"这么窄**：单元是系统里的执行体，有地址、租约、
 生命周期、能力清单与失败域。分三层：`system`（`sys.0`、store/scheduler/gateway/
-context）、`service`（审批、LLM、tool、skill、plugin）、`worker`（Agent 进程）。
+context）、`service`（审批、LLM、tool、skill、plugin、MCP 宿主）、`worker`（Agent 进程）。
 `UnitRegistry` 仍记录有 pid/心跳的 worker；`App.unit_cards()` 额外登记 hub 内
 in-process 服务单元，并用 `runtime.mode=in_process`、`unit://<id>` 表示它们，
 不伪造 pid/rpc 地址。详细规划见 [units-plan.md](units-plan.md)。

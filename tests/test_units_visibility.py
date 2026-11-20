@@ -46,7 +46,7 @@ class UnitVisibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_logical_service_units_are_visible(self):
         units = {unit["unit_id"]: unit for unit in self.app.unit_cards()}
         for unit_id in ("approval.0", "llm.0", "tool.0", "context.0",
-                        "plugin.0", "skill.0"):
+                        "plugin.0", "skill.0", "mcp.0"):
             self.assertIn(unit_id, units)
             self.assertEqual(units[unit_id]["runtime"]["mode"], "in_process")
             self.assertIsNone(units[unit_id]["pid"])

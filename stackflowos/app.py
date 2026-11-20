@@ -1756,6 +1756,13 @@ class App:
             requires=("context.0", "tool.0"),
             metadata={"description": "插件加载器；每个外部插件是 plugin.N"},
         ))
+        units.append(self._logical_service(
+            "mcp.0", "mcp", "MCP 宿主",
+            ["mcp.connect", "mcp.list_tools", "mcp.call_tool"],
+            provides={"servers": 0},
+            requires=("approval.0", "tool.0"),
+            metadata={"description": "MCP server 连接器；每个已配置 server 将登记为 mcp.<name>（协议接入 Phase 2）"},
+        ))
         return units
 
     def unit_cards(self) -> list[dict]:
