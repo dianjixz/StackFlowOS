@@ -416,6 +416,101 @@ class ChatService:
         return ("我在。可以让我「创建一个项目：…」，或者问「现在的进度怎么样」。\n"
                 "（当前模型为离线模式；在设置里配置 OpenAI 兼容端点后，我会用模型来理解和规划。）")
 
+    def _prompt_history(self, *, limit: int = 16,
+                        char_budget: int = 9000) -> list[dict]:
+        """Recent turns, newest-first budgeted, returned oldest-first.
+
+        The previous implementation sent only the current user sentence to
+        the model, so the dialog had no conversational memory at all.
+        """
+        selected: list[dict] = []
+        used = 0
+        for message in reversed(self._messages[-limit:]):
+            if message.role not in ("user", "assistant"):
+                continue
+            content = (message.text or "").strip()
+            if not content:
+                continue
+            content = content[:1800]
+            if used + len(content) > char_budget and selected:
+                break
+            selected.append({"role": message.role, "content": content})
+            used += len(content)
+        selected.reverse()
+        return selected
+
+    def _chat_context(self, snap: dict) -> dict:
+        """A compact, chat-sized view of the live system.
+
+        The full snapshot is dominated by unit/agent metadata; truncating it
+        used to cut projects/tasks out of the prompt entirely.
+        """
+        projects = []
+        for card in (snap.get("projects") or [])[:8]:
+            project_id = str(card.get("id") or "")
+            try:
+                tasks = self.app.projects.task_list(project_id=project_id)
+            except Exception:
+                tasks = []
+            projects.append({
+                "id": project_id,
+                "name": card.get("name"),
+                "status": card.get("status"),
+                "goal": str(card.get("goal") or "")[:400],
+                "brief": str(card.get("brief") or "")[:600],
+                "progress": card.get("progress"),
+                "counts": card.get("counts") or {},
+                "current_task": card.get("current_task"),
+                "tasks": [
+                    {"id": getattr(task, "id", ""),
+                     "title": str(getattr(task, "title", ""))[:100],
+                     "status": getattr(task, "status", ""),
+                     "role": getattr(task, "role", ""),
+                     "assignee": getattr(task, "assignee", None)}
+                    for task in tasks[:12]
+                ],
+                "agents": [
+                    {"role": agent.get("role"), "status": agent.get("status"),
+                     "task_id": agent.get("task_id")}
+                    for agent in (card.get("agents") or [])[:8]
+                ],
+            })
+        units = snap.get("units") or []
+        return {
+            "now": _now_ms(),
+            "projects": projects,
+            "units": {
+                "total": len(units),
+                "online": sum(
+                    1 for unit in units
+                    if (unit.get("state") or unit.get("status")) in
+                    ("ready", "degraded", "online", "suspect", "draining")),
+                "by_tier": {
+                    tier: sum(1 for unit in units
+                              if (unit.get("tier") or "worker") == tier)
+                    for tier in ("system", "service", "worker")
+                },
+            },
+            "agents": [
+                {"id": agent.get("id"), "role": agent.get("role"),
+                 "status": agent.get("status"),
+                 "task_id": agent.get("task_id")}
+                for agent in (snap.get("agents") or [])
+                if agent.get("status") not in ("done", "failed", "dead")
+            ][:12],
+            "approvals": [
+                {"id": approval.get("id"),
+                 "capability": approval.get("capability"),
+                 "principal": approval.get("principal"),
+                 "risk": approval.get("risk")}
+                for approval in (snap.get("approvals") or [])[:10]
+            ],
+            "config": {
+                "provider": (snap.get("config") or {}).get("llm", {}).get("provider"),
+                "model": (snap.get("config") or {}).get("llm", {}).get("model"),
+            },
+        }
+
     async def _llm_reply(self, text: str) -> str:
         try:
             snap = self.app.snapshot()
@@ -423,19 +518,23 @@ class ChatService:
             snap = {}
         system = (
             "你是 StackFlowOS 的系统助手，也是操作员的代理，拥有系统管理权限。"
+            "你可以看到最近对话历史和实时系统状态；回答要延续上下文，"
+            "引用之前说过的项目/任务时先核对实时状态。"
             "用户通过对话下达指令；需要操作时只输出一个 JSON 对象："
             '{"tool":"工具名","args":{...}}。不要请求审批、不要输出多个 JSON、'
             "不要编造工具名。不需要操作时直接用中文回答，简洁、具体，"
             "不要编造状态里没有的事实。若用户要求做某件事而你没有对应工具，"
             "直接说明做不到，并给出最接近的可执行选项。\n\n"
             + catalog_text()
+            + "\n\n实时状态（JSON，只包含聊天需要的摘要）："
+            + json.dumps(self._chat_context(snap), ensure_ascii=False)
         )
-        context = json.dumps(snap, ensure_ascii=False)[:6000]
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "system", "content": f"实时状态（JSON）：{context}"},
-            {"role": "user", "content": text},
-        ]
+        messages = [{"role": "system", "content": system}]
+        history = self._prompt_history()
+        if not history or history[-1].get("role") != "user" or \
+                history[-1].get("content") != text:
+            history.append({"role": "user", "content": text})
+        messages.extend(history)
         raw = await self.provider.chat(messages)
         action = _parse_action(raw)
         if action:

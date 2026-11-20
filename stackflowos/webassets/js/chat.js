@@ -8,6 +8,7 @@
  */
 
 import { api } from './api.js';
+import { openApp } from './apps.js';
 import {
   addLocalChat,
   on,
@@ -21,6 +22,7 @@ import {
   icon,
   richText,
   spinner,
+  statusLabel,
   toastError,
 } from './ui.js';
 
@@ -51,6 +53,7 @@ export function initChat() {
   els.suggestions = document.getElementById('suggestions');
   els.scrollBottom = document.getElementById('scroll-bottom');
   els.sub = document.getElementById('chat-sub');
+  els.context = document.getElementById('chat-context');
   if (!els.log || !els.form) return;
 
   renderSuggestions();
@@ -89,6 +92,7 @@ function onState() {
     renderEmptyIfNeeded();
   }
   updateSub();
+  updateContext();
 }
 
 function onChat(detail) {
@@ -367,6 +371,45 @@ function updateConnectionLabel(status = state.sse) {
   if (!els.sub || state.loaded === false) return;
   if (status === 'reconnecting') els.sub.textContent = '系统助手 · 事件流重连中';
   else if (status === 'live') updateSub();
+}
+
+function updateContext() {
+  if (!els.context) return;
+  if (!state.loaded) {
+    els.context.hidden = true;
+    return;
+  }
+  const openProjects = [...state.projects].filter((project) =>
+    ['active', 'review', 'degraded'].includes(project.status));
+  const project = openProjects[0];
+  const online = state.units.filter((unit) =>
+    ['online', 'suspect', 'ready', 'degraded', 'draining'].includes(unit.state || unit.status)).length;
+  const activeAgents = project
+    ? state.agents.filter((agent) => agent.project_id === project.id &&
+        ['working', 'waiting', 'idle', 'spawning'].includes(agent.status)).length
+    : 0;
+  const nodes = [el('span', { class: 'ctx-label' }, '上下文')];
+  if (project) {
+    nodes.push(el('button', {
+      class: 'ctx-chip',
+      type: 'button',
+      title: `打开项目 ${project.name}`,
+      onclick: () => openApp('project', project.id),
+    },
+    el('span', { class: 'ctx-dot', 'aria-hidden': 'true' }),
+    `${project.name} · ${statusLabel(project.status)} · ${Math.round(project.progress || 0)}%`));
+    const counts = project.counts || {};
+    nodes.push(el('span', {}, `待审 ${Number(counts.review) || 0} · 在岗 ${activeAgents}`));
+    if (openProjects.length > 1) {
+      nodes.push(el('span', {}, `另有 ${openProjects.length - 1} 个项目`));
+    }
+  } else {
+    nodes.push(el('span', {}, '全系统'));
+  }
+  nodes.push(el('span', {}, `单元 ${online}/${state.units.length}`));
+  nodes.push(el('span', {}, `待审批 ${state.approvals.length}`));
+  els.context.replaceChildren(...nodes);
+  els.context.hidden = false;
 }
 
 /* ------------------------------------------------------------------ */
