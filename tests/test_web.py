@@ -52,6 +52,11 @@ class FakeApp:
         self.supervisor = self
         self.leases = self
 
+    def health(self):
+        return {"status": "ok", "http": "ok", "transport": "ok",
+                "version": self.version, "uptime_s": 5,
+                "units": {"online": 1}}
+
     def stats(self):
         return {"uptime_s": 5, "units": {"online": 1}, "leases": 0,
                 "pending_approvals": 0, "events": self.eventlog.last_seq}
@@ -168,6 +173,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         status, payload = await self.aget("/api/health")
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"]["transport"], "ok")
         status, payload = await self.aget("/api/state")
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"]["sys"]["name"], "TestOS")

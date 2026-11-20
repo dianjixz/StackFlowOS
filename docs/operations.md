@@ -114,30 +114,54 @@ worker 会绑定 hub 分配端口池中的端口，需要保证该端口在该�
 
 ---
 
-## 5. 作为服务运行
+## 5. 作为服务运行（systemd --user，推荐）
+
+桌面用户不需要 root。`nohup` 只挡 SIGHUP，挡不住注销/会话清理的 SIGTERM；
+而 hub 被 SIGTERM 时会**优雅退出（exit 0）**，所以 `Restart=on-failure` 不会拉起它。
+必须用 `Restart=always`，并启用 linger（注销后仍存活）：
 
 ```ini
-# /etc/systemd/system/stackflowos.service
+# ~/.config/systemd/user/stackflowos-hub.service
 [Unit]
-Description=StackFlowOS hub
-After=network.target
+Description=StackFlowOS Hub
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
-User=YOUR_USER
 WorkingDirectory=/path/to/StackFlowOS
-Environment=SFO_ROOT=/path/to/StackFlowOS
-ExecStart=/usr/bin/python3 -m stackflowos hub
-Restart=on-failure
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -m stackflowos hub --port 17800
+ExecStartPost=/usr/bin/curl -fsS -o /dev/null --connect-timeout 2 -m 3   --retry 30 --retry-delay 1 --retry-connrefused   http://127.0.0.1:17800/api/health
+Restart=always
 RestartSec=3
-KillSignal=SIGTERM
+TimeoutStartSec=60
+TimeoutStopSec=15
+KillMode=control-group
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
-`SIGTERM` 会走优雅关闭。若需要 Web 暴露到局域网，建议前面加一层带鉴权的反代
-（Caddy/Nginx），并且**不要**直接暴露 sys RPC 端口给不可信网络。
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now stackflowos-hub.service
+loginctl enable-linger "$USER"   # 注销/重启后用户服务仍启动
+systemctl --user status stackflowos-hub.service
+journalctl --user -u stackflowos-hub -f
+```
+
+建议再加一个 health timer（每分钟探活，卡死也能重启），或至少监控
+`/api/health` 中的 `transport` 字段：HTTP 线程活着不代表 pynng IPC 活着。
+
+```bash
+systemctl --user stop stackflowos-hub   # 手动 stop 不会被 always 拉起
+systemctl --user restart stackflowos-hub
+```
+
+若需要 Web 暴露到局域网，建议前面加一层带鉴权的反代（Caddy/Nginx），并且
+**不要**直接暴露 sys RPC 端口给不可信网络。
 
 ---
 

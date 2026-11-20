@@ -747,6 +747,11 @@ class HubTransport:
     def sys_addresses(self) -> UnitAddresses:
         return self._sys
 
+    @property
+    def running(self) -> bool:
+        """True while the RPC server and event subscriber are both up."""
+        return bool(self._running)
+
     def register_action(self, action: str, handler: ActionHandler) -> None:
         """Register a sys-side RPC action (before or after :meth:`start`)."""
         if not callable(handler):

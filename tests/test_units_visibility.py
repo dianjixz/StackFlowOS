@@ -36,6 +36,7 @@ class UnitVisibilityTests(unittest.IsolatedAsyncioTestCase):
         stats = self.app.stats()["units"]
         self.assertEqual(stats["online"], 1)
         self.assertEqual(stats["by_kind"].get("sys"), 1)
+        self.assertEqual(self.app.health()["transport"], "ok")
 
     async def test_unit_cards_include_workers_after_sys(self):
         card = await self.app.attach_project("单元测试", str(self.tmp),

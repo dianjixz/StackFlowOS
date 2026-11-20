@@ -106,8 +106,12 @@ class WebAPI:
 
     # ------------------------------------------------------------------
     async def health(self, match, query, body):
-        return _ok({"status": "ok", "version": self.app.version,
-                    "uptime_s": self.app.stats().get("uptime_s", 0)})
+        health = self.app.health()
+        status = 200 if health.get("status") == "ok" else 503
+        code, payload = _ok(health, status)
+        if status != 200:
+            payload["ok"] = False
+        return code, payload
 
     async def state(self, match, query, body):
         return _ok(self.app.snapshot())

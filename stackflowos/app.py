@@ -1486,6 +1486,17 @@ class App:
                           if card.get("id") in json_dumps_safe(l.resource)]
         return card
 
+    def health(self) -> dict:
+        transport_ok = bool(getattr(self.transport, "running", False))
+        return {
+            "status": "ok" if transport_ok else "degraded",
+            "http": "ok",
+            "transport": "ok" if transport_ok else "down",
+            "version": self.version,
+            "uptime_s": int(time.time() - self.started_at / 1000),
+            "units": self.stats().get("units", {}),
+        }
+
     def stats(self) -> dict:
         units = self.registry.stats()
         # sys.0 is a real unit; count it in headline stats as well as in the
