@@ -291,11 +291,15 @@ class WebAPI:
 
     async def units_list(self, match, query, body):
         kind = query.get("kind") or None
+        tier = query.get("tier") or None
+        state = query.get("state") or None
         project_id = query.get("project_id") or None
         status = query.get("status") or None
         units = [
             unit for unit in self.app.unit_cards()
             if (kind is None or unit.get("kind") == kind)
+            and (tier is None or unit.get("tier") == tier)
+            and (state is None or unit.get("state") == state)
             and (project_id is None or unit.get("project_id") == project_id)
             and (status is None or unit.get("status") == status)
         ]

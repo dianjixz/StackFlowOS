@@ -16,7 +16,8 @@
 
 > 设计与判断的完整推导见 [docs/vision.md](docs/vision.md)，
 > 实现契约见 [docs/architecture.md](docs/architecture.md)，
-> 自举/自改进操作手册见 [docs/self-hosting.md](docs/self-hosting.md)。
+> 自举/自改进操作手册见 [docs/self-hosting.md](docs/self-hosting.md)，
+> 单元模型（sys/审批/LLM/工具/上下文/插件/skill）见 [docs/units-plan.md](docs/units-plan.md)。
 
 ---
 

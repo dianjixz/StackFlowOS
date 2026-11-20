@@ -1405,6 +1405,10 @@ class App:
     async def kill_unit(self, work_id: str) -> dict:
         if work_id == "sys.0":
             raise BadRequest("sys.0 is the hub itself; stop the hub process instead")
+        if work_id in {unit.get("unit_id") for unit in self.logical_units()}:
+            raise BadRequest(
+                "in-process service units cannot be killed independently; "
+                "restart the hub or disable the service")
         return await self._unit_kill({"work_id": work_id, "reason": "operator_requested"},
                                      "operator")
 
@@ -1498,17 +1502,28 @@ class App:
         }
 
     def stats(self) -> dict:
-        units = self.registry.stats()
-        # sys.0 is a real unit; count it in headline stats as well as in the
-        # snapshot/units API so "在线单元" never reads 0 while the hub runs.
-        units["total"] = int(units.get("total", 0)) + 1
-        units["online"] = int(units.get("online", 0)) + 1
-        by_status = dict(units.get("by_status") or {})
-        by_status["online"] = int(by_status.get("online", 0)) + 1
-        units["by_status"] = dict(sorted(by_status.items()))
-        by_kind = dict(units.get("by_kind") or {})
-        by_kind["sys"] = int(by_kind.get("sys", 0)) + 1
-        units["by_kind"] = dict(sorted(by_kind.items()))
+        cards = self.unit_cards()
+        by_status: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        by_tier: dict[str, int] = {}
+        online = 0
+        for card in cards:
+            status = str(card.get("status") or "")
+            state = str(card.get("state") or status)
+            by_status[status] = by_status.get(status, 0) + 1
+            by_kind[str(card.get("kind") or "")] = (
+                by_kind.get(str(card.get("kind") or ""), 0) + 1)
+            tier = str(card.get("tier") or "worker")
+            by_tier[tier] = by_tier.get(tier, 0) + 1
+            if state in ("ready", "degraded", "online", "suspect", "draining"):
+                online += 1
+        units = {
+            "total": len(cards),
+            "online": online,
+            "by_status": dict(sorted(by_status.items())),
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_tier": dict(sorted(by_tier.items())),
+        }
         agents = self.supervisor.stats()
         return {
             "units": units,
@@ -1535,9 +1550,13 @@ class App:
 
     def sys_unit(self) -> dict:
         """The hub itself is a unit: sys.0 with addresses and a lifecycle."""
+        now = now_ms()
         return {
             "work_id": "sys.0",
+            "unit_id": "sys.0",
             "kind": "sys",
+            "role": "hub",
+            "tier": "system",
             "label": "hub · 系统单元",
             "project_id": None,
             "pid": os.getpid(),
@@ -1546,6 +1565,8 @@ class App:
             "rpc_address": self.sys_addresses.rpc,
             "events_address": self.sys_addresses.events,
             "status": "online",
+            "state": "ready",
+            "reason": None,
             "abilities": [
                 {"name": "sys.rpc", "scope": "system"},
                 {"name": "sys.events", "scope": "system"},
@@ -1553,14 +1574,194 @@ class App:
             ],
             "hwinfo": {},
             "started_at": self.started_at,
-            "last_seen": now_ms(),
+            "last_seen": now,
             "restart_count": 0,
-            "metadata": {"role": "hub", "web_port": self.config.web.port},
+            "metadata": {"role": "hub", "web_port": self.config.web.port,
+                         "description": "hub 进程：注册表/监管/配置/HTTP/NNG 入口"},
+            "runtime": {
+                "mode": "sys",
+                "host_unit": None,
+                "host": self.config.system.host_label,
+                "pid": os.getpid(),
+                "module": "stackflowos.app:App",
+                "started_at": self.started_at,
+            },
+            "endpoints": [
+                {"name": "rpc", "transport": "nng-req",
+                 "address": self.sys_addresses.rpc},
+                {"name": "events", "transport": "nng-pub",
+                 "address": self.sys_addresses.events},
+                {"name": "http", "transport": "http",
+                 "address": f"http://127.0.0.1:{self.config.web.port}"},
+            ],
+            "ref": "unit://sys.0",
+            "critical": True,
+            "requires": [],
+            "actions": ["probe"],
+            "lease": {"type": "host", "host_unit": None, "interval_s": 5,
+                      "renewed_at": now},
+            "provides": {},
         }
 
+    def _logical_service(self, unit_id: str, kind: str, label: str,
+                         abilities: list[str], *, tier: str = "service",
+                         critical: bool = False, state: str = "ready",
+                         reason: str | None = None,
+                         requires: tuple[str, ...] = (),
+                         provides: dict | None = None,
+                         endpoints: list[dict] | None = None,
+                         metadata: dict | None = None) -> dict:
+        """A hub-resident service unit (no pid, no fake socket address)."""
+        now = now_ms()
+        status = {"ready": "online", "degraded": "degraded",
+                  "disabled": "disabled", "failed": "failed",
+                  "waiting": "waiting"}.get(state, "online")
+        return {
+            "work_id": unit_id,
+            "unit_id": unit_id,
+            "kind": kind,
+            "role": None,
+            "tier": tier,
+            "label": label,
+            "project_id": None,
+            "pid": None,
+            "host": self.config.system.host_label,
+            "transport": "inproc",
+            "rpc_address": None,
+            "events_address": None,
+            "status": status,
+            "state": state,
+            "reason": reason,
+            "abilities": [{"name": name, "scope": "system"}
+                          for name in abilities],
+            "hwinfo": {},
+            "started_at": self.started_at,
+            "last_seen": now,
+            "restart_count": 0,
+            "metadata": metadata or {},
+            "runtime": {
+                "mode": "in_process",
+                "host_unit": "sys.0",
+                "host": self.config.system.host_label,
+                "pid": None,
+                "module": f"stackflowos.app:{unit_id}",
+                "started_at": self.started_at,
+            },
+            "endpoints": endpoints or [
+                {"name": "inproc", "transport": "inproc", "address": unit_id}],
+            "ref": f"unit://{unit_id}",
+            "critical": critical,
+            "requires": list(requires),
+            "actions": ["probe"],
+            "lease": {"type": "host", "host_unit": "sys.0",
+                      "interval_s": 5, "renewed_at": now},
+            "provides": provides or {},
+        }
+
+    def logical_units(self) -> list[dict]:
+        """The hub's real services exposed as in-process units.
+
+        This deliberately does not invent a process/PID for them: runtime.mode
+        and endpoints carry the truth, while the old flat fields stay null.
+        """
+        from .agents.tools import TOOLS
+
+        units: list[dict] = []
+        events_ok = os.access(self.paths.events_dir, os.W_OK)
+
+        units.append(self._logical_service(
+            "store.eventlog", "store", "事件日志",
+            ["eventlog.append", "eventlog.query"], tier="system",
+            critical=True,
+            state="ready" if events_ok else "degraded",
+            reason=None if events_ok else "events 目录不可写",
+            provides={"events": self.eventlog.last_seq},
+            metadata={"description": "append-only JSONL 事件流"},
+        ))
+        units.append(self._logical_service(
+            "store.project", "store", "项目存储",
+            ["project.read", "project.write"], tier="system",
+            critical=True, provides={"projects": len(self.projects.list())},
+            metadata={"description": "项目/任务/里程碑"},
+        ))
+        units.append(self._logical_service(
+            "store.memory", "store", "记忆存储",
+            ["memory.get", "memory.set"], tier="system",
+            provides={"projects": len(self.memory.data)},
+            metadata={"description": "按项目隔离的 key/value 记忆"},
+        ))
+        units.append(self._logical_service(
+            "scheduler.0", "scheduler", "调度器",
+            ["task.dispatch", "lease.renew"], tier="system",
+            metadata={"description": "任务调度与租约续期"},
+        ))
+        units.append(self._logical_service(
+            "gateway.0", "gateway", "Web/SSE 网关",
+            ["http", "sse"], tier="system",
+            endpoints=[{"name": "http", "transport": "http",
+                        "address": f"http://127.0.0.1:{self.config.web.port}"}],
+            metadata={"description": "HTTP API、SSE 与静态 UI"},
+        ))
+        units.append(self._logical_service(
+            "context.0", "context", "上下文容器",
+            ["context.inject", "plugin.mount"], tier="system",
+            metadata={"description": "Cordis-style Context / effect / disposer"},
+        ))
+        units.append(self._logical_service(
+            "approval.0", "approval", "审批中心",
+            ["policy.evaluate", "approval.request", "approval.decide"],
+            critical=True,
+            provides={"pending": self.approvals.pending_count()},
+            requires=("store.eventlog",),
+            metadata={"description": "能力→风险→策略→审批→授予→审计"},
+        ))
+        provider = getattr(self, "provider", None)
+        llm_state = "ready"
+        llm_reason = None
+        llm_model = ""
+        llm_name = ""
+        if provider is None:
+            llm_state, llm_reason = "disabled", "未配置 LLM provider"
+        else:
+            llm_name = str(getattr(provider, "name", "") or "")
+            llm_model = str(getattr(provider, "model", "") or "")
+            if llm_name == "openai" and not getattr(provider, "api_key", ""):
+                llm_state, llm_reason = "degraded", "未配置 API Key"
+        units.append(self._logical_service(
+            "llm.0", "llm", "LLM 服务",
+            ["llm.chat", "llm.models"], state=llm_state, reason=llm_reason,
+            endpoints=[{"name": "remote", "transport": "http",
+                        "address": str(getattr(provider, "base_url", "") or "")}]
+            if provider is not None else [],
+            provides={"model": llm_model, "provider": llm_name},
+            metadata={"description": "OpenAI 兼容 provider（无状态，可多实例）",
+                      "model": llm_model, "provider": llm_name},
+        ))
+        units.append(self._logical_service(
+            "tool.0", "tool", "工具注册表",
+            ["tool.catalog", "tool.dispatch"], provides={"tools": len(TOOLS)},
+            requires=("approval.0",),
+            metadata={"description": "内置工具目录、schema 校验与审批挂钩"},
+        ))
+        units.append(self._logical_service(
+            "skill.0", "skill", "技能注册表",
+            ["skill.list", "skill.inject"], state="disabled",
+            reason="SkillRegistry 尚未实现（规划 Phase 2）",
+            provides={"skills": 0},
+            metadata={"description": "skill manifest 目录；单个 skill 不是单元"},
+        ))
+        units.append(self._logical_service(
+            "plugin.0", "plugin", "插件宿主",
+            ["plugin.load", "plugin.unload"], provides={"plugins": 0},
+            requires=("context.0", "tool.0"),
+            metadata={"description": "插件加载器；每个外部插件是 plugin.N"},
+        ))
+        return units
+
     def unit_cards(self) -> list[dict]:
-        """sys unit plus every registered worker unit (the system's ``ps``)."""
-        return [self.sys_unit()] + [u.to_dict() for u in self.registry.list()]
+        """sys + hub services + every registered worker (the system's ``ps``)."""
+        return ([self.sys_unit()] + self.logical_units()
+                + [u.to_dict() for u in self.registry.list()])
 
     def snapshot(self) -> dict:
         try:

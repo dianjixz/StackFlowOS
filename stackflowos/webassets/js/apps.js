@@ -45,7 +45,7 @@ import {
 const APP_META = {
   projects: { title: '项目', sub: '项目列表 · 任务看板 · 归档', icon: 'projects' },
   agents: { title: 'Agent', sub: '花名册 · 派工 · 终止', icon: 'agents' },
-  units: { title: '单元', sub: '进程 · 地址 · 能力', icon: 'units' },
+  units: { title: '单元', sub: '系统 · 服务 · 工人', icon: 'units' },
   approvals: { title: '审批', sub: '风险操作的人工闸门', icon: 'approvals' },
   events: { title: '事件', sub: '系统控制台 · 审计流', icon: 'events' },
   settings: { title: '设置', sub: '系统 · 网络 · AI · 安全 · 存储', icon: 'settings' },
@@ -1189,14 +1189,18 @@ function renderSpawnForm() {
 function renderUnitsApp() {
   const wrap = el('div', {});
   const units = state.units;
+  const online = units.filter((unit) =>
+    ['online', 'suspect', 'ready', 'degraded', 'draining'].includes(unit.state || unit.status)).length;
+  const tierCount = (tier) => units.filter((unit) => (unit.tier || 'worker') === tier).length;
+  const tierLabel = { system: '系统', service: '服务', worker: '工人' };
   wrap.append(el('div', { class: 'app-toolbar' },
     el('div', { class: 'toolbar-left' },
       el('span', { class: 'app-count' },
-        `${units.filter((unit) => unit.status === 'online').length} 在线 / ${units.length} 总计`),
+        `${online} 在线 / ${units.length} 总计 · 系统 ${tierCount('system')} · 服务 ${tierCount('service')} · 工人 ${tierCount('worker')}`),
     ),
     el('div', { class: 'toolbar-right' }, refreshButton(() => loadState({ quiet: true }))),
   ));
-  wrap.append(appNote('单元是带地址、租约与生命周期的执行体：sys.0 是 hub 本身，worker 单元通常一个 Agent 一个进程。强制终止会要求它退出；离线单元会在心跳超时后自动标记。', { iconName: 'units' }));
+  wrap.append(appNote('单元是带地址、租约与生命周期的执行体：sys.0 是 hub 本身；审批/LLM/工具/上下文/插件/技能是 hub 进程内的服务单元；worker 单元通常一个 Agent 一个进程。没有 pid/地址的服务单元不伪造字段。', { iconName: 'units' }));
 
   if (!state.loaded) {
     wrap.append(loadingInline('载入单元…'));
@@ -1205,8 +1209,8 @@ function renderUnitsApp() {
   if (!units.length) {
     wrap.append(emptyState({
       iconName: 'units',
-      title: '还没有 worker 单元',
-      text: '创建项目或派工后，工作进程会注册到这里，并显示它们的 RPC 地址与能力。',
+      title: '还没有单元',
+      text: '系统单元应在 hub 启动后立即出现；若为空，查看事件流中的 sys.booted。',
     }));
     return wrap;
   }
@@ -1229,39 +1233,54 @@ function renderUnitsApp() {
   const tbody = el('tbody');
   for (const unit of units) {
     const isSys = unit.work_id === 'sys.0';
-    const killBtn = isSys ? el('span', { class: 'muted mono' }, 'hub') : el('button', {
-      class: 'btn btn-xs btn-danger',
-      type: 'button',
-      'aria-label': `终止单元 ${unit.work_id}`,
-      onclick: () => {
-        if (!window.confirm(`终止单元 ${unit.work_id}？\n正在使用它的 Agent 会被中断。`)) return;
-        withBusy(killBtn, async () => {
-          try {
-            await api.killUnit(unit.work_id);
-            toast('终止信号已发送', 'success');
-            await loadState({ quiet: true });
-            renderSheet();
-          } catch (error) {
-            toastError(error);
-          }
-        });
-      },
-    }, '终止');
+    const inProcess = unit.runtime && unit.runtime.mode === 'in_process';
+    const killBtn = isSys
+      ? el('span', { class: 'muted mono' }, 'hub')
+      : inProcess
+        ? el('span', { class: 'muted mono' }, 'service')
+        : el('button', {
+          class: 'btn btn-xs btn-danger',
+          type: 'button',
+          'aria-label': `终止单元 ${unit.work_id}`,
+          onclick: () => {
+            if (!window.confirm(`终止单元 ${unit.work_id}？\n正在使用它的 Agent 会被中断。`)) return;
+            withBusy(killBtn, async () => {
+              try {
+                await api.killUnit(unit.work_id);
+                toast('终止信号已发送', 'success');
+                await loadState({ quiet: true });
+                renderSheet();
+              } catch (error) {
+                toastError(error);
+              }
+            });
+          },
+        }, '终止');
 
     const abilities = Array.isArray(unit.abilities) ? unit.abilities : [];
     const abilityNames = abilities.slice(0, 4).map((ability) =>
       typeof ability === 'string' ? ability : (ability.name || ability.tool || 'ability'));
+    const address = isSys
+      ? (unit.rpc_address || unit.ref || '—')
+      : (unit.ref || unit.rpc_address || '—');
+    const transport = inProcess
+      ? 'INPROC'
+      : String(unit.transport || '—').toUpperCase();
+    const sub = [unit.label, unit.kind, tierLabel[unit.tier] || '']
+      .filter(Boolean).join(' · ');
     tbody.append(el('tr', {},
       el('td', {},
         el('div', { class: 'unit-id', title: unit.work_id }, unit.work_id),
-        el('div', { class: 'unit-sub muted', title: [unit.label, unit.kind].filter(Boolean).join(' · ') },
-          [unit.label, unit.kind].filter(Boolean).join(' · ') || '—'),
+        el('div', { class: 'unit-sub muted', title: sub },
+          sub || '—'),
       ),
-      el('td', {}, statusPill(unit.status)),
-      el('td', { class: 'mono' }, String(unit.transport || '—').toUpperCase()),
-      el('td', {}, el('div', { class: 'unit-addr', title: unit.rpc_address || '' }, unit.rpc_address || '—'),
-        el('div', { class: 'unit-addr is-secondary', title: unit.events_address || '' }, unit.events_address || '—')),
-      el('td', { class: 'mono' }, String(unit.pid ?? '—')),
+      el('td', {}, (() => { const pill = statusPill(unit.state || unit.status); if (unit.reason) pill.title = unit.reason; return pill; })()),
+      el('td', { class: 'mono' }, transport),
+      el('td', {}, el('div', { class: 'unit-addr', title: address }, address),
+        unit.events_address
+          ? el('div', { class: 'unit-addr is-secondary', title: unit.events_address }, unit.events_address)
+          : null),
+      el('td', { class: 'mono' }, unit.pid == null ? '—' : String(unit.pid)),
       el('td', { class: 'mono unit-last-seen', title: fmtDateTime(unit.last_seen) }, ago(unit.last_seen)),
       el('td', {},
         abilities.length

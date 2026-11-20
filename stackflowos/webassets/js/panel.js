@@ -96,7 +96,8 @@ function renderStatus() {
     if (els.transportLabel) els.transportLabel.textContent = mode ? mode.toUpperCase() : '—';
     els.transport.title = `传输模式 ${mode.toUpperCase() || '未知'}${sys.sys_rpc ? ` · ${sys.sys_rpc}` : ''}`;
   }
-  const onlineUnits = state.units.filter((unit) => unit.status === 'online').length;
+  const onlineUnits = state.units.filter((unit) =>
+    ['online', 'suspect', 'ready', 'degraded', 'draining'].includes(unit.state || unit.status)).length;
   if (els.units) els.units.textContent = state.loaded ? String(onlineUnits) : '—';
   const leases = Array.isArray(state.leases) ? state.leases.length : Number(stats.leases) || 0;
   if (els.leases) els.leases.textContent = state.loaded ? String(leases) : '—';
