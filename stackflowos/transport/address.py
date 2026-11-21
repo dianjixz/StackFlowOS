@@ -20,8 +20,9 @@ Design notes
 * TCP ports are probed with a throwaway bind before being handed out, and
   released ports go back to the pool.  A port that is already in use is
   skipped, so a busy machine degrades to later ports instead of failing.
-* All runtime files stay under the caller-provided ``run_dir``; nothing is
-  written to the system temp directory.
+* Runtime files stay under the caller-provided ``run_dir``.  The only
+  exception is :func:`socket_dir_for`, which the hub uses to move ipc sockets
+  to a short temp dir when the state dir is too deep for ``sockaddr_un``.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import hashlib
 import logging
 import re
 import socket
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -303,6 +305,31 @@ def _safe_stem(work_id: str) -> str:
     if safe.startswith("."):
         safe = f"_{safe}"
     return safe
+
+
+def socket_dir_for(run_dir: Path, mode: str, log: logging.Logger | None = None) -> Path:
+    """Directory for ipc sockets: ``run_dir``, or a short temp dir if it is too deep.
+
+    ``sockaddr_un`` holds ~100 bytes, so a state dir under a deeply nested
+    checkout would make every unit fail to bind.
+    """
+    run_dir = Path(run_dir)
+    if mode != "ipc":
+        return run_dir
+    reserve = 40  # "coder.123.events.sock" or a hashed id
+    if len(str(run_dir).encode("utf-8")) + reserve <= MAX_IPC_PATH_BYTES:
+        return run_dir
+    digest = _digest(str(run_dir.resolve()), 10)
+    for base in (Path(tempfile.gettempdir()), Path("/tmp")):
+        candidate = base / f"sfo-{digest}"
+        if len(str(candidate).encode("utf-8")) + reserve <= MAX_IPC_PATH_BYTES:
+            (log or _LOG).warning(
+                "run dir %s is too long for unix sockets; using %s", run_dir, candidate)
+            return candidate
+    return run_dir
+
+
+_LOG = logging.getLogger("sfo.transport.address")
 
 
 def _digest(work_id: str, length: int) -> str:

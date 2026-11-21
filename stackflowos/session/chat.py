@@ -326,32 +326,88 @@ class ChatService:
         return ("我在。可以让我「创建一个项目：…」，或者问「现在的进度怎么样」。\n"
                 "（当前模型为离线模式；在设置里配置 OpenAI 兼容端点后，我会用模型来理解和规划。）")
 
-    async def _llm_reply(self, text: str) -> str:
+    _ASSISTANT_PROMPT = (
+        "你是 StackFlowOS 的系统助手，一个以操作系统口吻说话的执行型助手。"
+        "你能看到下方的实时系统状态。需要操作时只输出一个 JSON 对象：\n"
+        '{"tool":"project.create","args":{"name":"...","goal":"..."}}\n'
+        "可用工具：project.create(name,goal)、project.list()、project.get(project_id)、"
+        "task.list(project_id)、unit.list()、event.query(project_id,since,limit)、"
+        "agent.spawn(role,project_id,task_id?)、agent.kill(agent_id)、"
+        "project.update(project_id,patch)、project.archive(project_id)、"
+        "project.delete(project_id,purge_workspace)。\n"
+        "工具结果会作为下一条消息返回给你；据此继续调用工具，或直接用中文给出最终回答。"
+        "高风险工具会进入人工审批，你会等到结果再继续。"
+        "不需要工具时直接用中文回答，简洁、具体，不要编造状态里没有的事实。"
+    )
+    _MAX_TOOL_ROUNDS = 6
+
+    def _brief_state(self) -> str:
         try:
             snap = self.app.snapshot()
         except Exception:
-            snap = {}
-        system = (
-            "你是 StackFlowOS 的系统助手，一个以操作系统口吻说话的执行型助手。"
-            "你能看到下方的实时系统状态。需要操作时只输出一个 JSON 对象："
-            '{"tool":"project.create","args":{"name":"...","goal":"..."}} 或 '
-            '{"tool":"agent.spawn","args":{"role":"coder","project_id":"p-1"}}；'
-            "不需要工具时直接用中文回答，简洁、具体，不要编造状态里没有的事实。"
-        )
-        context = json.dumps(snap, ensure_ascii=False)[:6000]
+            return "{}"
+        brief = {
+            "projects": [
+                {"id": p.get("id"), "name": p.get("name"), "status": p.get("status"),
+                 "progress": p.get("progress"), "counts": p.get("counts")}
+                for p in (snap.get("projects") or [])[:20]],
+            "agents": [
+                {"id": a.get("id"), "role": a.get("role"), "status": a.get("status"),
+                 "project_id": a.get("project_id"), "task_id": a.get("task_id")}
+                for a in (snap.get("agents") or [])[-20:]],
+            "pending_approvals": [
+                {"id": a.get("id"), "capability": a.get("capability"),
+                 "risk": a.get("risk"), "principal": a.get("principal")}
+                for a in (snap.get("approvals") or [])[:10]],
+            "units_online": len([u for u in (snap.get("units") or [])
+                                 if u.get("status") == "online"]),
+        }
+        return json.dumps(brief, ensure_ascii=False)
+
+    def _history_messages(self, text: str) -> list[dict]:
+        turns = [{"role": m.role, "content": m.text}
+                 for m in self._messages[-13:]
+                 if m.role in ("user", "assistant") and m.text]
+        if not turns or turns[-1] != {"role": "user", "content": text}:
+            turns.append({"role": "user", "content": text})
+        return turns
+
+    async def _announce_pending(self, request: Any) -> None:
+        await self._append(ChatMessage(
+            id=_mid(), role="assistant", ts=_now_ms(), agent_id="agent-assistant",
+            text=(f"这一步需要你批准：`{request.capability}`（风险 {request.risk}，"
+                  f"审批 `{request.id}`）。请打开「审批」放行或拒绝，我会等结果再继续。"),
+        ))
+
+    async def _llm_reply(self, text: str) -> str:
         messages = [
-            {"role": "system", "content": system},
-            {"role": "system", "content": f"实时状态（JSON）：{context}"},
-            {"role": "user", "content": text},
+            {"role": "system", "content": self._ASSISTANT_PROMPT},
+            {"role": "system", "content": f"实时状态（JSON）：{self._brief_state()}"},
+            *self._history_messages(text),
         ]
-        raw = await self.provider.chat(messages)
-        action = _parse_action(raw)
-        if action and hasattr(self.app, "assistant_tool"):
-            result = await self.app.assistant_tool(action["tool"], action.get("args") or {})
+        raw = ""
+        last_note = ""
+        for _round in range(self._MAX_TOOL_ROUNDS):
+            raw = await self.provider.chat(messages)
+            action = _parse_action(raw)
+            if not action or not hasattr(self.app, "assistant_tool"):
+                return raw.strip() or self._fallback_text(text)
+            result = await self.app.assistant_tool(
+                action["tool"], action.get("args") or {}, wait=True,
+                on_pending=self._announce_pending)
             if result.get("ok"):
-                return self._explain_tool_result(action["tool"], result.get("data") or {})
-            return f"这个操作被挡下了：{result.get('error')}"
-        return raw.strip() or self._fallback_text(text)
+                last_note = self._explain_tool_result(action["tool"],
+                                                      result.get("data") or {})
+                payload = {"ok": True, "data": result.get("data")}
+            else:
+                last_note = f"这个操作没做成：{result.get('error')}"
+                payload = {"ok": False, "error": result.get("error")}
+            observation = json.dumps(payload, ensure_ascii=False, default=str)
+            if len(observation) > 6000:
+                observation = observation[:6000] + "…[已截断]"
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"工具结果：{observation}"})
+        return last_note or raw.strip() or self._fallback_text(text)
 
     def _explain_tool_result(self, tool: str, data: dict) -> str:
         if tool == "project.create":

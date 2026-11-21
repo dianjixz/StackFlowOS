@@ -16,7 +16,7 @@ Public surface (everything the rest of StackFlowOS imports):
 
 from __future__ import annotations
 
-from .address import AddressAllocator, UnitAddresses
+from .address import AddressAllocator, UnitAddresses, socket_dir_for
 from .nng import (
     EventPublisher,
     EventSubscriber,
@@ -30,6 +30,7 @@ from .nng import (
 
 __all__ = [
     "AddressAllocator",
+    "socket_dir_for",
     "UnitAddresses",
     "RpcServer",
     "RpcClient",

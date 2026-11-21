@@ -29,7 +29,7 @@ from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler
 from .projects import ProjectStore, plan_for
 from .security import ApprovalBroker, PolicyEngine
 from .session.chat import ChatService
-from .transport import AddressAllocator, HubTransport
+from .transport import AddressAllocator, HubTransport, socket_dir_for
 from .util.jsonio import read_json, write_json
 from .util.logging import get_logger, setup_logging
 
@@ -103,7 +103,7 @@ class App:
         self.allocator = AddressAllocator(
             mode=cfg.transport.mode,
             host=cfg.transport.host,
-            run_dir=self.paths.run_dir,
+            run_dir=socket_dir_for(self.paths.run_dir, cfg.transport.mode, log),
             port_pool=(cfg.transport.port_pool_start, cfg.transport.port_pool_end),
             advertise_host=cfg.transport.advertise_host,
             logger=get_logger("address"),
@@ -751,11 +751,14 @@ class App:
             note=str(data.get("note") or ""),
             created_by=str(data.get("created_by") or "operator"),
         )
+        if rule.effect == "allow":
+            self.approvals.resolve_pending()
         return rule.to_dict()
 
     async def _rule_update(self, data, src):
         rule = self.policy.update_rule(str(data.get("rule_id") or data.get("id") or ""),
                                        dict(data.get("patch") or {}))
+        self.approvals.resolve_pending()
         return rule.to_dict()
 
     async def _rule_delete(self, data, src):
@@ -1330,6 +1333,7 @@ class App:
             self.policy.auto_allow_low = cfg.security.auto_allow_low
             self.policy.medium_default = cfg.security.medium_default
             self.policy.high_default = cfg.security.high_default
+            self.approvals.resolve_pending()
         except Exception:
             self.log.exception("live config application failed")
         # Chat sessions hold a provider instance; rebuild it so a model
@@ -1355,8 +1359,14 @@ class App:
         }, source="operator")
         return {"config": cfg.public_dict(), "restart_required": restart_required}
 
-    async def assistant_tool(self, tool: str, args: dict) -> dict:
-        """Execute a chat-assistant tool call with a non-blocking approval gate."""
+    async def assistant_tool(self, tool: str, args: dict, *, wait: bool = False,
+                             on_pending=None) -> dict:
+        """Execute a chat-assistant tool call behind the approval gate.
+
+        With ``wait`` the call parks until a human decides (or the approval
+        expires) and then carries on; ``on_pending`` is awaited once with the
+        parked request so the chat can tell the user where to approve.
+        """
         mapping = {
             "project.create": ("project.create", {}),
             "project.list": ("data.read", {}),
@@ -1394,9 +1404,19 @@ class App:
             project_id=args.get("project_id"),
         )
         if request.status == "pending":
-            return {"ok": False, "error": f"已提交审批 {request.id}，等待人工放行"}
+            if not wait:
+                return {"ok": False, "error": f"已提交审批 {request.id}，等待人工放行"}
+            if on_pending is not None:
+                try:
+                    await on_pending(request)
+                except Exception:  # noqa: BLE001 - notification is best effort
+                    self.log.debug("assistant on_pending failed", exc_info=True)
+            while request.status == "pending":
+                await asyncio.sleep(0.5)
+                request = self.approvals.poll(request.id)
         if request.status != "approved":
-            return {"ok": False, "error": f"策略拒绝（{request.reason or request.status}）"}
+            why = request.note or request.status
+            return {"ok": False, "error": f"审批未通过（{request.status}：{why}）"}
         try:
             if tool == "project.create":
                 card = await self.create_project(
@@ -1439,7 +1459,7 @@ class App:
                 return {"ok": False, "error": "unhandled tool"}
         except SfoError as exc:
             return {"ok": False, "error": f"{exc.code}: {exc.message}"}
-        if request.grant_id and request.mode == "grant":
+        if request.grant_id:
             self.approvals.use(request.grant_id)
         return {"ok": True, "data": result}
 

@@ -269,6 +269,27 @@ class LLMBrainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.finish["status"], "failed")
         self.assertIn("未知工具", action.finish["summary"])
 
+    async def test_history_carries_tool_results_between_steps(self) -> None:
+        provider = ScriptedProvider([
+            '{"tool": "fs.list", "args": {"path": "."}}',
+            '{"finish": {"summary": "ok"}}'])
+        brain = LLMBrain(provider, "coder")
+        action = await brain.next_action(self._view())
+        brain.observe(action, SimpleNamespace(
+            ok=True, error=None, data={"entries": ["a.py"]}))
+        await brain.next_action(self._view())
+        messages = provider.calls[1][0]
+        self.assertTrue(any(m["role"] == "assistant" and "fs.list" in m["content"]
+                            for m in messages))
+        self.assertTrue(any("工具结果" in m["content"] and "a.py" in m["content"]
+                            for m in messages))
+
+    async def test_tool_outside_role_allow_list_is_rejected(self) -> None:
+        provider = ScriptedProvider(['{"tool": "task.create", "args": {}}'] * 3)
+        action = await LLMBrain(provider, "coder").next_action(self._view())
+        self.assertEqual(action.finish["status"], "failed")
+        self.assertIn("未知工具", action.finish["summary"])
+
     async def test_provider_error_finishes_failed(self) -> None:
         provider = ScriptedProvider(error=Unavailable("offline"))
         action = await LLMBrain(provider, "coder").next_action(self._view())

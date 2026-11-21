@@ -444,7 +444,11 @@ def _doctor(args) -> int:
         start, end = cfg.transport.port_pool_start, cfg.transport.port_pool_end
         print(f"[ok] tcp port pool {start}-{end}")
     else:
-        print(f"[ok] ipc directory {cfg.transport.ipc_dir or cfg.paths.run_dir}")
+        ipc_dir = cfg.transport.ipc_dir or cfg.paths.run_dir
+        print(f"[ok] ipc directory {ipc_dir}")
+        if len(str(ipc_dir).encode("utf-8")) > 60:
+            print("[warn] ipc directory path is long; sockets will fall back to a "
+                  "short temp directory (or use SFO_STATE_DIR=/tmp/sfo)")
 
     print(f"[ok] llm provider {cfg.llm.provider}"
           + (f" model={cfg.llm.model}" if cfg.llm.model else ""))

@@ -82,7 +82,7 @@ class LLMCfg:
     model: str = ""
     api_key: str = ""
     temperature: float = 0.2
-    max_tokens: int = 1200
+    max_tokens: int = 4096
     timeout_s: float = 60.0
 
 

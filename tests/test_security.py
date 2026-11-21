@@ -489,6 +489,59 @@ class ApprovalTests(SecurityTestBase):
         self.assertTrue(self.broker.use(rule.id))
         self.assertIsNotNone(self.policy.get_rule(rule.id))
 
+    def test_standing_grant_covers_later_requests_by_same_role(self):
+        first = self.broker.request(
+            "agent-coder-1", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "a.py"),
+             "bytes": 10}, project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="session")
+        later = self.broker.request(
+            "agent-coder-7", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "pkg" / "b.py"),
+             "bytes": 999}, project_id="p-1")
+        self.assertEqual(later.status, "approved")
+        other_role = self.broker.request(
+            "agent-reviewer-2", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "b.py"),
+             "bytes": 1}, project_id="p-1")
+        self.assertEqual(other_role.status, "pending")
+        other_project = self.broker.request(
+            "agent-coder-7", "fs.write",
+            {"project_id": "p-2", "path": str(self.workspace / "b.py"),
+             "bytes": 1}, project_id="p-2")
+        self.assertEqual(other_project.status, "pending")
+
+    def test_standing_shell_grant_stays_exact_per_command(self):
+        first = self.broker.request(
+            "agent-coder-1", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q"}, project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        same = self.broker.request(
+            "agent-coder-2", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q"}, project_id="p-1")
+        self.assertEqual(same.status, "approved")
+        different = self.broker.request(
+            "agent-coder-2", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q && rm -rf x"}, project_id="p-1")
+        self.assertEqual(different.status, "pending")
+
+    def test_standing_decision_resolves_waiting_siblings(self):
+        scope = {"project_id": "p-1", "path": str(self.workspace / "a.py"),
+                 "bytes": 3}
+        first = self.broker.request("agent-coder-1", "fs.write", scope,
+                                    project_id="p-1")
+        second = self.broker.request("agent-coder-2", "fs.write",
+                                     {**scope, "bytes": 4}, project_id="p-1")
+        unrelated = self.broker.request("agent-architect-1", "fs.write", scope,
+                                        project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        self.assertEqual(self.broker.get(second.id).status, "approved")
+        self.assertEqual(self.broker.get(second.id).decided_by, "policy")
+        self.assertEqual(self.broker.get(unrelated.id).status, "pending")
+
     def test_decide_deny(self):
         request = self.broker.request(
             "agent.coder.1", "shell.exec",
