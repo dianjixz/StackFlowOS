@@ -511,6 +511,24 @@ class ApprovalTests(SecurityTestBase):
              "bytes": 1}, project_id="p-2")
         self.assertEqual(other_project.status, "pending")
 
+    def test_standing_grant_outside_workspace_stays_exact_path(self):
+        outside = self.workspace.parent / "elsewhere" / "a.txt"
+        first = self.broker.request(
+            "agent-coder-1", "fs.write",
+            {"project_id": "p-1", "path": str(outside), "bytes": 1},
+            project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        sibling = self.broker.request(
+            "agent-coder-2", "fs.write",
+            {"project_id": "p-1", "path": str(outside.parent / "b.txt"),
+             "bytes": 1}, project_id="p-1")
+        self.assertEqual(sibling.status, "pending")
+        same = self.broker.request(
+            "agent-coder-2", "fs.write",
+            {"project_id": "p-1", "path": str(outside), "bytes": 1},
+            project_id="p-1")
+        self.assertEqual(same.status, "approved")
+
     def test_standing_shell_grant_stays_exact_per_command(self):
         first = self.broker.request(
             "agent-coder-1", "shell.exec",

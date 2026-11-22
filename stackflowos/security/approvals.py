@@ -274,7 +274,13 @@ class ApprovalBroker:
         if capability in ("fs.read", "fs.list", "fs.write"):
             raw = scope.get("path") or scope.get("cwd")
             if raw:
-                pattern["path_prefix"] = self._path_root(raw, project_id)
+                root = self._workspace_root(raw, project_id)
+                if root:
+                    pattern["path_prefix"] = root
+                else:
+                    # Never widen beyond the workspace: approving one outside
+                    # file must not open its whole directory.
+                    pattern["path"] = raw
             return pattern
         if capability == "shell.exec":
             if scope.get("command") is not None:
@@ -287,18 +293,17 @@ class ApprovalBroker:
             return scope
         return pattern
 
-    def _path_root(self, raw: Any, project_id: str | None) -> str:
-        """Project workspace when the path is inside it, else its directory."""
-        path = Path(str(raw))
+    def _workspace_root(self, raw: Any, project_id: str | None) -> str | None:
+        """The project workspace when ``raw`` is inside it, else ``None``."""
         projects_root = getattr(self.policy, "projects_root", None)
-        if project_id and projects_root:
-            workspace = Path(projects_root) / str(project_id) / "workspace"
-            try:
-                path.resolve().relative_to(workspace.resolve())
-                return str(workspace)
-            except (ValueError, OSError):
-                pass
-        return str(path if path.is_dir() else path.parent)
+        if not (project_id and projects_root):
+            return None
+        workspace = Path(projects_root) / str(project_id) / "workspace"
+        try:
+            Path(str(raw)).resolve().relative_to(workspace.resolve())
+        except (ValueError, OSError):
+            return None
+        return str(workspace)
 
     def resolve_pending(self, *, by: str = "policy") -> list[ApprovalRequest]:
         """Approve/deny parked requests that current rules now decide.
