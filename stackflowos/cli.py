@@ -347,9 +347,22 @@ async def seed_demo(app, *, name: str, goal: str) -> dict:
     )
     app.policy.add_rule(
         effect="allow", capability="shell.exec", principal="*",
-        scope={"command_regex": r"^(python3?|pytest|ls|cat|echo|mkdir|cp|mv|true|git)(\s|$)"},
+        scope={"command_regex": r"^(python3?|pytest|ls|cat|echo|mkdir|cp|mv|true|git)(?:\s.*)?$"},
         risk_max="high",
         note="demo: harmless project-local commands", created_by="demo",
+    )
+    # The mock coder runs a syntax check and the program's own selftest as one
+    # chain.  M3's chain guard only lets a pattern match a chained command when
+    # the pattern explicitly names an operator, so grant exactly that two-step
+    # shape instead of widening the plain command rule above.
+    app.policy.add_rule(
+        effect="allow", capability="shell.exec", principal="*",
+        scope={"command_regex": (
+            r"^python3 -m py_compile [^;&|<>`$()\n]+ && "
+            r"python3 [^;&|<>`$()\n]+ --selftest$")},
+        risk_max="high",
+        note="demo: coder's explicit syntax-check + selftest chain",
+        created_by="demo",
     )
     app.policy.add_rule(
         effect="allow", capability="agent.spawn", principal="*",

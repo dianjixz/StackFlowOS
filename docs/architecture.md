@@ -408,7 +408,7 @@ class Rule:
 `scope` 匹配模式：
 * `path_prefix`：规范化绝对路径前缀（`..` 解析后再比）；
 * `path_glob`：规范化后的绝对路径全匹配；`*` 不跨 `/`，`**` 跨目录，`?` 单字符（支持简单 `[...]` 字符类）；
-* `command_regex`：`re.search`；
+* `command_regex`：整条命令 `re.fullmatch`；含未引用的 shell 控制符（`;`、`&&`、`||`、`|`、`&`、`(`、`)`、`<`、`>`、换行、`$(`、反引号）时，pattern 必须显式包含控制符（如 `;`、`\|`）才允许匹配；`^echo` 只匹配 `echo`，要匹配参数须写 `^echo(?:\s.*)?$`；未锚定的旧 pattern 在加载时记 warning（不静默失效）；
 * `domain`：URL host 等于或以 `.domain` 结尾；
 * `url_prefix`：同一 scheme/host/port 下的路径前缀（按 URL 结构比较，不按字符串前缀）；
 * `project_id` / `role` / `agent_id`：精确；

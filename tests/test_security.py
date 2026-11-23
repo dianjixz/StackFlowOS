@@ -263,7 +263,7 @@ class PolicyTests(SecurityTestBase):
 
         regex_rule = self.policy.add_rule(
             effect="allow", capability="shell.exec",
-            scope={"command_regex": r"^ls\b"}, risk_max="high")
+            scope={"command_regex": r"^ls(?:\s.*)?$"}, risk_max="high")
         self.assertEqual(self.policy.evaluate(
             "agent.coder.1", "shell.exec",
             {"command": "ls -la", "cwd": str(self.workspace)},
@@ -350,7 +350,7 @@ class PolicyTests(SecurityTestBase):
     def test_rule_persistence_reload(self):
         rule = self.policy.add_rule(
             effect="deny", capability="shell.exec", principal="agent.*",
-            scope={"command_regex": r"rm\b"}, risk_max="high",
+            scope={"command_regex": r"^rm(?:\s.*)?$"}, risk_max="high",
             note="no rm", expires_at=now_ms() + 60_000)
         reloaded = self._make_policy()
         rules = reloaded.list_rules()

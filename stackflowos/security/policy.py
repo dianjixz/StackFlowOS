@@ -21,6 +21,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
+import shlex
 import threading
 from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
@@ -113,6 +114,7 @@ class PolicyEngine:
         self.projects_root = Path(projects_root)
         self._rules: dict[str, Rule] = {}
         self._lock = threading.RLock()
+        self._warned: set[tuple] = set()
         self.load()
 
     # -- rule management --------------------------------------------------
@@ -143,6 +145,7 @@ class PolicyEngine:
                 raise ValidationError(f"rule {rule.id!r} already exists")
             self._rules[rule.id] = rule
         self.save()
+        self._warn_legacy_command_regex(rule)
         self._emit("rule.created", rule, reason=rule.note)
         return rule
 
@@ -165,6 +168,7 @@ class PolicyEngine:
         with self._lock:
             self._rules[rule_id] = candidate
         self.save()
+        self._warn_legacy_command_regex(candidate)
         self._emit("rule.updated", candidate)
         return candidate
 
@@ -218,11 +222,24 @@ class PolicyEngine:
             command = scope.get("command")
             if command is None:
                 return False
+            pattern = str(expected)
             try:
-                return re.search(str(expected), str(command)) is not None
+                matched = re.fullmatch(pattern, str(command)) is not None
             except re.error:
-                self.log.warning("invalid command_regex in rule: %r", expected)
+                self._warn_once(("invalid", pattern),
+                                "invalid command_regex in rule: %r", expected)
                 return False
+            if not matched:
+                return False
+            ops = _shell_control_ops(str(command))
+            if ops and not _pattern_allows_shell_controls(pattern):
+                self._warn_once(
+                    ("chain", pattern),
+                    "command_regex %r matched a command with shell control "
+                    "operators %s but the pattern does not explicitly allow "
+                    "them; refusing the match", pattern, sorted(ops))
+                return False
+            return True
         if key == "domain":
             url = str(scope.get("url") or "")
             if not url:
@@ -327,6 +344,7 @@ class PolicyEngine:
             except (TypeError, ValueError):
                 continue
             rules[rule.id] = rule
+            self._warn_legacy_command_regex(rule)
         with self._lock:
             self._rules = rules
 
@@ -347,6 +365,34 @@ class PolicyEngine:
                 continue
             result.append(rule)
         return result
+
+    def _warn_legacy_command_regex(self, rule: Rule) -> None:
+        """Warn (never fail, never disable) about unanchored legacy patterns.
+
+        ``command_regex`` now uses :func:`re.fullmatch`, so a pattern without
+        ``^``/``\\A`` ... ``$``/``\\Z`` anchors silently matches less than its
+        author intended.  Deny rules are *not* skipped: skipping them would
+        quietly remove a protection, so the rule stays loaded and the operator
+        gets a warning to rewrite it.
+        """
+        scope = rule.scope if isinstance(rule.scope, dict) else {}
+        pattern = scope.get("command_regex")
+        if not isinstance(pattern, str) or not pattern:
+            return
+        if _pattern_is_fully_anchored(pattern):
+            return
+        self.log.warning(
+            "legacy unanchored command_regex in rule %s: %r; command_regex is "
+            "now matched with re.fullmatch, so rewrite it as '^...$' "
+            "(or '\\A...\\Z')", rule.id, pattern)
+
+    def _warn_once(self, key: tuple, message: str, *args: Any) -> None:
+        """Emit a policy warning once per distinct problem."""
+        with self._lock:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+        self.log.warning(message, *args)
 
     def _default(self, risk: str) -> Decision:
         level = _risk_index(risk)
@@ -393,6 +439,145 @@ class PolicyEngine:
 
 def _risk_index(risk: str) -> int:
     return RISK_ORDER.get(str(risk), RISK_ORDER["high"])
+
+
+# Shell control operators that split or redirect a command line.  ``shlex``
+# emits runs of these as standalone tokens; a quoted ``;`` stays inside a word
+# token, which is exactly the distinction the chain guard needs.
+_SHELL_CONTROL_CHARS = frozenset(";|&<>()")
+# Marker for a command ``shlex`` cannot parse (unbalanced quotes).  It makes
+# the op set non-empty so plain patterns fail closed on malformed commands.
+_UNPARSED = "<unparsed>"
+
+
+def _shell_control_ops(command: str) -> set[str]:
+    """Return the unquoted shell control operators present in ``command``.
+
+    ``;``, ``&&``, ``||``, ``|``, ``&``, ``(``, ``)``, ``<`` and ``>`` are
+    recognised with ``shlex`` in POSIX mode with ``punctuation_chars`` enabled.
+    Unquoted newlines are kept as tokens (whitespace is narrowed to spaces,
+    tabs and CR) and command substitution -- ``$(...)`` and backticks -- is
+    detected by a quote-aware scan because it also runs inside double quotes.
+
+    Quoted control characters are not operators: ``echo "a;b"`` yields an
+    empty set.  A command that cannot be parsed yields a non-empty marker set
+    so callers treat it as chained (fail closed).
+    """
+    text = command if isinstance(command, str) else str(command)
+    ops: set[str] = set()
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        # Keep newline out of the separators so an unquoted newline becomes a
+        # standalone token; a quoted newline stays inside a word token.
+        lexer.whitespace = " \t\r"
+        tokens = list(lexer)
+    except (TypeError, ValueError):
+        ops.add(_UNPARSED)
+        tokens = []
+    for token in tokens:
+        if token and set(token) <= _SHELL_CONTROL_CHARS:
+            ops.add(token)
+    ops.update(_quote_sensitive_ops(text))
+    return ops
+
+
+def _quote_sensitive_ops(command: str) -> set[str]:
+    """Find operators that work inside double quotes: ``$(``, backtick, newline."""
+    ops: set[str] = set()
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch == "`":
+                ops.add("`")
+            elif ch == "$" and i + 1 < n and command[i + 1] == "(":
+                ops.add("$(")
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "`":
+            ops.add("`")
+        elif ch == "$" and i + 1 < n and command[i + 1] == "(":
+            ops.add("$(")
+        elif ch == "\n":
+            ops.add("\n")
+        i += 1
+    return ops
+
+
+_PATTERN_CONTROL_LITERALS = frozenset(";&<>")
+
+
+def _pattern_allows_shell_controls(pattern: str) -> bool:
+    """True when a ``command_regex`` explicitly permits a shell control op.
+
+    Splitting/redirection characters (``;``, ``&``, ``<``, ``>``), command
+    substitution (``$(``), backticks and escaped literals (``\\;``, ``\\|``,
+    ...) count.  A bare ``|`` is regex alternation, *not* an explicit shell
+    pipe, so a literal pipe must be written ``\\|`` (or inside a character
+    class); otherwise an ordinary alternation rule would accidentally opt out
+    of the chain guard.
+    """
+    i, n = 0, len(pattern)
+    in_class = False
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = pattern[i + 1]
+            if nxt in _PATTERN_CONTROL_LITERALS or nxt in ("|", "`"):
+                return True
+            if nxt == "$":
+                # ``\$(`` / ``\$\(`` both describe a literal command
+                # substitution opener.
+                j = i + 2
+                if j < n and pattern[j] == "(":
+                    return True
+                if j + 1 < n and pattern[j] == "\\" and pattern[j + 1] == "(":
+                    return True
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch in _PATTERN_CONTROL_LITERALS or ch == "`":
+            return True
+        elif ch == "|":
+            if in_class:
+                return True
+        elif ch == "$" and i + 1 < n and pattern[i + 1] == "(":
+            return True
+        i += 1
+    return False
+
+
+def _pattern_is_fully_anchored(pattern: str) -> bool:
+    """True when ``pattern`` starts with ``^``/``\\A`` and ends with ``$``/``\\Z``."""
+    if not (pattern.startswith("^") or pattern.startswith(r"\A")):
+        return False
+    if pattern.endswith(r"\Z"):
+        return True
+    if not pattern.endswith("$"):
+        return False
+    # An odd number of trailing backslashes escapes the final '$'.
+    j = len(pattern) - 2
+    slashes = 0
+    while j >= 0 and pattern[j] == "\\":
+        slashes += 1
+        j -= 1
+    return slashes % 2 == 0
 
 
 def _host_of(url: str) -> str:
