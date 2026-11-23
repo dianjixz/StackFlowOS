@@ -55,6 +55,7 @@ _TASK_UPDATE_FIELDS = (
     "assignee",
     "role",
     "error",
+    "deps",
 )
 
 
@@ -72,6 +73,35 @@ def _validate_priority(priority: Any) -> int:
     if priority < 0 or priority > 3:
         raise ValidationError(f"priority must be within 0..3, got {priority}")
     return priority
+
+
+def _validate_dep_ids(value: Any) -> list[str]:
+    """Normalise a ``deps`` value into a list of distinct, non-empty task ids.
+
+    ``None`` means "no dependencies" (the default of :meth:`add_task`). Any
+    other non-list value, non-string entry, blank entry or duplicate is
+    rejected instead of being coerced, so a bad caller cannot silently create
+    a malformed task graph.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError(
+            f"deps must be a list of task ids, got {type(value).__name__}")
+    deps: list[str] = []
+    seen: set[str] = set()
+    for dep in value:
+        if not isinstance(dep, str):
+            raise ValidationError(
+                f"deps entries must be strings, got {type(dep).__name__}: {dep!r}")
+        if not dep.strip():
+            raise ValidationError("deps entries must be non-empty task ids")
+        if dep in seen:
+            raise ValidationError(f"duplicate task dependency: {dep!r}",
+                                  detail={"dep": dep})
+        seen.add(dep)
+        deps.append(dep)
+    return deps
 
 
 def _id_number(ident: str, prefix: str) -> int:
@@ -478,6 +508,67 @@ class ProjectStore:
             )
 
     # -- tasks ------------------------------------------------------------
+    def _validate_task_deps(self, project_id: str, task_id: str,
+                            value: Any) -> list[str]:
+        """Validate a task's dependency ids against the project graph.
+
+        Every dependency must name an existing task in the same project and
+        the resulting edges must not introduce a cycle (self-reference
+        included). The whole set is checked before anything is persisted, so
+        a rejected create/update never leaves a dangling or cyclic edge
+        behind.
+        """
+        deps = _validate_dep_ids(value)
+        for dep in deps:
+            if dep == task_id:
+                raise ValidationError(
+                    "task cannot depend on itself",
+                    detail={"task_id": task_id},
+                )
+            target = self._tasks.get(dep)
+            if target is None:
+                raise ValidationError(
+                    f"unknown task dependency: {dep!r}",
+                    detail={"dep": dep, "project_id": project_id},
+                )
+            if target.project_id != project_id:
+                raise ValidationError(
+                    f"task dependency {dep!r} belongs to another project",
+                    detail={"dep": dep, "project_id": project_id,
+                            "dep_project_id": target.project_id},
+                )
+        if self._has_dep_cycle(project_id, task_id, deps):
+            raise ValidationError(
+                "task dependency cycle detected",
+                detail={"task_id": task_id, "deps": list(deps)},
+            )
+        return deps
+
+    def _has_dep_cycle(self, project_id: str, task_id: str,
+                       deps: list[str]) -> bool:
+        """Return whether ``task_id`` is reachable from ``deps``.
+
+        Only edges inside ``project_id`` are followed; missing or foreign
+        targets are skipped so pre-existing legacy data cannot crash the
+        check. Because the graph is acyclic apart from the task being
+        validated, the new edge set forms a cycle exactly when one of its
+        targets can reach ``task_id``.
+        """
+        pending = list(deps)
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == task_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            node = self._tasks.get(current)
+            if node is None or node.project_id != project_id:
+                continue
+            pending.extend(node.deps)
+        return False
+
     def add_task(
         self,
         project_id: str,
@@ -490,7 +581,11 @@ class ProjectStore:
         created_by: str = "operator",
         milestone_id: str | None = None,
     ) -> Task:
-        """Add a ``todo`` task to a project and emit ``task.created``."""
+        """Add a ``todo`` task to a project and emit ``task.created``.
+
+        Dependencies are validated before the id counter is advanced, so a
+        rejected task does not burn a task id or write ``counters.json``.
+        """
         project = self.get(project_id)
         self._require_mutable(project)
         clean_title = (title or "").strip()
@@ -498,6 +593,11 @@ class ProjectStore:
             raise ValidationError("task title is required")
         _validate_priority(priority)
         milestone = self._find_milestone(project, milestone_id)
+        # The next id is deterministic (single-threaded store): peek at it so
+        # the self-reference check can run before ``_next_id`` persists the
+        # counter bump.
+        next_task_id = f"{_ID_PREFIX['task']}-{self._counters.get('task', 0) + 1}"
+        clean_deps = self._validate_task_deps(project.id, next_task_id, deps)
         now = now_ms()
         task = Task(
             id=self._next_id("task"),
@@ -509,7 +609,7 @@ class ProjectStore:
             role=role,
             assignee=None,
             created_by=created_by or "operator",
-            deps=list(deps or []),
+            deps=clean_deps,
             created_at=now,
             updated_at=now,
             milestone_id=milestone.id if milestone is not None else None,
@@ -601,10 +701,11 @@ class ProjectStore:
 
         The patch is applied to a deep copy and validated there; only a fully
         valid patch replaces the stored task, so a rejected update leaves
-        memory and disk untouched. Status changes also emit the specific
-        lifecycle event (``task.started`` / ``task.review`` /
-        ``task.completed`` / ``task.blocked``) in addition to
-        ``task.updated``.
+        memory and disk untouched. ``deps`` is re-validated like on creation
+        (same project, existing, no self-reference, no cycle). Status changes
+        also emit the specific lifecycle event (``task.started`` /
+        ``task.review`` / ``task.completed`` / ``task.blocked``) in addition
+        to ``task.updated``.
         """
         if not isinstance(patch, dict):
             raise ValidationError("task patch must be a dict")
@@ -634,6 +735,9 @@ class ProjectStore:
         if "error" in patch:
             error = patch.get("error")
             candidate.error = None if error is None else str(error)
+        if "deps" in patch:
+            candidate.deps = self._validate_task_deps(
+                project.id, candidate.id, patch.get("deps"))
         now = now_ms()
         if candidate.status != old_status:
             if candidate.status == TaskStatus.DOING and not candidate.started_at:
