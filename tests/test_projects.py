@@ -132,10 +132,11 @@ class ProjectStoreTestCase(unittest.TestCase):
     def test_update_whitelist_and_validation(self) -> None:
         project = self.store.create("Demo")
         created_at = project.created_at
-        self.store.update("p-1", {"unknown": "ignored", "name": "Renamed"})
-        self.assertEqual(project.name, "Renamed")
-        self.assertFalse(hasattr(project, "unknown"))
-        self.assertGreaterEqual(project.updated_at, created_at)
+        updated = self.store.update(
+            "p-1", {"unknown": "ignored", "name": "Renamed"})
+        self.assertEqual(updated.name, "Renamed")
+        self.assertFalse(hasattr(updated, "unknown"))
+        self.assertGreaterEqual(updated.updated_at, created_at)
         with self.assertRaises(ValidationError):
             self.store.update("p-1", {"status": "bogus"})
         with self.assertRaises(ValidationError):
@@ -289,10 +290,10 @@ class ProjectStoreTestCase(unittest.TestCase):
         self.store.create("Demo")
         task = self.store.add_task("p-1", "build")
         self.assertIsNone(task.started_at)
-        self.store.task_update(task.id, {"status": TaskStatus.DOING})
+        task = self.store.task_update(task.id, {"status": TaskStatus.DOING})
         self.assertIsNotNone(task.started_at)
-        self.store.task_update(task.id, {"status": TaskStatus.REVIEW})
-        self.store.task_update(task.id, {"status": TaskStatus.DONE})
+        task = self.store.task_update(task.id, {"status": TaskStatus.REVIEW})
+        task = self.store.task_update(task.id, {"status": TaskStatus.DONE})
         self.assertIsNotNone(task.finished_at)
         archived_status = self.store.task_update(
             task.id, {"status": TaskStatus.DONE})
@@ -301,7 +302,7 @@ class ProjectStoreTestCase(unittest.TestCase):
     def test_task_update_whitelist(self) -> None:
         self.store.create("Demo")
         task = self.store.add_task("p-1", "build")
-        self.store.task_update(task.id, {
+        task = self.store.task_update(task.id, {
             "title": "build it", "description": "desc", "priority": 3,
             "role": "coder", "assignee": "agent.coder.1", "error": "boom",
             "notes": "ignored",
@@ -360,14 +361,21 @@ class ProjectStoreTestCase(unittest.TestCase):
         self.assertEqual(info["done"], 1)
 
         for task in self.store.task_list(project_id="p-1"):
-            if task.status == TaskStatus.BLOCKED:
-                self.store.task_update(task.id, {"status": TaskStatus.TODO})
-            if task.status == TaskStatus.TODO:
-                self.store.task_update(task.id, {"status": TaskStatus.DOING})
-            if task.status == TaskStatus.DOING:
-                self.store.task_update(task.id, {"status": TaskStatus.REVIEW})
-            if task.status == TaskStatus.REVIEW:
-                self.store.task_update(task.id, {"status": TaskStatus.DONE})
+            # Each update returns the new copy-on-write task; keep using the
+            # fresh object so chained transitions see the latest status.
+            current = task
+            if current.status == TaskStatus.BLOCKED:
+                current = self.store.task_update(
+                    current.id, {"status": TaskStatus.TODO})
+            if current.status == TaskStatus.TODO:
+                current = self.store.task_update(
+                    current.id, {"status": TaskStatus.DOING})
+            if current.status == TaskStatus.DOING:
+                current = self.store.task_update(
+                    current.id, {"status": TaskStatus.REVIEW})
+            if current.status == TaskStatus.REVIEW:
+                current = self.store.task_update(
+                    current.id, {"status": TaskStatus.DONE})
         self.assertEqual(self.store.project_progress("p-1")["progress"], 100)
 
         self.assertEqual(progress_for([]), 0)

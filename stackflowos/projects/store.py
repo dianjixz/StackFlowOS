@@ -15,11 +15,16 @@ Design notes:
 * ``<state>/state/counters.json`` is ``{"project": n, "task": n,
   "milestone": n}`` with the same atomic-write semantics as
   :class:`stackflowos.util.jsonio.Counter`;
+* ``update`` / ``task_update`` are copy-on-write: the patch is applied to a
+  deep copy, validated there, and only then swapped into the store, so a
+  rejected patch never leaves a half-mutated domain that a later ``save``
+  could persist;
 * the store is not thread-safe by design; StackFlowOS runs one asyncio loop.
 """
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -349,20 +354,23 @@ class ProjectStore:
     def update(self, project_id: str, patch: dict) -> Project:
         """Apply a whitelisted project patch and emit ``project.updated``.
 
-        Archiving is not allowed through this method: use :meth:`archive`
-        because it also stamps ``archived_at``.
+        The patch is applied to a deep copy, validated there, and only then
+        swapped into the store, so a rejected patch leaves memory and disk
+        untouched. Archiving is not allowed through this method: use
+        :meth:`archive` because it also stamps ``archived_at``.
         """
         if not isinstance(patch, dict):
             raise ValidationError("project patch must be a dict")
         project = self.get(project_id)
         self._require_mutable(project)
+        candidate = copy.deepcopy(project)
         if "name" in patch:
             name = str(patch.get("name") or "").strip()
             if not name:
                 raise ValidationError("project name is required")
-            project.name = name
+            candidate.name = name
         if "goal" in patch:
-            project.goal = str(patch.get("goal") or "")
+            candidate.goal = str(patch.get("goal") or "")
         if "status" in patch:
             status = str(patch.get("status") or "")
             if status == ProjectStatus.ARCHIVED:
@@ -376,22 +384,36 @@ class ProjectStore:
                     detail={"status": status,
                             "allowed": list(ProjectStatus.UPDATABLE)},
                 )
-            project.status = status
+            candidate.status = status
         if "tags" in patch:
-            project.tags = _as_str_list(patch.get("tags"))
+            candidate.tags = _as_str_list(patch.get("tags"))
         if "color" in patch:
             color = str(patch.get("color") or "").strip()
             if color:
-                project.color = color
+                candidate.color = color
         if "brief" in patch:
-            project.brief = str(patch.get("brief") or "")
+            candidate.brief = str(patch.get("brief") or "")
         if "degraded" in patch:
-            project.degraded = bool(patch.get("degraded"))
-        now = now_ms()
-        project.updated_at = now
-        self.save()
-        self._emit("project.updated", project.to_dict(), project_id=project.id)
-        return project
+            candidate.degraded = bool(patch.get("degraded"))
+        candidate.updated_at = now_ms()
+        self._commit_project(candidate)
+        self._emit("project.updated", candidate.to_dict(),
+                   project_id=candidate.id)
+        return candidate
+
+    def _commit_project(self, candidate: Project) -> None:
+        """Swap ``candidate`` into the store and persist it.
+
+        On a write failure the previous object is restored so memory and disk
+        stay consistent (``save`` writes the whole domain atomically).
+        """
+        previous = self._projects[candidate.id]
+        self._projects[candidate.id] = candidate
+        try:
+            self.save()
+        except Exception:
+            self._projects[candidate.id] = previous
+            raise
 
     def archive(self, project_id: str) -> Project:
         """Move a project to ``archived`` and stamp ``archived_at``."""
@@ -577,60 +599,81 @@ class ProjectStore:
     def task_update(self, task_id: str, patch: dict) -> Task:
         """Apply a whitelisted task patch, validating status transitions.
 
-        Status changes also emit the specific lifecycle event
-        (``task.started`` / ``task.review`` / ``task.completed`` /
-        ``task.blocked``) in addition to ``task.updated``.
+        The patch is applied to a deep copy and validated there; only a fully
+        valid patch replaces the stored task, so a rejected update leaves
+        memory and disk untouched. Status changes also emit the specific
+        lifecycle event (``task.started`` / ``task.review`` /
+        ``task.completed`` / ``task.blocked``) in addition to
+        ``task.updated``.
         """
         if not isinstance(patch, dict):
             raise ValidationError("task patch must be a dict")
         task = self.task_get(task_id)
         project = self._task_project(task)
-        old_status = task.status
+        candidate = copy.deepcopy(task)
+        old_status = candidate.status
         if "title" in patch:
             title = str(patch.get("title") or "").strip()
             if not title:
                 raise ValidationError("task title is required")
-            task.title = title
+            candidate.title = title
         if "description" in patch:
-            task.description = str(patch.get("description") or "")
+            candidate.description = str(patch.get("description") or "")
         if "status" in patch:
             new_status = str(patch.get("status") or "")
-            validate_task_transition(task.status, new_status)
-            task.status = new_status
+            validate_task_transition(candidate.status, new_status)
+            candidate.status = new_status
         if "priority" in patch:
-            task.priority = _validate_priority(patch.get("priority"))
+            candidate.priority = _validate_priority(patch.get("priority"))
         if "assignee" in patch:
             assignee = patch.get("assignee")
-            task.assignee = None if assignee is None else str(assignee)
+            candidate.assignee = None if assignee is None else str(assignee)
         if "role" in patch:
             role = patch.get("role")
-            task.role = None if role is None else str(role)
+            candidate.role = None if role is None else str(role)
         if "error" in patch:
             error = patch.get("error")
-            task.error = None if error is None else str(error)
+            candidate.error = None if error is None else str(error)
         now = now_ms()
-        if task.status != old_status:
-            if task.status == TaskStatus.DOING and not task.started_at:
-                task.started_at = now
-            if task.status == TaskStatus.DONE:
-                task.finished_at = now
+        if candidate.status != old_status:
+            if candidate.status == TaskStatus.DOING and not candidate.started_at:
+                candidate.started_at = now
+            if candidate.status == TaskStatus.DONE:
+                candidate.finished_at = now
             elif old_status == TaskStatus.DONE:
-                task.finished_at = None
-        task.updated_at = now
-        project.updated_at = now
-        self.save()
-        self._emit("task.updated", task.to_dict(), project_id=project.id)
-        if task.status != old_status:
+                candidate.finished_at = None
+        candidate.updated_at = now
+        self._commit_task(candidate, project, now)
+        self._emit("task.updated", candidate.to_dict(),
+                   project_id=project.id)
+        if candidate.status != old_status:
             lifecycle = {
                 TaskStatus.DOING: "task.started",
                 TaskStatus.REVIEW: "task.review",
                 TaskStatus.DONE: "task.completed",
                 TaskStatus.BLOCKED: "task.blocked",
-            }.get(task.status)
+            }.get(candidate.status)
             if lifecycle is not None:
-                self._emit(lifecycle, task.to_dict(), project_id=project.id)
+                self._emit(lifecycle, candidate.to_dict(), project_id=project.id)
         self._emit_progress(project)
-        return task
+        return candidate
+
+    def _commit_task(self, candidate: Task, project: Project, now: int) -> None:
+        """Swap ``candidate`` into the store and persist it.
+
+        ``project.updated_at`` is stamped only after the patch validated, and
+        both objects are rolled back if the write fails.
+        """
+        previous_task = self._tasks[candidate.id]
+        previous_updated_at = project.updated_at
+        self._tasks[candidate.id] = candidate
+        project.updated_at = now
+        try:
+            self.save()
+        except Exception:
+            self._tasks[candidate.id] = previous_task
+            project.updated_at = previous_updated_at
+            raise
 
     def task_artifact(self, task_id: str, artifact: dict) -> Task:
         """Attach an artifact (``type``/``path``/``title`` + ``ts``) to a task."""
