@@ -6,6 +6,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,7 +80,8 @@ class AttachProjectTests(unittest.IsolatedAsyncioTestCase):
         card = await self.app.attach_project("已有项目", str(self.external))
         self.assertEqual(card["workspace_mode"], "attached-ro")
         changed = await self.app.operator_tool(
-            "project.access", {"project_id": card["id"], "allow_writes": True})
+            "project.access", {"project_id": card["id"], "allow_writes": True,
+                               "confirm": True})
         self.assertTrue(changed["ok"], changed)
         self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
                          "attached-rw")
@@ -196,21 +198,65 @@ class AttachProjectTests(unittest.IsolatedAsyncioTestCase):
         server = WebServer(self.app, host="127.0.0.1", port=0)
         await server.start()
         try:
-            def call():
+            def call(body):
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{server.port}/api/projects/attach",
                     method="POST",
-                    data=json.dumps({"name": "HTTP 接入",
-                                     "path": str(self.external)}).encode())
+                    data=json.dumps(body).encode())
                 request.add_header("Content-Type", "application/json")
                 request.add_header("X-SFO-Request", "1")
                 request.add_header("Authorization", f"Bearer {server.launch_token}")
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    return response.status, json.loads(response.read().decode())
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return response.status, json.loads(response.read().decode())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode())
 
-            status, payload = await asyncio.to_thread(call)
+            # The API also refuses an attach without the echoed path.
+            status, payload = await asyncio.to_thread(
+                call, {"name": "HTTP 接入", "path": str(self.external)})
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(self.app.projects.list(), [])
+
+            status, payload = await asyncio.to_thread(call, {
+                "name": "HTTP 接入", "path": str(self.external),
+                "confirm": str(self.external)})
             self.assertEqual(status, 201, payload)
             self.assertTrue(payload["data"]["external"])
+        finally:
+            await server.stop()
+
+    async def test_http_access_requires_confirm(self):
+        card = await self.app.attach_project("HTTP 模式", str(self.external))
+        server = WebServer(self.app, host="127.0.0.1", port=0)
+        await server.start()
+        try:
+            def call(body):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.port}"
+                    f"/api/projects/{card['id']}/access",
+                    method="POST",
+                    data=json.dumps(body).encode())
+                request.add_header("Content-Type", "application/json")
+                request.add_header("X-SFO-Request", "1")
+                request.add_header("Authorization", f"Bearer {server.launch_token}")
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        return response.status, json.loads(response.read().decode())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode())
+
+            status, payload = await asyncio.to_thread(
+                call, {"allow_writes": True})
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
+                             "attached-ro")
+
+            status, payload = await asyncio.to_thread(
+                call, {"allow_writes": True, "confirm": True})
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
+                             "attached-rw")
         finally:
             await server.stop()
 

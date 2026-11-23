@@ -260,7 +260,10 @@ class ChatService:
                                low)) and not re.search(r"(只读|read[- ]?only)", low)
         result = await self.app.operator_tool("project.access", {
             "project_id": target.id, "allow_writes": allow,
-        })
+            # The human said "可写/读写" in this very message: that is the
+            # second confirmation the operator layer asks for.
+            "confirm": allow,
+        }, subject="chat")
         if not result.get("ok"):
             return f"切换失败：{result.get('error') or '未知错误'}"
         return (f"项目 **{target.name}** 已切换为"
@@ -276,7 +279,10 @@ class ChatService:
         result = await self.app.operator_tool("project.attach", {
             "path": path,
             "allow_writes": allow_writes,
-        })
+            # The user named this path in the sentence; echo it as the
+            # explicit confirmation instead of trusting the parser alone.
+            "confirm": path,
+        }, subject="chat")
         if not result.get("ok"):
             return f"接入失败：{result.get('error') or '未知错误'}"
         data = result.get("data") or {}
@@ -381,7 +387,9 @@ class ChatService:
             "decision": decision,
             "mode": "once",
             "note": "由系统助手根据对话指令处理",
-        })
+            # The user quoted this approval id in the sentence.
+            "confirm": request_id,
+        }, subject="chat")
         if result.get("ok"):
             verb = "拒绝" if decision == "deny" else "放行"
             return f"已{verb}审批 `{request_id}`。"
@@ -541,7 +549,10 @@ class ChatService:
             runner = getattr(self.app, "operator_tool", None) or \
                 getattr(self.app, "assistant_tool", None)
             if runner is not None:
-                result = await runner(action["tool"], action.get("args") or {})
+                # No auto-filled confirm here: the model must supply it
+                # explicitly, otherwise the operator layer refuses loudly.
+                result = await runner(action["tool"], action.get("args") or {},
+                                      subject="chat")
                 if result.get("ok"):
                     return self._explain_tool_result(
                         action["tool"], result.get("data") or {})

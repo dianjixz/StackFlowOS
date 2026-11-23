@@ -109,9 +109,9 @@ export const api = {
   getProject: (id) => requestJson(`/api/projects/${enc(id)}`),
   patchProject: (id, patch) => requestJson(`/api/projects/${enc(id)}`, { method: 'PATCH', body: { patch } }),
   archiveProject: (id) => requestJson(`/api/projects/${enc(id)}/archive`, { method: 'POST', body: {} }),
-  setProjectAccess: (id, allowWrites) =>
+  setProjectAccess: (id, allowWrites, confirm = false) =>
     requestJson(`/api/projects/${enc(id)}/access`, {
-      method: 'POST', body: { allow_writes: Boolean(allowWrites) },
+      method: 'POST', body: { allow_writes: Boolean(allowWrites), confirm },
     }),
   deleteProject: (id, { purgeWorkspace = true, confirm = '' } = {}) =>
     requestJson(`/api/projects/${enc(id)}`, {

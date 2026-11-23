@@ -501,6 +501,7 @@ function renderAttachProjectForm() {
           name: name.value.trim(),
           goal: goal.value.trim(),
           allow_writes: allow.checked,
+          confirm: dir,
         });
         toast(card.existing ? `目录已在项目「${card.name}」中` : `目录已接入项目「${card.name}」`, 'success');
         await loadState({ quiet: true });
@@ -617,7 +618,7 @@ function renderProjectDetail(project) {
       if (!window.confirm(message)) return;
       withBusy(accessBtn, async () => {
         try {
-          await api.setProjectAccess(project.id, !writable);
+          await api.setProjectAccess(project.id, !writable, true);
           toast(writable ? '已改为只读' : '已允许写入', 'success');
           await loadState({ quiet: true });
           if (current) renderSheet();

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -46,20 +47,104 @@ class OperatorTests(unittest.IsolatedAsyncioTestCase):
             reason="operator test", preview="outside",
             project_id=project_id, ttl_s=300)
 
+    def _external_dir(self) -> Path:
+        holder = tempfile.TemporaryDirectory(dir=str(REPO / ".stackflowos" / "tmp"))
+        self.addCleanup(holder.cleanup)
+        external = Path(holder.name)
+        (external / "README.md").write_text("# external", "utf-8")
+        return external
+
     async def test_approval_deny_and_allow_aliases(self):
         deny_me = self._pending()
         result = await self.app.operator_tool(
-            "approval.deny", {"request_id": deny_me.id, "note": "no"})
+            "approval.deny", {"request_id": deny_me.id, "confirm": deny_me.id,
+                              "note": "no"})
         self.assertTrue(result["ok"], result)
         self.assertEqual(self.app.approvals.get(deny_me.id).status, "denied")
 
         allow_me = self._pending()
         result = await self.app.operator_tool(
-            "approval.allow", {"id": allow_me.id, "mode": "session"})
+            "approval.allow", {"id": allow_me.id, "confirm": allow_me.id,
+                               "mode": "session"})
         self.assertTrue(result["ok"], result)
         approved = self.app.approvals.get(allow_me.id)
         self.assertEqual(approved.status, "approved")
         self.assertEqual(approved.mode, "session")
+
+    async def test_project_attach_requires_confirmation(self):
+        external = self._external_dir()
+        missing = await self.app.operator_tool(
+            "project.attach", {"path": str(external)})
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["code"], "BAD_REQUEST")
+        self.assertIn("confirm", missing["error"])
+        self.assertEqual(self.app.projects.list(), [])
+
+        wrong = await self.app.operator_tool(
+            "project.attach", {"path": str(external),
+                               "confirm": str(self.tmp / "elsewhere")})
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["code"], "BAD_REQUEST")
+        self.assertEqual(self.app.projects.list(), [])
+
+        confirmed = await self.app.operator_tool(
+            "project.attach", {"path": str(external), "confirm": str(external)})
+        self.assertTrue(confirmed["ok"], confirmed)
+        self.assertTrue(confirmed["data"]["external"])
+
+    async def test_project_access_write_requires_confirmation(self):
+        external = self._external_dir()
+        card = await self.app.attach_project("确认访问", str(external))
+
+        missing = await self.app.operator_tool(
+            "project.access", {"project_id": card["id"], "allow_writes": True})
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["code"], "BAD_REQUEST")
+        self.assertIn("confirm", missing["error"])
+        self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
+                         "attached-ro")
+
+        confirmed = await self.app.operator_tool(
+            "project.access", {"project_id": card["id"], "allow_writes": True,
+                               "confirm": True})
+        self.assertTrue(confirmed["ok"], confirmed)
+        self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
+                         "attached-rw")
+
+        # Read-only is the safe direction and needs no second confirmation.
+        read_only = await self.app.operator_tool(
+            "project.access", {"project_id": card["id"], "allow_writes": False})
+        self.assertTrue(read_only["ok"], read_only)
+        self.assertEqual(self.app.projects.get(card["id"]).workspace_mode,
+                         "attached-ro")
+
+    async def test_approval_decide_requires_confirmation(self):
+        pending = self._pending()
+        missing = await self.app.operator_tool(
+            "approval.decide", {"request_id": pending.id, "decision": "allow"})
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["code"], "BAD_REQUEST")
+        self.assertIn("confirm", missing["error"])
+        self.assertEqual(self.app.approvals.get(pending.id).status, "pending")
+
+        confirmed = await self.app.operator_tool(
+            "approval.decide", {"request_id": pending.id, "decision": "allow",
+                                "confirm": pending.id})
+        self.assertTrue(confirmed["ok"], confirmed)
+        self.assertEqual(self.app.approvals.get(pending.id).status, "approved")
+
+    async def test_operator_audit_records_subject_without_secrets(self):
+        result = await self.app.operator_tool(
+            "sys.status", {"token": "super-secret-token"}, subject="chat")
+        self.assertTrue(result["ok"], result)
+        actions = [record for record in self.app.eventlog.tail(30)
+                   if record.type == "operator.action"]
+        self.assertTrue(actions)
+        payload = actions[-1].data
+        self.assertEqual(payload["subject"], "chat")
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("super-secret-token", serialized)
+        self.assertIn("***", serialized)
 
     async def test_project_delete_is_direct_and_audited(self):
         card = await self.app.create_project("操作员删除", "operator delete",
@@ -162,11 +247,21 @@ class OperatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_llm_can_call_operator_tool(self):
         pending = self._pending()
         self.app.chat.provider = ScriptedProvider(
-            '{"tool":"approval.deny","args":{"request_id":"%s"}}' % pending.id)
+            '{"tool":"approval.deny","args":{"request_id":"%s","confirm":"%s"}}'
+            % (pending.id, pending.id))
         await self.app.chat.send_user("执行一下")
         reply = await self._wait_reply()
         self.assertIn("已处理", reply)
         self.assertEqual(self.app.approvals.get(pending.id).status, "denied")
+
+    async def test_chat_llm_missing_confirm_is_refused(self):
+        pending = self._pending()
+        self.app.chat.provider = ScriptedProvider(
+            '{"tool":"approval.deny","args":{"request_id":"%s"}}' % pending.id)
+        await self.app.chat.send_user("直接拒绝")
+        reply = await self._wait_reply()
+        self.assertIn("confirm", reply)
+        self.assertEqual(self.app.approvals.get(pending.id).status, "pending")
 
     async def _wait_reply(self, timeout: float = 15.0) -> str:
         deadline = time.monotonic() + timeout

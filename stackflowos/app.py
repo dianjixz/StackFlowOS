@@ -1934,13 +1934,15 @@ class App:
         }, source="operator")
         return {"config": cfg.public_dict(), "restart_required": restart_required}
 
-    async def operator_tool(self, tool: str, args: dict) -> dict:
+    async def operator_tool(self, tool: str, args: dict, *,
+                            subject: str = "human:operator") -> dict:
         """Run one assistant/operator tool directly (audited, no approval queue)."""
-        return await self.operator.run(tool, args)
+        return await self.operator.run(tool, args, subject=subject)
 
-    async def assistant_tool(self, tool: str, args: dict) -> dict:
+    async def assistant_tool(self, tool: str, args: dict, *,
+                             subject: str = "human:operator") -> dict:
         """Compatibility alias for the operator tool entry point."""
-        return await self.operator_tool(tool, args)
+        return await self.operator_tool(tool, args, subject=subject)
 
     # ------------------------------------------------------------------
     # projections for the UI

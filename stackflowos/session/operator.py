@@ -44,13 +44,15 @@ OPERATOR_TOOLS: dict[str, OperatorTool] = {
         {"name": "string", "goal": "string"}),
     "project.attach": OperatorTool(
         "project.attach", "project.attach",
-        "接入已存在的本地目录作为项目（默认只读，不复制/删除该目录）",
+        "接入已存在的本地目录作为项目（默认只读，不复制/删除该目录；"
+        "confirm 必须是目录路径或项目名，由用户提供）",
         {"name": "string?", "path": "string", "goal": "string?",
-         "allow_writes": "boolean?"}),
+         "allow_writes": "boolean?", "confirm": "string"}),
     "project.access": OperatorTool(
         "project.access", "project.attach",
-        "切换接入目录的读写模式（只读/可写）",
-        {"project_id": "string", "allow_writes": "boolean"}),
+        "切换接入目录的读写模式（只读/可写；切可写时 confirm=true）",
+        {"project_id": "string", "allow_writes": "boolean",
+         "confirm": "boolean?"}),
     "project.update": OperatorTool(
         "project.update", "project.update", "更新项目字段",
         {"project_id": "string", "patch": "object"}),
@@ -105,9 +107,11 @@ OPERATOR_TOOLS: dict[str, OperatorTool] = {
         {"status": "string?", "project_id": "string?"}),
     "approval.decide": OperatorTool(
         "approval.decide", "approval.decide",
-        "放行/拒绝审批（也接受 approval.allow / approval.deny）",
+        "放行/拒绝审批（也接受 approval.allow / approval.deny；"
+        "confirm 必须是 request_id，由用户提供）",
         {"request_id": "string", "decision": "allow|deny",
-         "mode": "once|session|always?", "note": "string?"}),
+         "mode": "once|session|always?", "note": "string?",
+         "confirm": "string"}),
     "rule.list": OperatorTool(
         "rule.list", "data.read", "列出放行规则", {}),
     "rule.create": OperatorTool(
@@ -174,8 +178,12 @@ def catalog_text() -> str:
             continue
         args = ", ".join(k for k in spec.args) or "无"
         lines.append(f"- {name}({args})：{spec.description}")
-    lines.append("- approval.decide(request_id, decision=allow|deny, mode?, note?)"
+    lines.append("- approval.decide(request_id, decision=allow|deny, mode?, note?,"
+                 " confirm=request_id)"
                  "：放行/拒绝审批；也接受 approval.allow / approval.deny")
+    lines.append("")
+    lines.append("高危操作必须带 confirm，且 confirm 必须来自用户明确给出的"
+                 "路径/项目名/审批 id；缺失时工具会拒绝，不要自行猜测或补全。")
     lines.append("")
     lines.append("你是操作员代理：直接调用工具完成任务，不要请求审批、不要输出多个 JSON。")
     return "\n".join(lines)
@@ -216,12 +224,28 @@ def _decision(args: dict) -> str:
     return ""
 
 
+_DECISION_CONFIRM_WORDS: dict[str, set[str]] = {
+    "allow": {"allow", "approve", "approved", "accept", "yes", "允许", "放行"},
+    "deny": {"deny", "denied", "reject", "rejected", "no", "拒绝"},
+}
+
+
+def _approval_confirm_ok(confirm: str, request_id: str, decision: str) -> bool:
+    """The human must echo the request id (or state the decision) explicitly."""
+    if not confirm:
+        return False
+    if request_id and confirm.lower() == request_id.lower():
+        return True
+    return confirm.lower() in _DECISION_CONFIRM_WORDS.get(decision, set())
+
+
 class OperatorTools:
     def __init__(self, app: Any) -> None:
         self.app = app
         self.log = get_logger("operator")
 
-    async def run(self, tool: str, args: dict | None = None) -> dict:
+    async def run(self, tool: str, args: dict | None = None, *,
+                  subject: str = "human:operator") -> dict:
         name = str(tool or "").strip()
         args = dict(args) if isinstance(args, dict) else {}
         canonical = ALIASES.get(name, name)
@@ -234,7 +258,7 @@ class OperatorTools:
         spec = OPERATOR_TOOLS.get(canonical)
         if spec is None:
             supported = sorted(OPERATOR_TOOLS) + sorted(ALIASES)
-            self._audit(name, None, args, ok=False,
+            self._audit(name, None, args, ok=False, subject=subject,
                         error=f"unknown tool: {name}")
             return {
                 "ok": False,
@@ -248,29 +272,30 @@ class OperatorTools:
         try:
             data = await handler(args)
         except SfoError as exc:
-            self._audit(canonical, spec, args, ok=False,
+            self._audit(canonical, spec, args, ok=False, subject=subject,
                         error=f"{exc.code}: {exc.message}")
             return {"ok": False, "code": exc.code,
                     "error": f"{exc.code}: {exc.message}",
                     "detail": exc.detail}
         except Exception as exc:  # noqa: BLE001 - the chat must not die
             self.log.exception("operator tool %s failed", canonical)
-            self._audit(canonical, spec, args, ok=False,
+            self._audit(canonical, spec, args, ok=False, subject=subject,
                         error=f"{type(exc).__name__}: {exc}")
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if not isinstance(data, dict):
             data = {"value": data}
-        self._audit(canonical, spec, args, ok=True, data=data)
+        self._audit(canonical, spec, args, ok=True, subject=subject, data=data)
         return {"ok": True, "tool": canonical, "data": data}
 
     # -- audit -----------------------------------------------------------
     def _audit(self, requested: str, spec: OperatorTool | None, args: dict, *,
-               ok: bool, data: dict | None = None,
+               ok: bool, subject: str, data: dict | None = None,
                error: str | None = None) -> None:
         try:
             payload = {
                 "tool": requested,
                 "capability": spec.capability if spec else None,
+                "subject": subject,
                 "args": _redact_args(args),
                 "ok": bool(ok),
             }
@@ -317,8 +342,17 @@ class OperatorTools:
                                              created_by="agent-assistant")
 
     async def _project_attach(self, args: dict) -> dict:
+        path = str(args.get("path") or "").strip()
+        name = str(args.get("name") or "").strip()
+        confirm = str(args.get("confirm") or "").strip()
+        # Attaching widens the system's reach to an arbitrary host directory;
+        # the human must echo the path (or the project name) in the same call.
+        if not confirm or confirm not in (path, name):
+            raise BadRequest(
+                "project.attach requires confirm=<path>",
+                detail={"path": path or None, "name": name or None})
         return await self.app.attach_project(
-            str(args.get("name") or ""), str(args.get("path") or ""),
+            name, path,
             goal=str(args.get("goal") or ""),
             allow_writes=bool(args.get("allow_writes", False)),
             created_by="agent-assistant")
@@ -333,6 +367,12 @@ class OperatorTools:
 
     async def _project_access(self, args: dict) -> dict:
         allow = bool(args.get("allow_writes", False))
+        if allow and args.get("confirm") is not True:
+            # Read-only is safe; enabling writes on an attached host directory
+            # needs a second, explicit confirmation in the same call.
+            raise BadRequest(
+                "project.access requires confirm=true to enable writes",
+                detail={"project_id": str(args.get("project_id") or "")})
         return await self.app.set_project_access(
             str(args.get("project_id") or ""), allow_writes=allow,
             by="agent-assistant")
@@ -495,6 +535,11 @@ class OperatorTools:
             raise BadRequest("approval.decide requires request_id")
         if not decision:
             raise BadRequest("approval.decide requires decision=allow|deny")
+        confirm = str(args.get("confirm") or "").strip()
+        if not _approval_confirm_ok(confirm, request_id, decision):
+            raise BadRequest(
+                "approval.decide requires confirm=<request_id>",
+                detail={"request_id": request_id})
         mode = str(args.get("mode") or "once")
         if mode not in ("once", "session", "always"):
             mode = "once"

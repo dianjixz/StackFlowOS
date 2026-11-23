@@ -22,6 +22,13 @@ def _ok(data: Any, status: int = 200) -> tuple[int, dict]:
     return status, {"ok": True, "data": data}
 
 
+def _as_bool(value: Any) -> bool:
+    """JSON `true`/`false`, plus the string spellings the UI may send."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class WebAPI:
     def __init__(self, app) -> None:
         self.app = app
@@ -173,10 +180,18 @@ class WebAPI:
         path = str(body.get("path") or "").strip()
         if not path:
             raise BadRequest("path required")
+        name = str(body.get("name") or "").strip()
+        confirm = str(body.get("confirm") or "").strip()
+        # Clicking "attach" is the user's confirmation, but the API still
+        # requires the echoed path/name so a script cannot attach silently.
+        if not confirm or confirm not in (path, name):
+            raise BadRequest(
+                "project.attach requires confirm=<path or name>",
+                detail={"path": path, "name": name or None})
         card = await self.app.attach_project(
-            str(body.get("name") or ""), path,
+            name, path,
             goal=str(body.get("goal") or ""),
-            allow_writes=bool(body.get("allow_writes", False)),
+            allow_writes=_as_bool(body.get("allow_writes", False)),
             created_by="human:operator")
         return _ok(card, 201 if card.get("attached_now") else 200)
 
@@ -194,9 +209,14 @@ class WebAPI:
         return _ok(self.app.project_card(project_id))
 
     async def project_access(self, match, query, body):
-        allow = body.get("allow_writes", False)
+        allow = _as_bool(body.get("allow_writes", False))
+        confirm = body.get("confirm")
+        if allow and not (confirm is True or
+                          (isinstance(confirm, str) and
+                           confirm.strip().lower() == "true")):
+            raise BadRequest("project.access requires confirm=true to enable writes")
         return _ok(await self.app.set_project_access(
-            match.group(1), allow_writes=bool(allow), by="human:operator"))
+            match.group(1), allow_writes=allow, by="human:operator"))
 
     async def project_archive(self, match, query, body):
         return _ok(await self.app.archive_project(match.group(1),
