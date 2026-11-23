@@ -9,7 +9,8 @@ The server binds loopback by default and is an operator console for one person
 on one machine.  Every request passes :class:`stackflowos.web.auth.WebAuth`
 before routing: a per-process launch token is exchanged for an ``HttpOnly``
 cookie, Host/Origin are checked (DNS rebinding, CSRF) and all responses carry
-the console's security headers.  Only CSS/JS/images/favicon are anonymous.
+the console's security headers.  Only CSS/JS/images/favicon and the data-free
+``/healthz`` liveness probe are anonymous.
 """
 
 from __future__ import annotations
@@ -197,6 +198,9 @@ class WebServer:
                     "error": {"code": decision.code, "message": decision.message},
                 })
                 return
+            if path == "/healthz":
+                await self._serve_liveness(writer, method)
+                return
             if path == "/api/events/stream":
                 await self._serve_sse(writer, query)
                 return
@@ -319,7 +323,8 @@ class WebServer:
                 return None
         return method.upper(), target, headers, body
 
-    async def _send_json(self, writer: asyncio.StreamWriter, status: int, payload: Any) -> None:
+    async def _send_json(self, writer: asyncio.StreamWriter, status: int, payload: Any,
+                         *, include_body: bool = True) -> None:
         body = dumps(payload).encode("utf-8")
         header = (
             f"HTTP/1.1 {status} {_reason(status)}\r\n"
@@ -329,8 +334,36 @@ class WebServer:
             + "Connection: close\r\n"
             "\r\n"
         ).encode("latin-1")
-        writer.write(header + body)
+        writer.write(header + (body if include_body else b""))
         await writer.drain()
+
+    async def _serve_liveness(self, writer: asyncio.StreamWriter, method: str) -> None:
+        """Answer the anonymous ``/healthz`` liveness probe.
+
+        The process supervisor cannot know the per-process launch token, so
+        this exact path is exempt from session auth (see
+        ``web.auth.ANONYMOUS_PATHS``).  It must therefore carry no project
+        data: the payload is only ``status``/``transport``.  ``transport`` is
+        what distinguishes "HTTP thread alive" from "pynng IPC alive"; a down
+        transport answers 503 so ``curl --fail`` and the health timer notice.
+        ``HEAD`` returns the same headers without a body.
+        """
+        if method not in ("GET", "HEAD"):
+            await self._send_json(writer, 405, {"ok": False, "error": {
+                "code": "METHOD_NOT_ALLOWED", "message": "method not allowed"}})
+            return
+        try:
+            transport = str(self.app.health().get("transport") or "unknown")
+        except Exception:
+            self.log.exception("liveness probe failed")
+            transport = "unknown"
+        ok = transport == "ok"
+        payload = {"ok": ok, "data": {
+            "status": "ok" if ok else "degraded",
+            "transport": transport,
+        }}
+        await self._send_json(writer, 200 if ok else 503, payload,
+                              include_body=(method == "GET"))
 
     async def _send_redirect(self, writer: asyncio.StreamWriter, location: str,
                              cookie: str) -> None:

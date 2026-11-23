@@ -14,7 +14,10 @@ Design notes:
 * ``Authorization: Bearer <launch_token>`` is the test/CLI path; it does not
   depend on cookies.
 * Anonymous static assets (CSS/JS/images/favicon) still pass Host/Origin
-  admission, but carry no data.
+  admission, but carry no data.  The same holds for the exact ``/healthz``
+  liveness probe: a process supervisor (systemd ``ExecStartPost``, health
+  timer) cannot know the per-process token, so that one path answers without
+  a session while still returning no project data.
 """
 
 from __future__ import annotations
@@ -44,6 +47,14 @@ PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=()"
 #: project data; every other path (including the app shell and ``/api/*``) is
 #: authenticated.
 ANONYMOUS_PREFIXES = ("/css/", "/js/", "/img/")
+
+#: Exact paths that answer without a session.  ``/healthz`` is the liveness
+#: probe used by the process supervisor: systemd cannot know the per-process
+#: launch token, and probing with a persisted token would make startup depend
+#: on that secret.  The handler returns only ``status``/``transport`` (never
+#: project data) and still passes Host/Origin admission; every ``/api/*`` path
+#: stays authenticated.
+ANONYMOUS_PATHS = frozenset({"/healthz"})
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 _LOOPBACK_OR_WILDCARD_BIND = {
@@ -241,6 +252,8 @@ class WebAuth:
         return bool(cookie) and self.verify_cookie(cookie, host)
 
     def requires_auth(self, path: str) -> bool:
+        if path in ANONYMOUS_PATHS:
+            return False
         if path in ("/", "", "/index.html"):
             return True
         if path == "/favicon.ico":

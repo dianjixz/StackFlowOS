@@ -16,6 +16,7 @@ browser would send.  They pin the security contract from the fix plan:
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -203,6 +204,62 @@ class WebSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body)
         self.assertIn("no-store", headers.get("cache-control", ""))
+
+    # -- anonymous liveness probe (/healthz) ----------------------------
+    async def test_liveness_probe_is_anonymous_and_data_free(self):
+        status, headers, body = await raw_request(self.port, "GET", "/healthz")
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"], {"status": "ok", "transport": "ok"})
+        self.assertIn("no-store", headers.get("cache-control", ""))
+        self.assertEqual(headers.get(CSP_HEADER), CONTENT_SECURITY_POLICY)
+
+    async def test_liveness_probe_head_returns_headers_only(self):
+        status, headers, body = await raw_request(self.port, "HEAD", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertGreater(int(headers["content-length"]), 0)
+
+    async def test_liveness_probe_reports_degraded_with_503(self):
+        def degraded():
+            return {"status": "degraded", "transport": "down", "units": {}}
+
+        self.app.health = degraded
+        status, _, body = await raw_request(self.port, "GET", "/healthz")
+        self.assertEqual(status, 503, body)
+        self.assertEqual(json.loads(body)["data"]["transport"], "down")
+
+    async def test_liveness_probe_rejects_writes(self):
+        status, _, body = await raw_request(
+            self.port, "POST", "/healthz",
+            headers={"Content-Type": "application/json", "X-SFO-Request": "1"},
+            body=b"{}")
+        self.assertEqual(status, 405, body)
+
+    async def test_liveness_probe_still_checks_host(self):
+        status, _, body = await raw_request(
+            self.port, "GET", "/healthz", host="evil.example:17800")
+        self.assertEqual(status, 403, body)
+        self.assertIn(b"FORBIDDEN", body)
+
+    async def test_liveness_probe_does_not_accept_launch_token_query(self):
+        status, _, _ = await raw_request(
+            self.port, "GET", f"/healthz?token={self.token}")
+        self.assertEqual(status, 401)
+
+    async def test_api_health_stays_authenticated(self):
+        status, _, body = await raw_request(self.port, "GET", "/api/health")
+        self.assertEqual(status, 401, body)
+        self.assertIn(b"UNAUTHORIZED", body)
+
+    def test_requires_auth_contract(self):
+        auth = WebAuth(host="127.0.0.1", port=17800)
+        self.assertFalse(auth.requires_auth("/healthz"))
+        self.assertFalse(auth.requires_auth("/css/os.css"))
+        self.assertTrue(auth.requires_auth("/api/health"))
+        self.assertTrue(auth.requires_auth("/api/state"))
+        self.assertTrue(auth.requires_auth("/"))
 
     # -- host / origin / CSRF -------------------------------------------
     async def test_rejects_bad_host(self):
