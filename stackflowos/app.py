@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import os
 import platform
 import shutil
@@ -71,7 +72,27 @@ PRINCIPAL_ACTIONS = frozenset({
     "unit.addresses", "unit.register", "unit.heartbeat", "unit.release",
     "lease.acquire", "lease.renew", "lease.release", "lease.list",
     "approval.status", "approval.use",
+    # ``event.append`` binds the audit provenance to the authenticated unit
+    # itself (X2): a caller-supplied ``source`` is never persisted.
+    "event.append",
 })
+
+#: Event types a remote RPC caller may append (X2, plan §5.2.7).  Workers and
+#: agents report lifecycle/tool telemetry through ``event.append``; audit and
+#: system types (``approval.*``, ``rule.*``, ``project.*``, ``operator.*``,
+#: ``sys.*``) are hub-only and must be produced by the authenticated component
+#: that performed the action.  An allowlist is used rather than a denylist so
+#: an unknown/new type cannot silently become forgeable.
+ALLOWED_RPC_EVENT_TYPES = frozenset({
+    "agent.step", "agent.working", "agent.waiting", "agent.failed",
+    "agent.finished", "agent.terminated", "agent.registered",
+    "task.review", "task.blocked",
+    "tool.invoked", "tool.result", "tool.failed", "tool.denied",
+    "unit.paused",
+})
+
+#: Cap for an externally appended event's ``data`` (JSON encoded, UTF-8).
+RPC_EVENT_DATA_MAX_BYTES = 64 * 1024
 
 
 def now_ms() -> int:
@@ -154,7 +175,11 @@ class App:
         self.transport = HubTransport(sys_addresses=self.sys_addresses,
                                       timeout=cfg.transport.rpc_timeout_s,
                                       logger=get_logger("transport"))
-        self.transport.on_event(self._on_unit_event)
+        # X2: the hub must never turn an unauthenticated PUB frame into an
+        # audit record.  Workers append events through the authenticated
+        # ``event.append`` RPC instead, so no callback is registered here.
+        # The subscriber socket may stay up for future peer fan-out, but a
+        # forged PUB frame now reaches no consumer at all.
 
         self.registry = UnitRegistry(self.ctx, self.eventlog,
                                      offline_after_s=cfg.agents.offline_after_s,
@@ -814,6 +839,11 @@ class App:
             self._authorize(principal, action)
             data = self._bind_external(principal, action, data)
             data = self._authorize_scope(principal, action, data)
+            if action == "event.append":
+                # X2: audit event types and payload size are hub policy, not
+                # caller input.  In-process calls (external=False) keep the
+                # trusted operator path.
+                data = self._validate_event_append(data)
         if action in PRINCIPAL_ACTIONS:
             return await handler(data, src, principal)
         return await handler(data, src)
@@ -1357,16 +1387,38 @@ class App:
     # ------------------------------------------------------------------
     # events / memory / chat
     # ------------------------------------------------------------------
-    def _on_unit_event(self, record) -> None:
+    def _validate_event_append(self, data: dict) -> dict:
+        """Apply the X2 event-trust policy to one external ``event.append``.
+
+        Identity/project/source have already been bound by M5; this layer
+        decides *which* types external callers may report and how large the
+        payload may be.  Audit/system events stay hub-only.
+        """
+        event_type = data.get("type")
+        if not isinstance(event_type, str) or not event_type.strip():
+            raise BadRequest("event type required")
+        event_type = event_type.strip()
+        if event_type not in ALLOWED_RPC_EVENT_TYPES:
+            raise Denied(
+                f"event type {event_type!r} may not be appended over rpc")
+        payload = data.get("data")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise BadRequest("event data must be an object")
         try:
-            stored = self.eventlog.append_record(record)
-        except Exception:
-            self.log.exception("failed to persist remote event")
-            return
-        try:
-            self.ctx.emit(stored.type, stored.to_dict())
-        except Exception:
-            self.log.exception("event dispatch failed for %s", stored.type)
+            encoded = json.dumps(payload, ensure_ascii=False, default=str,
+                                 separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise BadRequest(
+                f"event data is not JSON-serializable: {exc}") from exc
+        if len(encoded) > RPC_EVENT_DATA_MAX_BYTES:
+            raise BadRequest(
+                f"event data too large: {len(encoded)} bytes "
+                f"(limit {RPC_EVENT_DATA_MAX_BYTES})")
+        data["type"] = event_type
+        data["data"] = payload
+        return data
 
     def _on_unit_offline(self, payload: dict) -> None:
         data = payload.get("data") if isinstance(payload, dict) else {}
@@ -1410,12 +1462,21 @@ class App:
             except Exception:
                 self.log.debug("could not reset task for dead agent", exc_info=True)
 
-    async def _event_append(self, data, src):
+    async def _event_append(self, data, src, principal: Principal | None = None):
+        # External units may not choose their provenance: the hub stamps
+        # ``agent:<agent_id>``/``unit:<work_id>`` and the credential's project.
+        # In-process callers (principal is None) keep the trusted operator path.
+        source = str(data.get("source") or src)
+        project_id = data.get("project_id")
+        if principal is not None and principal.is_unit:
+            source = (f"agent:{principal.agent_id}"
+                      if principal.agent_id else f"unit:{principal.id}")
+            project_id = principal.project_id
         record = self.eventlog.append(
             str(data.get("type") or ""),
             dict(data.get("data") or {}),
-            source=str(data.get("source") or src),
-            project_id=data.get("project_id"),
+            source=source,
+            project_id=project_id,
         )
         return {"seq": record.seq, "id": record.id}
 

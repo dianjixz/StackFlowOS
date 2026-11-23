@@ -26,7 +26,6 @@ from ..agents import Agent, AgentRunner, MockBrain, ToolExecutor
 from ..agents.api import SysAPI
 from ..ai import make_provider
 from ..config import Config
-from ..protocol import EventRecord
 from ..transport import RpcClient, UnitAddresses, UnitTransport
 from ..util.logging import get_logger, setup_logging
 
@@ -111,8 +110,15 @@ async def run_worker(args: argparse.Namespace) -> int:
         runner_ref = state.get("runner")
         if runner_ref is not None:
             runner_ref.pause()
-        unit.publish(EventRecord(seq=0, type="unit.paused", source=work_id,
-                                 ts=int(time.time() * 1000), data={"reason": (data or {}).get("reason", "")}))
+        # X2: audit events go through the authenticated ``event.append`` RPC
+        # (the hub never trusts an unauthenticated PUB frame from us).
+        try:
+            await sys_api.call("event.append", {
+                "type": "unit.paused",
+                "data": {"reason": (data or {}).get("reason", "")},
+            })
+        except Exception:
+            log.debug("unit.paused event append failed", exc_info=True)
         return {"paused": True}
 
     async def on_resume(data: dict | None = None) -> dict:
@@ -204,10 +210,13 @@ async def run_worker(args: argparse.Namespace) -> int:
         state["agent_id"] = agent.id
         state["task_id"] = agent.task_id
         state["status"] = "idle"
-        unit.publish(EventRecord(seq=0, type="agent.registered", source=work_id,
-                                 ts=int(time.time() * 1000),
-                                 data={"agent_id": agent.id, "role": agent.role},
-                                 project_id=args.project))
+        try:
+            await sys_api.call("event.append", {
+                "type": "agent.registered",
+                "data": {"agent_id": agent.id, "role": agent.role},
+            })
+        except Exception:
+            log.debug("agent.registered event append failed", exc_info=True)
 
         executor = ToolExecutor(sys_api, agent=agent, workspace=workspace_dir,
                                 security_config=cfg.security,
