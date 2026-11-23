@@ -1,12 +1,16 @@
 """Tests for :mod:`stackflowos.transport.address`.
 
-All temporary state lives under ``<repo>/.stackflowos/tmp``; the allocator is
-exercised without starting any sockets except for the TCP probe binds.
+Temporary state lives in a short system temp directory (``SFO_TEST_TMPDIR``,
+default ``<tempdir>/sfo-tests``), never under the checkout: unix socket paths
+must fit in ``sockaddr_un``, so a deep checkout path would make IPC binds fail.
+The allocator is exercised without starting any sockets except for the TCP
+probe binds.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import socket
 import tempfile
@@ -16,9 +20,20 @@ from pathlib import Path
 from stackflowos.errors import Unavailable, ValidationError
 from stackflowos.transport.address import MAX_IPC_PATH_BYTES, AddressAllocator
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TMP_ROOT = REPO_ROOT / ".stackflowos" / "tmp"
+TMP_ROOT = Path(os.environ.get("SFO_TEST_TMPDIR")
+                or Path(tempfile.gettempdir()) / "sfo-tests")
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+\.[0-9]+$")
+
+
+def _ipc_path_too_long(run_dir: Path) -> bool:
+    """Whether even a hashed IPC socket path would exceed the length limit.
+
+    Mirrors :meth:`AddressAllocator._ipc_path`: when ``run_dir`` is deep it
+    builds ``<run_dir>/<stem>-<12-char digest><suffix>`` with a one-char stem.
+    """
+    shortest_name = 1 + 1 + 12 + len(".events.sock")  # x-<digest><suffix>
+    return (len(str(run_dir).encode("utf-8")) + 1 + shortest_name
+            > MAX_IPC_PATH_BYTES)
 
 
 def _bindable(host: str, port: int) -> bool:
@@ -48,7 +63,8 @@ def _port_of(address: str) -> int:
 class AddressAllocatorTests(unittest.TestCase):
     def setUp(self) -> None:
         TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT),
+                                                 prefix="sfo-")
         self.tmp = Path(self._tmp.name)
         self.run_dir = (self.tmp / "run").resolve()
 
@@ -56,7 +72,14 @@ class AddressAllocatorTests(unittest.TestCase):
         self._tmp.cleanup()
 
     # -- helpers ----------------------------------------------------------
+    def skip_if_ipc_path_too_long(self, run_dir: Path) -> None:
+        if _ipc_path_too_long(run_dir):
+            self.skipTest(
+                "checkout path too long for unix sockets: "
+                f"{run_dir}")
+
     def ipc(self, **kwargs) -> AddressAllocator:
+        self.skip_if_ipc_path_too_long(self.run_dir)
         return AddressAllocator(mode="ipc", host="127.0.0.1",
                                 run_dir=self.run_dir, **kwargs)
 
@@ -174,6 +197,7 @@ class AddressAllocatorTests(unittest.TestCase):
             self.assertTrue(rpc_path.name.endswith(".rpc.sock"))
 
     def test_long_ipc_path_is_shortened(self) -> None:
+        self.skip_if_ipc_path_too_long(self.run_dir)
         alloc = AddressAllocator(mode="ipc", host="127.0.0.1",
                                  run_dir=self.run_dir)
         sys = alloc.ensure_sys()

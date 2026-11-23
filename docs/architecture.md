@@ -696,7 +696,10 @@ tests/
   验证：注册/心跳/租约/审批/任务完成/事件落盘/Web API/SSE；
   以及 SIGKILL 一个工人后：offline 检测 → 租约释放 → 失败域重启替代。
 * 当前 `python3 -m unittest discover -s tests -t .` 为 263 个测试。
-* 测试临时目录必须放在 `<repo>/.stackflowos/tmp/`，不写系统临时目录。
+* IPC 测试的临时目录放在浅层系统临时目录（`$TMPDIR/sfo-tests`，可用 `SFO_TEST_TMPDIR`
+  覆盖），不放在仓库内：unix socket 路径受 `sockaddr_un` 上限约束（代码自设
+  `MAX_IPC_PATH_BYTES = 100`）。若检出路径仍使套接字路径超限，测试以明确原因 skip，
+  而不是失败。
 
 ## 13. 非目标（这一版不做）
 

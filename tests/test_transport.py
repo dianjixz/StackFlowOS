@@ -1,13 +1,17 @@
 """Tests for :mod:`stackflowos.transport.nng`.
 
-The suite starts real pynng sockets on IPC sockets and on TCP ports >= 17900,
-always under ``<repo>/.stackflowos/tmp``.  Every test tears its transports down
-so no socket files or background tasks outlive it.
+The suite starts real pynng sockets on IPC sockets and on TCP ports >= 17900.
+IPC temporary state lives in a short system temp directory (``SFO_TEST_TMPDIR``,
+default ``<tempdir>/sfo-tests``), never under the checkout: unix socket paths
+must fit in ``sockaddr_un``, so a deep checkout path would make IPC binds fail.
+Every test tears its transports down so no socket files or background tasks
+outlive it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import tempfile
 import time
@@ -30,9 +34,21 @@ from stackflowos.transport import (
     cleanup_ipc_address,
     is_ipc,
 )
+from stackflowos.transport.address import MAX_IPC_PATH_BYTES
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TMP_ROOT = REPO_ROOT / ".stackflowos" / "tmp"
+TMP_ROOT = Path(os.environ.get("SFO_TEST_TMPDIR")
+                or Path(tempfile.gettempdir()) / "sfo-tests")
+
+
+def _ipc_path_too_long(run_dir: Path) -> bool:
+    """Whether even a hashed IPC socket path would exceed the length limit.
+
+    Mirrors :meth:`AddressAllocator._ipc_path`: when ``run_dir`` is deep it
+    builds ``<run_dir>/<stem>-<12-char digest><suffix>`` with a one-char stem.
+    """
+    shortest_name = 1 + 1 + 12 + len(".events.sock")  # x-<digest><suffix>
+    return (len(str(run_dir).encode("utf-8")) + 1 + shortest_name
+            > MAX_IPC_PATH_BYTES)
 
 
 def _now() -> int:
@@ -42,7 +58,8 @@ def _now() -> int:
 class IpAddressHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT),
+                                                 prefix="sfo-")
         self.tmp = Path(self._tmp.name)
 
     def tearDown(self) -> None:
@@ -70,7 +87,8 @@ class IpAddressHelperTests(unittest.TestCase):
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT))
+        self._tmp = tempfile.TemporaryDirectory(dir=str(TMP_ROOT),
+                                                 prefix="sfo-")
         self.tmp = Path(self._tmp.name)
         self.run_dir = (self.tmp / "run").resolve()
 
@@ -78,9 +96,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self._tmp.cleanup()
 
     # -- helpers ----------------------------------------------------------
+    def skip_if_ipc_path_too_long(self, run_dir: Path) -> None:
+        if _ipc_path_too_long(run_dir):
+            self.skipTest(
+                "checkout path too long for unix sockets: "
+                f"{run_dir}")
+
     def ipc_allocator(self, name: str = "run") -> AddressAllocator:
+        run_dir = (self.tmp / name).resolve()
+        self.skip_if_ipc_path_too_long(run_dir)
         return AddressAllocator(mode="ipc", host="127.0.0.1",
-                                run_dir=(self.tmp / name).resolve())
+                                run_dir=run_dir)
 
     def tcp_allocator(self, name: str = "tcp",
                       pool: tuple[int, int] = (17900, 17960)) -> AddressAllocator:
