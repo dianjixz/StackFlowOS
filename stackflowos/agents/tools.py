@@ -349,6 +349,17 @@ class ToolExecutor:
             return await self._fail(
                 spec, f"{type(exc).__name__}: {exc}", preview=preview)
 
+        if not await self._spend_once_grant(approval):
+            reason = "one-shot approval was already used"
+            await self._emit("tool.denied", {
+                "tool": spec.name,
+                "capability": spec.capability,
+                "request_id": str(approval.get("id") or ""),
+                "reason": reason,
+                "preview": preview,
+            })
+            return ToolResult(ok=False, error=f"DENIED: {reason}", preview=preview)
+
         handler = self._handlers().get(spec.name)
         if handler is None:  # pragma: no cover - registry/handler mismatch
             return await self._fail(spec, f"no executor for tool {spec.name!r}",
@@ -388,10 +399,26 @@ class ToolExecutor:
         })
         return ToolResult(ok=False, error=error, preview=preview)
 
+    async def _spend_once_grant(self, approval: dict) -> bool:
+        """Spend a human one-shot grant *before* acting; fail closed."""
+        if str(approval.get("mode") or "") != "once":
+            return True
+        grant_id = approval.get("grant_id")
+        if not grant_id:
+            return False
+        try:
+            result = await call_ok(self.sys, "approval.use",
+                                   {"grant_id": str(grant_id)})
+        except Exception:  # noqa: BLE001 - cannot prove the grant: refuse
+            self.log.debug("approval.use failed for grant %s", grant_id,
+                           exc_info=True)
+            return False
+        return bool(result.get("ok"))
+
     async def _use_grant(self, approval: dict) -> None:
         grant_id = approval.get("grant_id") if isinstance(approval, dict) else None
         mode = str(approval.get("mode") or "") if isinstance(approval, dict) else ""
-        if not grant_id or mode not in ("once", "grant"):
+        if not grant_id or mode != "grant":
             return
         try:
             await call_ok(self.sys, "approval.use", {"grant_id": str(grant_id)})
