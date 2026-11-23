@@ -11,7 +11,7 @@ from typing import Any
 from stackflowos.agents.brain import Action, AgentView, MockBrain
 from stackflowos.agents.models import Agent
 from stackflowos.agents.runner import AgentRunner
-from stackflowos.agents.tools import ToolExecutor
+from stackflowos.agents.tools import ToolExecutor, ToolResult
 from stackflowos.config import AgentsCfg, SecurityCfg
 from stackflowos.errors import NotFound
 
@@ -164,6 +164,48 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool.result", event_types)
         self.assertIn("agent.finished", event_types)
         self.assertEqual(len(self.sys.actions("task.note")), 1)
+
+    async def test_coder_self_check_failure_blocks_without_artifact(self) -> None:
+        """S4: a failed self-check stops the run; nothing is submitted."""
+
+        class FailingShellExecutor:
+            """Real executor, but the coder's self-check shell always fails."""
+
+            def __init__(self, inner: ToolExecutor) -> None:
+                self.inner = inner
+                self.workspace = inner.workspace
+                self.calls: list[str] = []
+
+            async def run(self, name: str,
+                          args: dict | None = None) -> ToolResult:
+                self.calls.append(name)
+                if name == "shell.exec":
+                    return ToolResult(ok=False,
+                                      error="selftest failed: exit status 1")
+                return await self.inner.run(name, args)
+
+        executor = FailingShellExecutor(self.executor)
+        runner = AgentRunner(
+            self.sys, self.agent, MockBrain("coder", max_steps=8), executor,
+            config=AgentsCfg(max_steps=8), workspace=self.ws)
+        result = await runner.run()
+
+        self.assertEqual(result.status, "blocked", result.summary)
+        self.assertIn("自检失败", result.summary)
+        self.assertEqual(self.sys.task["status"], "blocked")
+        # The source file was written, but never registered or sent to review.
+        self.assertEqual(len(list((self.ws / "src").glob("*.py"))), 1)
+        self.assertEqual(self.sys.actions("task.artifact"), [])
+        statuses = [(data.get("patch") or {}).get("status")
+                    for data in self.sys.actions("task.update")]
+        self.assertNotIn("review", statuses)
+        self.assertNotIn("done", statuses)
+        self.assertIn("shell.exec", executor.calls)
+        self.assertEqual(len(self.sys.finished), 1)
+        self.assertIn("agent.failed", self.sys.event_types())
+        self.assertIn("task.blocked", self.sys.event_types())
+        self.assertNotIn("agent.finished", self.sys.event_types())
+        self.assertEqual(self.agent.status, "failed")
 
     async def test_non_code_task_writes_markdown(self) -> None:
         self.sys.task["title"] = "整理发布说明"

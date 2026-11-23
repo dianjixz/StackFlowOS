@@ -141,6 +141,14 @@ class MockBrain:
         self._artifact_registered = False
         self._compiled = False
         self._missing_artifacts = False
+        # S4: outcome of the last tool the runner executed, fed back through
+        # ``observe``.  The coder uses it to settle its pending self-check
+        # instead of assuming success from the plan position.
+        self._last_tool = ""
+        self._last_ok = False
+        self._last_error = ""
+        self._compile_pending = False
+        self._coder_blocked = ""
 
     # -- entry ------------------------------------------------------------
     async def next_action(self, view: AgentView) -> Action:
@@ -161,6 +169,18 @@ class MockBrain:
         if planner is None:
             return _finish(f"未知角色：{self.role}", "failed")
         return planner(view, step)
+
+    def observe(self, action: Any, result: Any) -> None:
+        """Record the outcome of the action the runner just executed.
+
+        ``AgentRunner`` calls this after every tool call when the brain
+        exposes it.  Only the coder consumes the outcome (to confirm its
+        self-check); other roles keep their purely plan-driven behaviour.
+        """
+        self._last_tool = str(getattr(action, "tool", "") or "")
+        self._last_ok = bool(getattr(result, "ok", False))
+        error = getattr(result, "error", None)
+        self._last_error = str(error or "")
 
     # -- lead -------------------------------------------------------------
     def _lead(self, view: AgentView, step: int) -> Action:
@@ -277,6 +297,13 @@ class MockBrain:
         task, stop = self._require_task(view)
         if stop is not None:
             return stop
+        if self._coder_blocked:
+            # A failed self-check terminates this coder for good: no artifact
+            # registration and no review hand-off.
+            return _finish(self._coder_blocked, "blocked")
+        settled = self._settle_self_check()
+        if settled is not None:
+            return settled
         tid = _task_id(task)
         title = _task_title(task)
         description = str(task.get("description") or "")
@@ -299,13 +326,15 @@ class MockBrain:
             self._artifact_title = f"{title} 实现产物"
             return _call("fs.write", path=path, content=body)
         if not self._compiled:
-            self._compiled = True
             if self._artifact_path.endswith(".py"):
                 quoted = _shell_quote(self._artifact_path)
                 command = (f"python3 -m py_compile {quoted} && "
                            f"python3 {quoted} --selftest")
             else:
                 command = "true"
+            # Stay pending until the runner reports the result through
+            # ``observe``; only a successful run may reach artifact/review.
+            self._compile_pending = True
             return _call("shell.exec", command=command)
         if not self._artifact_registered:
             self._artifact_registered = True
@@ -315,6 +344,27 @@ class MockBrain:
         if _task_status(task) != "review":
             return _call("task.update", task_id=tid, patch={"status": "review"})
         return _finish(f"完成 {tid}：写入 {self._artifact_path} 并做语法自检。")
+
+    def _settle_self_check(self) -> Action | None:
+        """Consume a pending coder self-check; return a stop action if it failed.
+
+        ``_compiled`` is set only after the observed ``shell.exec`` succeeded.
+        A failed (or never executed) self-check blocks the coder before it can
+        register an artifact or move the task to review.
+        """
+        if not self._compile_pending:
+            return None
+        self._compile_pending = False
+        if self._last_tool == "shell.exec" and self._last_ok:
+            self._compiled = True
+            return None
+        if self._last_tool != "shell.exec":
+            reason = "自检命令未执行"
+        else:
+            reason = self._last_error or "自检命令执行失败"
+        summary = f"自检失败：{reason}；产物未提交。"
+        self._coder_blocked = summary
+        return _finish(summary, "blocked")
 
     def _tester(self, view: AgentView, step: int) -> Action:
         task, stop = self._require_task(view)
