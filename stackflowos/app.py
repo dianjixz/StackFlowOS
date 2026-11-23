@@ -2317,14 +2317,16 @@ class App:
 
     def console(self, *, types: list[str] | None = None, project_id: str | None = None,
                 limit: int = 200) -> list[dict]:
-        records = self.eventlog.tail(max(limit * 4, 400))
-        if project_id:
-            records = [r for r in records if r.project_id == project_id]
-        if types:
-            wanted = set(types)
-            records = [r for r in records if r.type in wanted
-                       or any(r.type.startswith(t + ".") for t in wanted)]
-        return [r.to_dict() for r in records[-limit:]]
+        """Return filtered events oldest-first, searching memory *and* files.
+
+        L7: never derive the window from ``tail()`` first — an old project's
+        events may sit outside the newest records.  ``EventLog.query`` applies
+        the filters while scanning backwards, so a matching event is found
+        regardless of how recently it was appended.
+        """
+        records = self.eventlog.query(types=types, project_id=project_id,
+                                      limit=limit)
+        return [r.to_dict() for r in records]
 
 
 def json_dumps_safe(value: Any) -> str:

@@ -24,7 +24,7 @@ import re
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..errors import BadRequest
 from ..protocol import EventRecord, new_id, now_ms
@@ -44,6 +44,14 @@ class EventLog:
 
     #: Event types that are broadcast but never persisted.
     EPHEMERAL_TYPES = {"chat.delta", "stream.chunk"}
+
+    #: Hard upper bound for :meth:`query` (mirrors the web API limit).
+    QUERY_MAX_LIMIT = 1000
+    #: Upper bounds for one filtered query's backward file replay.  When an
+    #: old event is not found within this budget the query returns fewer rows
+    #: (or none) rather than reading unbounded history into memory.
+    query_max_scan_records = 100_000
+    query_max_scan_bytes = 16 * 1024 * 1024
 
     def __init__(self, events_dir: Path, *, logger: logging.Logger | None = None,
                  memory_limit: int = 5000,
@@ -150,6 +158,53 @@ class EventLog:
             return []
         return list(self._memory)[-int(limit):]
 
+    def query(self, *, project_id: str | None = None,
+              types: list[str] | None = None,
+              limit: int = 200) -> list[EventRecord]:
+        """Return up to ``limit`` records matching the filters, oldest first.
+
+        Unlike :meth:`tail`, this searches *all* retained history, not just the
+        newest in-memory window: matching records are collected newest-first
+        from the memory deque, then the event files are scanned backwards
+        (newest file/line first) until enough matches are found.  The result is
+        reversed to oldest-first so callers keep the console's ordering.
+
+        ``types`` matches exact event types or dotted prefixes: ``["rule"]``
+        matches ``rule`` and ``rule.created`` but not ``rulebook``.  The scan is
+        bounded by :attr:`query_max_scan_records` /
+        :attr:`query_max_scan_bytes`; history beyond that is not searched.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise BadRequest("limit must be an integer") from None
+        if limit < 1 or limit > self.QUERY_MAX_LIMIT:
+            raise BadRequest(
+                f"limit must be between 1 and {self.QUERY_MAX_LIMIT}")
+        project = str(project_id) if project_id else None
+        type_match = _type_matcher(types)
+
+        def keep(record: EventRecord) -> bool:
+            if project is not None and record.project_id != project:
+                return False
+            if type_match is not None and not type_match(record.type):
+                return False
+            return True
+
+        with self._lock:
+            memory = list(self._memory)
+        collected: list[EventRecord] = []
+        for record in reversed(memory):
+            if keep(record):
+                collected.append(record)
+                if len(collected) >= limit:
+                    break
+        if len(collected) < limit:
+            floor = memory[0].seq if memory else None
+            self._query_files(collected, keep, limit, memory_floor=floor)
+        collected.reverse()
+        return collected
+
     def subscribe(self) -> asyncio.Queue:
         """Create a live queue receiving future :class:`EventRecord` objects."""
         queue: asyncio.Queue = asyncio.Queue(maxsize=self.subscriber_queue_size)
@@ -217,6 +272,44 @@ class EventLog:
             files.append(self.current_path)
         return files
 
+    def _query_files(self, collected: list[EventRecord],
+                     keep: Callable[[EventRecord], bool],
+                     limit: int, *, memory_floor: int | None) -> None:
+        """Append matches found by scanning rotated files newest-first.
+
+        Records already covered by the in-memory window (``seq >=
+        memory_floor``) are skipped so callers never see duplicates.  The scan
+        stops at ``limit`` matches or when the record/byte budget is spent.
+        """
+        budget = [self.query_max_scan_bytes]
+        scanned = 0
+        for path in reversed(self._files_ascending()):
+            if budget[0] <= 0 or scanned >= self.query_max_scan_records:
+                break
+            for raw in _iter_lines_reversed(path, budget):
+                line = raw.strip()
+                if not line:
+                    continue
+                scanned += 1
+                if scanned > self.query_max_scan_records:
+                    return
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                record = _record_from_dict(obj)
+                if record is None:
+                    continue
+                if memory_floor is not None and record.seq >= memory_floor:
+                    continue
+                if not keep(record):
+                    continue
+                collected.append(record)
+                if len(collected) >= limit:
+                    return
+
     def _load_memory(self) -> None:
         """Warm the in-memory window from the newest files (recent history)."""
         collected: list[EventRecord] = []
@@ -253,6 +346,60 @@ def _record_from_dict(obj: dict) -> EventRecord | None:
         return EventRecord.from_dict(obj)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+#: Chunk size for backwards line reading; bounds memory to chunk + one line.
+_REVERSE_CHUNK_BYTES = 64 * 1024
+
+
+def _iter_lines_reversed(path: Path, byte_budget: list[int]):
+    """Yield raw lines from *path*, newest line first.
+
+    The file is read backwards in fixed-size chunks, so neither the whole file
+    nor all of its lines are materialised.  ``byte_budget`` is a one-element
+    mutable list holding the remaining byte allowance; it is decremented as
+    data is read, and iteration stops when it reaches zero.
+    """
+    if byte_budget[0] <= 0:
+        return
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return
+    with fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        buffered = b""
+        while pos > 0 and byte_budget[0] > 0:
+            read_size = min(_REVERSE_CHUNK_BYTES, pos, byte_budget[0])
+            pos -= read_size
+            fh.seek(pos)
+            chunk = fh.read(read_size)
+            byte_budget[0] -= len(chunk)
+            buffered = chunk + buffered
+            lines = buffered.split(b"\n")
+            # lines[0] may be a partial line unless we reached the file start.
+            buffered = lines[0]
+            for line in reversed(lines[1:]):
+                yield line
+        if pos == 0 and buffered:
+            # A partial first line (budget exhausted mid-file) is not a record.
+            yield buffered
+
+
+def _type_matcher(types: list[str] | None) -> Callable[[str], bool] | None:
+    """Build a predicate for exact event types or dotted prefixes."""
+    if isinstance(types, str):
+        types = [types]
+    wanted = [str(item).strip() for item in (types or []) if str(item).strip()]
+    if not wanted:
+        return None
+
+    def matches(event_type: str) -> bool:
+        return any(event_type == item or event_type.startswith(item + ".")
+                   for item in wanted)
+
+    return matches
 
 
 def _last_seq_in_file(path: Path) -> int:
