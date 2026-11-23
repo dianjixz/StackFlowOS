@@ -33,6 +33,19 @@ from ..util.jsonio import append_jsonl, ensure_dir, iter_jsonl
 _ROTATED_RE = re.compile(r"^events-(\d+)(?:-[^.]*)?\.jsonl$")
 
 
+class SubscriberQueue(asyncio.Queue):
+    """Queue handed out by :meth:`EventLog.subscribe`.
+
+    ``closed`` is ``True`` when the log was already closed at subscribe time.
+    Such a queue is deliberately *not* registered with the log and will never
+    receive records, so callers can end their stream instead of waiting for an
+    event that cannot arrive.  Queues created while the log is open leave the
+    flag ``False``.
+    """
+
+    closed: bool = False
+
+
 class EventLog:
     """Durable, sequenced event store with live broadcast.
 
@@ -206,26 +219,44 @@ class EventLog:
         return collected
 
     def subscribe(self) -> asyncio.Queue:
-        """Create a live queue receiving future :class:`EventRecord` objects."""
-        queue: asyncio.Queue = asyncio.Queue(maxsize=self.subscriber_queue_size)
-        self._subscribers.append(queue)
+        """Create a live queue receiving future :class:`EventRecord` objects.
+
+        Safe to call from any thread.  When the log has been closed the queue
+        is returned with ``closed`` set and is not registered: callers can
+        detect that and stop consuming instead of waiting forever.
+        """
+        queue: SubscriberQueue = SubscriberQueue(
+            maxsize=self.subscriber_queue_size)
+        with self._lock:
+            if self._closed:
+                queue.closed = True
+                return queue
+            self._subscribers.append(queue)
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         """Remove a queue created by :meth:`subscribe` (idempotent)."""
-        try:
-            self._subscribers.remove(queue)
-        except ValueError:
-            return
+        with self._lock:
+            try:
+                self._subscribers.remove(queue)
+            except ValueError:
+                return
 
     async def close(self) -> None:
         """Mark the log closed and drop live subscribers."""
-        self._closed = True
-        self._subscribers.clear()
+        with self._lock:
+            self._closed = True
+            self._subscribers.clear()
 
     # -- internals --------------------------------------------------------
     def _broadcast(self, record: EventRecord) -> None:
-        for queue in list(self._subscribers):
+        # Snapshot under the lock so concurrent subscribe/unsubscribe cannot
+        # mutate the list mid-iteration; put_nowait runs outside the lock so a
+        # slow consumer (or a queue callback re-entering the log) never blocks
+        # writers or deadlocks on the RLock.
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for queue in subscribers:
             try:
                 queue.put_nowait(record)
             except asyncio.QueueFull:
@@ -436,4 +467,4 @@ def emit_both(ctx: Any, eventlog: EventLog, type: str, data: dict,
     return record
 
 
-__all__ = ["EventLog", "emit_both"]
+__all__ = ["EventLog", "SubscriberQueue", "emit_both"]

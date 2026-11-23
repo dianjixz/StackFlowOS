@@ -415,13 +415,18 @@ class WebServer:
                                      minimum=1, maximum=MAX_SSE_LIMIT)
             if self._sse_clients >= self.sse_max_clients:
                 raise Unavailable("too many concurrent event stream clients")
+            queue = self.app.eventlog.subscribe()
+            # S7: a closed log hands back a queue that will never receive
+            # records.  End the request with an error instead of holding a
+            # silent stream open; the queue is not registered, so nothing leaks.
+            if getattr(queue, "closed", False):
+                raise Unavailable("event log is closed")
+            self._sse_clients += 1
         except SfoError as exc:
             await self._send_json(writer, exc.http_status, {
                 "ok": False, "error": exc.to_dict(),
             })
             return
-        queue = self.app.eventlog.subscribe()
-        self._sse_clients += 1
         try:
             header = (
                 "HTTP/1.1 200 OK\r\n"

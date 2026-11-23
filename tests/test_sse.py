@@ -265,6 +265,20 @@ class SseTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_client_count(0)
         self.assertEqual(len(self.app.eventlog._subscribers), 0)
 
+    # -- closed log (S7) -------------------------------------------------
+    async def test_closed_event_log_is_503_without_subscribing(self):
+        await self.app.eventlog.close()
+        status, headers, body = await raw_request(
+            self.port, "/api/events/stream", token=self.token)
+        self.assertEqual(status, 503, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["error"]["code"], "UNAVAILABLE")
+        self.assert_no_cors(headers)
+        # A closed log rejects the stream before counting a client or
+        # registering a queue.
+        self.assertEqual(self.server._sse_clients, 0)
+        self.assertEqual(len(self.app.eventlog._subscribers), 0)
+
     # -- replay limits / heartbeat / counter release ---------------------
     async def test_limit_caps_tail_and_since_replay(self):
         for index in range(5):
