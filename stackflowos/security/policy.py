@@ -23,6 +23,7 @@ import logging
 import re
 import threading
 from dataclasses import asdict, dataclass, field, fields
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -212,9 +213,7 @@ class PolicyEngine:
             raw = scope.get("path") or scope.get("cwd")
             if raw is None:
                 return False
-            path = normalize_path(raw, cwd=scope.get("cwd"))
-            return (fnmatch.fnmatchcase(str(path), str(expected))
-                    or fnmatch.fnmatchcase(str(raw), str(expected)))
+            return _match_path_glob(raw, expected, cwd=scope.get("cwd"))
         if key == "command_regex":
             command = scope.get("command")
             if command is None:
@@ -451,6 +450,116 @@ def _url_prefix_match(url: str, expected: Any) -> bool:
         return False
     path, prefix = u.path or "/", e.path or "/"
     return path == prefix or path.startswith(prefix.rstrip("/") + "/")
+
+
+_MAX_PATH_CHARS = 8192
+
+
+def _match_path_glob(raw: Any, pattern: Any, *, cwd: Any = None) -> bool:
+    """Match the *normalized* absolute path against an absolute glob pattern.
+
+    Only the canonical path is matched -- never the caller-supplied raw string
+    -- so a path like ``/ws/proj/../../etc/passwd`` is first resolved (here to
+    ``/etc/passwd``) and can no longer slip through a ``/ws/proj/*`` rule.
+    ``*`` stays within one path segment and ``**`` crosses segments.  Unsafe or
+    unsupported patterns (relative, ``..`` segments, NUL, bad class syntax) and
+    malformed paths fail closed.
+    """
+    if not isinstance(pattern, str) or not pattern:
+        return False
+    if "\x00" in pattern or len(pattern) > _MAX_PATH_CHARS:
+        return False
+    if not pattern.startswith("/") or ".." in pattern.split("/"):
+        return False
+    compiled = _compile_path_glob(pattern)
+    if compiled is None:
+        return False
+    try:
+        raw_text = str(raw)
+    except (TypeError, ValueError):
+        return False
+    if "\x00" in raw_text:
+        return False
+    try:
+        path = normalize_path(raw_text, cwd=cwd)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    text = str(path)
+    if "\x00" in text or len(text) > _MAX_PATH_CHARS:
+        return False
+    return compiled.fullmatch(text) is not None
+
+
+@lru_cache(maxsize=512)
+def _compile_path_glob(pattern: str) -> re.Pattern[str] | None:
+    """Compile an absolute glob to a regex (cached); ``None`` means no match."""
+    regex = _glob_to_regex(pattern)
+    if regex is None:
+        return None
+    try:
+        return re.compile(regex)
+    except re.error:
+        return None
+
+
+def _glob_to_regex(pattern: str) -> str | None:
+    """Translate a POSIX-ish glob into a regex used with ``fullmatch``.
+
+    ``*`` -> one path segment (``[^/]*``), ``**`` -> any depth (``.*``),
+    ``?`` -> one non-separator char (``[^/]``) and simple ``[...]`` classes
+    (``[abc]``, ``[!abc]`` / ``[^abc]``) are supported.  Everything else is a
+    literal, so regex metacharacters carry no extra meaning.  Unsupported class
+    syntax returns ``None`` so the caller fails closed instead of guessing.
+    """
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        elif ch == "[":
+            parsed = _glob_class(pattern, i)
+            if parsed is None:
+                return None
+            rendered, i = parsed
+            out.append(rendered)
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    return "".join(out)
+
+
+def _glob_class(pattern: str, start: int) -> tuple[str, int] | None:
+    """Parse a ``[...]`` class at ``start``; returns (regex, next index)."""
+    i, n = start + 1, len(pattern)
+    negate = False
+    if i < n and pattern[i] in "!^":
+        negate = True
+        i += 1
+    chars: list[str] = []
+    while i < n:
+        ch = pattern[i]
+        if ch == "]" and chars:
+            break
+        chars.append(ch)
+        i += 1
+    else:
+        return None  # unterminated class
+    if not chars or "/" in chars or "[" in chars or "\\" in chars:
+        return None  # unsupported syntax: fail closed
+    body = "".join(re.escape(ch) for ch in chars)
+    if negate:
+        # A negated class must never match the path separator.
+        return f"[^/{body}]", i + 1
+    return f"[{body}]", i + 1
 
 
 def _section(config: Any, name: str) -> Any:

@@ -407,7 +407,7 @@ class Rule:
 
 `scope` 匹配模式：
 * `path_prefix`：规范化绝对路径前缀（`..` 解析后再比）；
-* `path_glob`：fnmatch；
+* `path_glob`：规范化后的绝对路径全匹配；`*` 不跨 `/`，`**` 跨目录，`?` 单字符（支持简单 `[...]` 字符类）；
 * `command_regex`：`re.search`；
 * `domain`：URL host 等于或以 `.domain` 结尾；
 * `url_prefix`：同一 scheme/host/port 下的路径前缀（按 URL 结构比较，不按字符串前缀）；
