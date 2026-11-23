@@ -78,6 +78,9 @@ class SecurityCfg:
     approval_ttl_s: int = 300
     grant_ttl_s: int = 3600
     shell_timeout_s: int = 60
+    #: Hard upper bound for a single ``shell.exec`` (L5); a caller-supplied
+    #: ``timeout_s`` is clamped to this so one command cannot pin a worker.
+    shell_max_timeout_s: int = 600
     allow_shell: bool = True
     #: ``net.fetch`` may reach loopback/RFC1918/link-local targets (SSRF, M4).
     #: Off by default; when on, private targets stay high risk.
@@ -258,6 +261,9 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("security.approval_ttl_s out of range")
         if not (10 <= section.grant_ttl_s <= 30 * 86400):
             raise ConfigError("security.grant_ttl_s out of range")
+        if not (1 <= section.shell_max_timeout_s <= 3600):
+            raise ConfigError(
+                "security.shell_max_timeout_s out of range (1..3600)")
         if not isinstance(section.allow_private_network, bool):
             raise ConfigError("security.allow_private_network must be a boolean")
         if section.max_preview_chars < 100:

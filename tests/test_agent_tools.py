@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from stackflowos.agents.models import Agent
-from stackflowos.agents.tools import (ToolError, ToolExecutor, get_tool,
+from stackflowos.agents.tools import (MAX_WAIT_S, ToolError, ToolExecutor,
+                                      _arg_float, _arg_int, get_tool,
                                       tools_for)
 from stackflowos.config import SecurityCfg
 from stackflowos.errors import BadRequest
@@ -339,6 +340,99 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             names = {spec.name for spec in tools_for(role)}
             self.assertNotIn("project.delete", names,
                              f"role {role!r} must not delete projects")
+
+
+class NumericArgumentTests(unittest.IsolatedAsyncioTestCase):
+    """L5: non-finite numbers become ToolError, ranges stay enforced."""
+
+    def setUp(self) -> None:
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(dir=TMP_ROOT))
+        self.ws = self.tmp / "workspace"
+        self.ws.mkdir()
+        self.sys = FakeSysAPI()
+        self.executor = ToolExecutor(
+            self.sys,
+            agent=Agent(id="agent-l5", role="coder",
+                        project_id="p-1", task_id="t-1"),
+            workspace=self.ws,
+            security_config=SecurityCfg())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- helpers ----------------------------------------------------------
+    def test_arg_float_accepts_finite_numbers(self) -> None:
+        self.assertEqual(_arg_float({"n": 3}, "n", 1.0), 3.0)
+        self.assertEqual(_arg_float({"n": 2.5}, "n", 1.0), 2.5)
+        self.assertEqual(_arg_float({}, "n", 4.5), 4.5)
+
+    def test_arg_float_rejects_non_finite_and_non_numbers(self) -> None:
+        bad_values = (float("nan"), float("inf"), float("-inf"),
+                      float("1e309"), True, False, "1.5", None, [1], {"n": 1})
+        for bad in bad_values:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ToolError):
+                    _arg_float({"n": bad}, "n", 1.0)
+
+    def test_arg_int_rejects_non_finite_without_overflow(self) -> None:
+        for bad in (float("inf"), float("-inf"), float("nan"),
+                    float("1e309")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ToolError):
+                    _arg_int({"n": bad}, "n", 0)
+
+    def test_arg_int_rejects_non_numbers_and_bools(self) -> None:
+        for bad in (True, False, "5", None, [5]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ToolError):
+                    _arg_int({"n": bad}, "n", 0)
+
+    def test_arg_int_ranges_still_enforced(self) -> None:
+        self.assertEqual(_arg_int({"n": 2}, "n", 0, minimum=0, maximum=3), 2)
+        self.assertEqual(_arg_int({"n": 9}, "n", 0, minimum=0, maximum=3), 3)
+        self.assertEqual(_arg_int({"n": 10 ** 400}, "n", 0, maximum=500), 500)
+        with self.assertRaises(ToolError):
+            _arg_int({"n": -1}, "n", 0, minimum=0)
+
+    # -- call sites -------------------------------------------------------
+    async def test_priority_rejects_inf_before_any_rpc(self) -> None:
+        result = await self.executor.run("task.create", {
+            "project_id": "p-1", "title": "t", "priority": float("inf")})
+        self.assertFalse(result.ok)
+        self.assertIn("priority", result.error or "")
+        self.assertEqual(self.sys.calls, [])
+
+    async def test_priority_still_clamped(self) -> None:
+        result = await self.executor.run("task.create", {
+            "project_id": "p-1", "title": "t", "priority": 9})
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(self.sys.actions("task.create")[0]["priority"], 3)
+
+    def test_wait_seconds_clamped_in_preview(self) -> None:
+        for value, expected in ((9999, "wait 60s"), (-5, "wait 0s"),
+                                (2.5, "wait 2.5s")):
+            with self.subTest(value=value):
+                _, _, preview = self.executor._prepare("wait",
+                                                       {"seconds": value})
+                self.assertEqual(preview, expected)
+
+    async def test_wait_rejects_non_finite_seconds(self) -> None:
+        for bad in (float("nan"), float("inf"), float("-inf"),
+                    float("1e309")):
+            with self.subTest(bad=bad):
+                result = await self.executor.run("wait", {"seconds": bad})
+                self.assertFalse(result.ok)
+                self.assertIn("finite", result.error or "")
+        self.assertEqual(self.sys.calls, [])
+
+    async def test_wait_handler_clamps_seconds(self) -> None:
+        with mock.patch("stackflowos.agents.tools.asyncio.sleep",
+                        new=mock.AsyncMock()) as sleeper:
+            result = await self.executor.run("wait", {"seconds": 9999})
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["waited_s"], MAX_WAIT_S)
+        sleeper.assert_awaited_once_with(MAX_WAIT_S)
 
 
 if __name__ == "__main__":  # pragma: no cover

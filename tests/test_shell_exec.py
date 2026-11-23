@@ -11,7 +11,8 @@ import unittest
 from pathlib import Path
 
 from stackflowos.agents.models import Agent
-from stackflowos.agents.tools import OUTPUT_CAP_BYTES, ToolExecutor
+from stackflowos.agents.tools import (OUTPUT_CAP_BYTES, ToolError,
+                                      ToolExecutor)
 from stackflowos.config import SecurityCfg
 
 TMP_ROOT = Path(__file__).resolve().parent.parent / ".stackflowos" / "tmp"
@@ -115,10 +116,10 @@ class ShellExecHardeningTests(unittest.IsolatedAsyncioTestCase):
                          f"detached sleep {pid} survived the timeout")
         self.assertEqual(self._capture_tasks(), [])
 
-    @unittest.skipUnless(IS_LINUX, "requires /proc and POSIX process groups")
-    async def test_invalid_timeout_falls_back_to_default(self) -> None:
+    @unittest.skipUnless(IS_LINUX, "requires POSIX process groups")
+    async def test_non_positive_timeout_falls_back_to_default(self) -> None:
         executor = self._executor(shell_timeout_s=0.5)
-        for bad in (float("nan"), float("inf"), float("-inf"), -1.0, 0.0):
+        for bad in (-1.0, 0.0):
             started = time.monotonic()
             result = await asyncio.wait_for(
                 executor.run("shell.exec",
@@ -127,6 +128,61 @@ class ShellExecHardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.ok, result.error)
             self.assertTrue(result.data["timed_out"], f"timeout_s={bad!r}")
             self.assertLess(time.monotonic() - started, 3.0)
+
+    # -- L5: non-finite timeouts and the upper bound ----------------------
+    async def test_non_finite_timeout_rejected_before_spawn(self) -> None:
+        bad_values = (float("nan"), float("inf"), float("-inf"),
+                      float("1e309"), "5", True, None)
+        for index, bad in enumerate(bad_values):
+            result = await self.executor.run(
+                "shell.exec",
+                {"command": f"touch spawned-{index}", "timeout_s": bad})
+            self.assertFalse(result.ok, f"timeout_s={bad!r} must be rejected")
+            self.assertIn("timeout_s", result.error or "")
+            self.assertIn("number", result.error or "")
+        # No process was spawned and no approval was even requested.
+        self.assertFalse(list(self.ws.glob("spawned-*")),
+                         "invalid timeout_s must not execute the command")
+        self.assertEqual(self.executor.sys.calls, [],
+                         "invalid timeout_s must fail before any RPC")
+
+    async def test_huge_timeout_clamped_to_config_max(self) -> None:
+        executor = self._executor(shell_max_timeout_s=1)
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            executor.run("shell.exec",
+                         {"command": "sleep 30", "timeout_s": 1e9}),
+            timeout=5.0)
+        elapsed = time.monotonic() - started
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.data["timed_out"])
+        self.assertLess(elapsed, 3.0,
+                        "timeout_s=1e9 must be clamped to shell_max_timeout_s")
+
+    def test_resolved_timeout_is_bounded_and_finite(self) -> None:
+        executor = self._executor(shell_max_timeout_s=600)
+        self.assertEqual(executor._resolve_shell_timeout({"timeout_s": 1e9}),
+                         600.0)
+        self.assertEqual(executor._resolve_shell_timeout({}), 60.0)
+        self.assertEqual(executor._resolve_shell_timeout({"timeout_s": 0}),
+                         60.0)
+        self.assertEqual(executor._resolve_shell_timeout({"timeout_s": -5}),
+                         60.0)
+        self.assertEqual(executor._resolve_shell_timeout({"timeout_s": 2.5}),
+                         2.5)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad), self.assertRaises(ToolError):
+                executor._resolve_shell_timeout({"timeout_s": bad})
+
+    def test_unusable_or_oversized_config_cap_is_sanitized(self) -> None:
+        # Directly-built SecurityCfg bypasses Config validation; the executor
+        # must still produce a finite, sane cap.
+        for cap in (0, -10, 10 ** 6):
+            executor = self._executor(shell_max_timeout_s=cap)
+            cap_value = executor._shell_max_timeout()
+            self.assertTrue(0 < cap_value <= 3600.0, cap)
+            self.assertEqual(executor._resolve_shell_timeout({"timeout_s": 1e9}),
+                             cap_value)
 
     # -- bounded output ---------------------------------------------------
     async def test_large_output_is_capped_and_truncated(self) -> None:

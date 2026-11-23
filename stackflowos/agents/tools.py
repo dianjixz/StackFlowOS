@@ -57,6 +57,10 @@ NET_TIMEOUT_S = 15.0
 MAX_REDIRECTS = 5
 #: Longest single ``wait`` tool call (seconds).
 MAX_WAIT_S = 60.0
+#: Fallback cap for one ``shell.exec`` when the config value is unusable (L5).
+_DEFAULT_SHELL_MAX_TIMEOUT_S = 600.0
+#: Absolute ceiling accepted by ``security.shell_max_timeout_s`` (L5).
+SHELL_MAX_TIMEOUT_CEILING_S = 3600.0
 
 #: Only these headers are sent on a fetch; no cookies/credentials ever are.
 _SAFE_FETCH_HEADERS = {
@@ -286,7 +290,14 @@ def _arg_int(args: dict, key: str, default: int, *, minimum: int = 0,
     value = args.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ToolError(f"argument {key!r} must be an integer")
-    number = int(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        # ``int(inf)`` would raise OverflowError (a 500 for the caller); a NaN
+        # cannot be converted at all.  Both are invalid arguments.
+        raise ToolError(f"argument {key!r} must be an integer")
+    try:
+        number = int(value)
+    except (OverflowError, ValueError, TypeError) as exc:
+        raise ToolError(f"argument {key!r} must be an integer") from exc
     if number < minimum:
         raise ToolError(f"argument {key!r} must be >= {minimum}")
     if maximum is not None:
@@ -298,7 +309,16 @@ def _arg_float(args: dict, key: str, default: float) -> float:
     value = args.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ToolError(f"argument {key!r} must be a number")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        # NaN/Infinity would poison downstream arithmetic and JSON output.
+        raise ToolError(f"argument {key!r} must be a finite number")
+    return number
+
+
+def _wait_seconds(args: dict) -> float:
+    """``wait`` seconds: finite, then clamped to [0, MAX_WAIT_S] (L5)."""
+    return min(max(_arg_float(args, "seconds", 5.0), 0.0), MAX_WAIT_S)
 
 
 def _arg_dict(args: dict, key: str, default: dict | None = None) -> dict:
@@ -995,6 +1015,9 @@ class ToolExecutor:
             cwd = self.check_path(_arg_str(args, "cwd", "."), must_exist=True)
             if not cwd.is_dir():
                 raise ToolError(f"cwd is not a directory: {cwd}")
+            # L5: reject a bad ``timeout_s`` before asking for approval and
+            # before any process could be spawned.
+            self._resolve_shell_timeout(args)
             scope = {**base_scope, "cwd": str(cwd), "command": command}
             return scope, "执行命令", _truncate(
                 _shell_preview(command, cwd), limit)
@@ -1141,9 +1164,9 @@ class ToolExecutor:
             return {}, "读取单元列表", "unit.list"
 
         if name == "wait":
-            seconds = _arg_float(args, "seconds", 5.0)
+            seconds = _wait_seconds(args)
             scope = {"project_id": self.project_id} if self.project_id else {}
-            return scope, "等待任务推进", f"wait {min(max(seconds, 0.0), MAX_WAIT_S):g}s"
+            return scope, "等待任务推进", f"wait {seconds:g}s"
 
         raise ToolError(f"no planner for tool {name!r}")  # pragma: no cover
 
@@ -1282,6 +1305,36 @@ class ToolExecutor:
             return 60.0
         return value
 
+    def _shell_max_timeout(self) -> float:
+        """Hard per-call cap from ``security.shell_max_timeout_s`` (L5).
+
+        Defensively sanitized: a ``ToolExecutor`` built from a raw
+        ``SecurityCfg`` (or an old config dump) must never yield ``inf``/``nan``
+        or a nonsensical cap.
+        """
+        try:
+            value = float(self._cfg("shell_max_timeout_s",
+                                    _DEFAULT_SHELL_MAX_TIMEOUT_S))
+        except (TypeError, ValueError):
+            return _DEFAULT_SHELL_MAX_TIMEOUT_S
+        if not math.isfinite(value) or value <= 0:
+            return _DEFAULT_SHELL_MAX_TIMEOUT_S
+        return min(value, SHELL_MAX_TIMEOUT_CEILING_S)
+
+    def _resolve_shell_timeout(self, args: dict) -> float:
+        """Validated, finite ``shell.exec`` timeout, capped by config (L5).
+
+        Raises :class:`ToolError` for a non-number/NaN/Inf ``timeout_s`` before
+        any process is spawned.  ``0``/negative values fall back to the
+        configured default; every value is clamped to the configured maximum.
+        """
+        max_timeout = self._shell_max_timeout()
+        default_timeout = min(self._default_shell_timeout(), max_timeout)
+        timeout_s = _arg_float(args, "timeout_s", default_timeout)
+        if timeout_s <= 0:
+            timeout_s = default_timeout
+        return min(timeout_s, max_timeout)
+
     def _open_shell_log(self, command: str, cwd: Path) -> _ShellLog | None:
         """Create a uniquely named log file for streaming the full output.
 
@@ -1323,12 +1376,9 @@ class ToolExecutor:
         cwd = self.check_path(_arg_str(args, "cwd", "."), must_exist=True)
         if not cwd.is_dir():
             raise ToolError(f"cwd is not a directory: {cwd}")
-        default_timeout = self._default_shell_timeout()
-        timeout_s = _arg_float(args, "timeout_s", default_timeout)
-        if not math.isfinite(timeout_s) or timeout_s <= 0:
-            # H4 only needs to stay hang-free; strict 400s (and the upper
-            # bound) are handled by the later timeout-validation item.
-            timeout_s = default_timeout
+        # L5: non-finite/non-numeric ``timeout_s`` raises before any spawn; a
+        # valid value is clamped to ``security.shell_max_timeout_s``.
+        timeout_s = self._resolve_shell_timeout(args)
 
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -1576,7 +1626,7 @@ class ToolExecutor:
         return await call_ok(self.sys, "unit.list", {})
 
     async def _wait(self, args: dict, scope: dict) -> dict:
-        seconds = min(max(_arg_float(args, "seconds", 5.0), 0.0), MAX_WAIT_S)
+        seconds = _wait_seconds(args)
         await asyncio.sleep(seconds)
         out: dict[str, Any] = {"waited_s": seconds}
         if self.project_id:
