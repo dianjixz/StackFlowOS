@@ -410,7 +410,7 @@ class Rule:
 * `path_glob`：fnmatch；
 * `command_regex`：`re.search`；
 * `domain`：URL host 等于或以 `.domain` 结尾；
-* `url_prefix`：字符串前缀；
+* `url_prefix`：同一 scheme/host/port 下的路径前缀（按 URL 结构比较，不按字符串前缀）；
 * `project_id` / `role` / `agent_id`：精确；
 * `equals`：`{key: value}` 逐项精确。
 

@@ -232,7 +232,10 @@ class PolicyEngine:
             wanted = str(expected).lower()
             return bool(host) and (host == wanted or host.endswith("." + wanted))
         if key == "url_prefix":
-            return str(scope.get("url") or "").startswith(str(expected))
+            url = scope.get("url")
+            if not url:
+                return False
+            return _url_prefix_match(str(url), expected)
         if key == "equals":
             if not isinstance(expected, dict):
                 return False
@@ -397,6 +400,57 @@ def _host_of(url: str) -> str:
     if "://" in url:
         return (urlsplit(url).hostname or "").lower()
     return url.split("/", 1)[0].lower()
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_INVALID_PORT = object()
+
+
+def _url_hostname(parts: Any) -> str:
+    """Lower-cased hostname, with IPv6 brackets removed."""
+    host = parts.hostname or ""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host.lower()
+
+
+def _url_port(parts: Any) -> int | None | object:
+    """Effective port: the explicit one, else the scheme default."""
+    try:
+        port = parts.port
+    except ValueError:
+        return _INVALID_PORT
+    if port is not None:
+        return port
+    return _DEFAULT_PORTS.get((parts.scheme or "").lower())
+
+
+def _url_prefix_match(url: str, expected: Any) -> bool:
+    """Match ``url`` against ``expected`` by URL structure, never by string prefix.
+
+    The scheme, hostname and effective port must be identical; the path must be
+    equal to, or nested below, the expected path on a path-segment boundary.
+    Userinfo and malformed URLs are rejected rather than raising.
+    """
+    try:
+        u = urlsplit(str(url))
+        e = urlsplit(str(expected))
+    except (TypeError, ValueError):
+        return False
+    if not u.scheme or not e.scheme:
+        return False
+    if u.scheme.lower() != e.scheme.lower():
+        return False
+    host, wanted = _url_hostname(u), _url_hostname(e)
+    if not host or host != wanted:
+        return False
+    if u.username or u.password or e.username or e.password:
+        return False
+    u_port, e_port = _url_port(u), _url_port(e)
+    if u_port is _INVALID_PORT or e_port is _INVALID_PORT or u_port != e_port:
+        return False
+    path, prefix = u.path or "/", e.path or "/"
+    return path == prefix or path.startswith(prefix.rstrip("/") + "/")
 
 
 def _section(config: Any, name: str) -> Any:
