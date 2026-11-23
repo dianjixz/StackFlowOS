@@ -25,11 +25,20 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 from ..errors import BadRequest, Denied, SfoError
 from ..util.logging import get_logger
+from ..util.net import (
+    PRIVATE_NETWORK_ERROR,
+    InvalidTarget,
+    validate_fetch_url,
+)
 from .api import call_ok, emit_event, request_permission
 from .roles import get_role
 
@@ -41,8 +50,20 @@ DEFAULT_MAX_BYTES = 200_000
 MAX_READ_BYTES = 2_000_000
 #: Outbound HTTP timeout (seconds).
 NET_TIMEOUT_S = 15.0
+#: Maximum redirect hops followed for one ``net.fetch`` (M4).
+MAX_REDIRECTS = 5
 #: Longest single ``wait`` tool call (seconds).
 MAX_WAIT_S = 60.0
+
+#: Only these headers are sent on a fetch; no cookies/credentials ever are.
+_SAFE_FETCH_HEADERS = {
+    "User-Agent": "StackFlowOS/0.1 (+stdlib)",
+    "Accept": "*/*",
+}
+#: Stripped again on every redirect, should anything ever add them.
+_SENSITIVE_HEADERS = frozenset({
+    "authorization", "cookie", "cookie2", "proxy-authorization",
+})
 
 #: Bytes read from a child stream per pump iteration; keeps memory flat.
 _SHELL_CHUNK_BYTES = 64 * 1024
@@ -77,6 +98,70 @@ class ToolSpec:
 
 class ToolError(Exception):
     """A tool failed for a reason the executor should report, not crash on."""
+
+
+def _strip_credentials(request: Request) -> None:
+    """Defensively drop credential headers before following a redirect."""
+    for mapping in (request.headers, request.unredirected_hdrs):
+        for key in [item for item in mapping
+                    if str(item).lower() in _SENSITIVE_HEADERS]:
+            del mapping[key]
+
+
+class _GuardedRedirectHandler(HTTPRedirectHandler):
+    """Validate each redirect target *before* urllib requests it (M4).
+
+    ``validate`` is the executor's URL check (scheme/userinfo/port/private
+    network/length), so a redirect to the cloud metadata service or an
+    intranet host is rejected without a second request being sent.
+
+    urllib's own ``http_error_30x`` rejects non-http(s) targets first, so this
+    override checks the absolute target *before* delegating; ``redirect_request``
+    keeps the same guard for direct calls and other handlers.
+    """
+
+    #: urllib's own bookkeeping; our counter below is authoritative.
+    max_repeats = MAX_REDIRECTS
+    max_redirections = MAX_REDIRECTS
+
+    def __init__(self, validate: Callable[[str], None]) -> None:
+        super().__init__()
+        self._validate = validate
+        self.hops = 0
+        self._hop_validated = False
+
+    def _validate_hop(self, newurl: str) -> None:
+        self.hops += 1
+        if self.hops > MAX_REDIRECTS:
+            raise ToolError(f"too many redirects (max {MAX_REDIRECTS})")
+        self._validate(newurl)
+
+    def http_error_302(self, req: Request, fp: Any, code: int, msg: str,
+                       headers: Any) -> Any:
+        location = None
+        if headers is not None:
+            location = headers.get("location") or headers.get("uri")
+        if location:
+            # Resolve relative Locations and validate before urllib's scheme
+            # gate (which would otherwise raise a generic HTTPError).
+            self._validate_hop(urljoin(req.full_url, str(location).strip()))
+            self._hop_validated = True
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = \
+        http_error_302
+
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> Request | None:
+        if not self._hop_validated:
+            # Direct call (not via http_error_30x): validate the target here.
+            self._validate_hop(newurl)
+        self._hop_validated = False
+        new_request = super().redirect_request(
+            req, fp, code, msg, headers, newurl)
+        if new_request is not None:
+            _strip_credentials(new_request)
+        return new_request
 
 
 @dataclass
@@ -909,13 +994,26 @@ class ToolExecutor:
 
         raise ToolError(f"no planner for tool {name!r}")  # pragma: no cover
 
-    @staticmethod
-    def _validate_url(url: str) -> None:
-        parsed = urlsplit(url)
-        if parsed.scheme not in ("http", "https"):
-            raise ToolError(f"only http/https URLs are allowed: {url!r}")
-        if not parsed.netloc:
-            raise ToolError(f"URL has no host: {url!r}")
+    def _allow_private_network(self) -> bool:
+        """Whether ``security.allow_private_network`` opted into SSRF targets."""
+        return bool(self._cfg("allow_private_network", False))
+
+    def _validate_url(self, url: str) -> None:
+        """Pre-flight check shared by the initial URL, redirects and the end.
+
+        Rejects non-http(s) schemes, userinfo, empty/invalid hosts, over-long
+        URLs and - unless ``security.allow_private_network`` is on - every
+        private/loopback/link-local target, including *all* addresses the host
+        resolves to. Runs before the approval request and again on each hop.
+        """
+        try:
+            validate_fetch_url(
+                url, allow_private_network=self._allow_private_network())
+        except InvalidTarget as exc:
+            message = str(exc)
+            if message == PRIVATE_NETWORK_ERROR:
+                raise ToolError(PRIVATE_NETWORK_ERROR) from exc
+            raise ToolError(message) from exc
 
     # -- handlers ---------------------------------------------------------
     def _handlers(self) -> dict[str, Callable[[dict, dict], Awaitable[dict]]]:
@@ -1146,6 +1244,8 @@ class ToolExecutor:
 
     async def _net_fetch(self, args: dict, scope: dict) -> dict:
         url = _arg_str(args, "url", required=True)
+        # Re-check at execution time too: the approval happened earlier and
+        # the URL/redirect target must be revalidated against live DNS.
         self._validate_url(url)
         max_bytes = _arg_int(args, "max_bytes", DEFAULT_MAX_BYTES, minimum=1,
                              maximum=MAX_READ_BYTES)
@@ -1154,25 +1254,27 @@ class ToolExecutor:
         truncated = len(body) > max_bytes
         return {
             "status": status,
+            "requested_url": url,
             "url": final_url,
             "content": body[:max_bytes].decode("utf-8", "replace"),
             "content_type": content_type,
             "truncated": truncated,
         }
 
-    @staticmethod
-    def _http_get(url: str, max_bytes: int) -> tuple[int, str, str, bytes]:
-        request = Request(url, headers={
-            "User-Agent": "StackFlowOS/0.1 (+stdlib)",
-            "Accept": "*/*",
-        })
+    def _http_get(self, url: str, max_bytes: int) -> tuple[int, str, str, bytes]:
+        self._validate_url(url)
+        handler = _GuardedRedirectHandler(self._validate_url)
+        opener = build_opener(handler)
+        # Explicit allowlist: no Cookie/Authorization is ever attached, and no
+        # ambient cookie jar or credential store is consulted.
+        request = Request(url, headers=dict(_SAFE_FETCH_HEADERS))
         try:
-            with urlopen(request, timeout=NET_TIMEOUT_S) as response:
+            # Local opener, not ``urlopen``: no globally installed handlers
+            # (cookies/proxies) can loosen the redirect policy.
+            with opener.open(request, timeout=NET_TIMEOUT_S) as response:
                 final_url = response.geturl()
-                parsed = urlsplit(final_url)
-                if parsed.scheme not in ("http", "https"):
-                    raise ToolError(
-                        f"redirected to unsupported scheme: {parsed.scheme!r}")
+                # Final target re-checked after the last hop.
+                self._validate_url(final_url)
                 status = int(getattr(response, "status", 200) or 200)
                 headers = getattr(response, "headers", None)
                 content_type = headers.get("Content-Type", "") if headers else ""

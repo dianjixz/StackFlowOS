@@ -12,13 +12,13 @@ risk, it only raises it.
 
 from __future__ import annotations
 
-import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from ..errors import BadRequest
+from ..util.net import is_private_host
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -172,8 +172,10 @@ def risk_of(capability: str, scope: dict, *, projects_root: Path,
             scheme = (parts.scheme or "").lower()
             if scheme not in ("http", "https"):
                 level = _max_risk(level, "high")
-            elif _is_private_host(parts.hostname or ""):
-                level = _max_risk(level, "medium")
+            elif is_private_host(parts.hostname or ""):
+                # M4: private targets are never "medium like any fetch";
+                # they stay high even when ``allow_private_network`` is on.
+                level = _max_risk(level, "high")
 
     return level
 
@@ -188,27 +190,13 @@ def _is_dangerous(command: str) -> bool:
     return any(pattern.search(command) for pattern in DANGEROUS_PATTERNS)
 
 
-def _is_private_host(host: str) -> bool:
-    """True for loopback, RFC1918/link-local, ``.local`` and single-label hosts."""
-    host = host.strip().strip("[]").lower()
-    if not host:
-        return False
-    if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return "." not in host
-    return (address.is_private or address.is_loopback or address.is_link_local
-            or address.is_reserved or address.is_unspecified)
-
-
 __all__ = [
     "CAPABILITIES",
     "RISK_ORDER",
     "CapabilityDef",
     "DANGEROUS_PATTERNS",
     "get_capability",
+    "is_private_host",
     "is_within",
     "normalize_path",
     "risk_of",

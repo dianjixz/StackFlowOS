@@ -169,9 +169,9 @@ class CapabilityTests(SecurityTestBase):
         self.assertEqual(risk_of("net.fetch", {"url": "https://example.com"},
                                  projects_root=self.projects_root), "medium")
         self.assertEqual(risk_of("net.fetch", {"url": "http://192.168.1.5/x"},
-                                 projects_root=self.projects_root), "medium")
+                                 projects_root=self.projects_root), "high")
         self.assertEqual(risk_of("net.fetch", {"url": "http://localhost:8000"},
-                                 projects_root=self.projects_root), "medium")
+                                 projects_root=self.projects_root), "high")
         self.assertEqual(risk_of("net.fetch", {"url": "file:///etc/passwd"},
                                  projects_root=self.projects_root), "high")
 

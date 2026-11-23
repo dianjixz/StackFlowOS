@@ -79,6 +79,9 @@ class SecurityCfg:
     grant_ttl_s: int = 3600
     shell_timeout_s: int = 60
     allow_shell: bool = True
+    #: ``net.fetch`` may reach loopback/RFC1918/link-local targets (SSRF, M4).
+    #: Off by default; when on, private targets stay high risk.
+    allow_private_network: bool = False
     max_preview_chars: int = 4000
 
 
@@ -251,6 +254,8 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("security.approval_ttl_s out of range")
         if not (10 <= section.grant_ttl_s <= 30 * 86400):
             raise ConfigError("security.grant_ttl_s out of range")
+        if not isinstance(section.allow_private_network, bool):
+            raise ConfigError("security.allow_private_network must be a boolean")
     elif name == "llm":
         if section.provider not in ("mock", "openai"):
             raise ConfigError("llm.provider must be mock|openai")

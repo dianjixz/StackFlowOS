@@ -385,7 +385,9 @@ memory.updated / demo.seeded
 * 目标路径不在 `<state>/projects/<project>/workspace` 内 → 至少 high；
 * shell 命令命中 `DANGEROUS_PATTERNS`（`rm -rf /`、`sudo`、`mkfs`、`dd if=`、
   `curl|sh`、`chmod 777 /` 等）→ high；
-* URL 非 http/https → high；私网地址 → medium 起。
+* URL 非 http/https → high；私网地址（loopback/RFC1918/link-local/元数据/保留/未指定，
+  含 IPv4-mapped IPv6）→ high。`net.fetch` 默认拒绝私网（`security.allow_private_network`，
+  默认 `false`），显式开启才允许且风险仍为 high；重定向逐跳复查（最多 5 跳）。
 
 ### 6.2 策略（PolicyEngine）
 
