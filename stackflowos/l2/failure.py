@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import logging
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Callable
 
@@ -55,12 +56,21 @@ class FailurePolicy:
 class FailureManager:
     """Sweeps liveness, releases leases and applies restart policies."""
 
+    #: Hard ceiling for the number of distinct work_ids kept in the restart
+    #: history.  Without it a long-lived deployment that churns through
+    #: work_ids would grow the dict without bound (§6.15 / S8).
+    MAX_HISTORY_ENTRIES = 2048
+    #: Never prune attempt timestamps younger than this, regardless of the
+    #: configured policy window (which may be shorter than one hour).
+    MIN_HISTORY_RETENTION_S = 3600.0
+
     def __init__(self, ctx: Context, registry: UnitRegistry,
                  leases: LeaseManager, eventlog: EventLog, *,
                  policies: dict[str, FailurePolicy] | None = None,
                  restart_cb: Callable[[UnitInfo, int], Any] | None = None,
                  kill_cb: Callable[[UnitInfo], Any] | None = None,
-                 tick_s: float = 2.0) -> None:
+                 tick_s: float = 2.0,
+                 max_history_entries: int | None = None) -> None:
         self.ctx = ctx
         self.registry = registry
         self.leases = leases
@@ -72,8 +82,20 @@ class FailureManager:
         self._policies: dict[str, FailurePolicy] = {}
         for policy in (policies or {}).values():
             self.set_policy(policy)
+        if max_history_entries is None:
+            max_history_entries = self.MAX_HISTORY_ENTRIES
+        try:
+            max_history_entries = int(max_history_entries)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "max_history_entries must be an integer") from exc
+        if max_history_entries < 1:
+            raise ValidationError("max_history_entries must be >= 1")
+        self.max_history_entries = max_history_entries
         # work_id -> monotonic attempt timestamps (seconds) inside the window.
-        self._history: dict[str, list[float]] = {}
+        # Bounded by _prune_history(): stale stamps are dropped, empty entries
+        # removed, and at most ``max_history_entries`` work_ids are retained.
+        self._history: dict[str, deque[float]] = {}
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -107,12 +129,15 @@ class FailureManager:
     # -- tick loop --------------------------------------------------------
     async def tick(self) -> list[dict]:
         """Sweep once and handle every unit that just went offline."""
+        self._prune_history()
         results: list[dict] = []
         for transition in self.registry.sweep():
             unit, status = self._unpack_transition(transition)
             if status != "offline":
                 continue
             results.append(await self._handle_offline(unit))
+        if len(self._history) > self.max_history_entries:
+            self._prune_history()
         return results
 
     async def start(self) -> None:
@@ -203,7 +228,7 @@ class FailureManager:
                     "released_leases": len(released)}
 
         attempt = len(attempts) + 1
-        self._history.setdefault(work_id, []).append(time.monotonic())
+        self._history.setdefault(work_id, deque()).append(time.monotonic())
         try:
             ok = await _maybe_await(self.restart_cb(unit, attempt))
         except Exception:
@@ -243,10 +268,59 @@ class FailureManager:
 
     def _attempts_in_window(self, work_id: str, window_s: float) -> list[float]:
         cutoff = time.monotonic() - float(window_s)
-        history = [stamp for stamp in self._history.get(work_id, ())
-                   if stamp >= cutoff]
-        self._history[work_id] = history
-        return history
+        stamps = self._history.get(work_id)
+        if stamps is None:
+            return []
+        while stamps and stamps[0] < cutoff:
+            stamps.popleft()
+        if not stamps:
+            # An expired entry must not keep a key alive forever.
+            self._history.pop(work_id, None)
+            return []
+        return list(stamps)
+
+    # -- bounded history (S8) ---------------------------------------------
+    def _history_retention_s(self) -> float:
+        """How old an attempt stamp may get before it is pruned.
+
+        The widest configured policy window wins (so a policy with a
+        multi-hour window keeps its budget accurate), but never less than
+        :attr:`MIN_HISTORY_RETENTION_S`.
+        """
+        widest = 0.0
+        for policy in self._policies.values():
+            widest = max(widest, float(policy.window_s))
+        return max(widest, self.MIN_HISTORY_RETENTION_S)
+
+    def _prune_history(self, now: float | None = None) -> int:
+        """Bound the restart history (called at the start of every tick).
+
+        Drops attempt timestamps older than the retention window, deletes
+        work_ids whose deque became empty, then evicts the least recently
+        attempted work_ids until at most ``max_history_entries`` remain.
+        Returns the number of work_ids evicted by the size cap.
+        """
+        if not self._history:
+            return 0
+        now = time.monotonic() if now is None else float(now)
+        cutoff = now - self._history_retention_s()
+        for work_id in list(self._history):
+            stamps = self._history[work_id]
+            while stamps and stamps[0] < cutoff:
+                stamps.popleft()
+            if not stamps:
+                del self._history[work_id]
+
+        evicted = 0
+        overflow = len(self._history) - self.max_history_entries
+        if overflow > 0:
+            # Deques are append-ordered, so the last stamp is the newest.
+            oldest = sorted(self._history.items(),
+                            key=lambda item: item[1][-1])[:overflow]
+            for work_id, _ in oldest:
+                del self._history[work_id]
+                evicted += 1
+        return evicted
 
     def _note_restart(self, unit: UnitInfo, attempt: int) -> None:
         note = getattr(self.registry, "note_restart", None)
