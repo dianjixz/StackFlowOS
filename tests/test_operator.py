@@ -10,6 +10,7 @@ from pathlib import Path
 
 from stackflowos.app import App
 from stackflowos.config import Config, default_root
+from stackflowos.errors import NotFound
 
 REPO = default_root()
 
@@ -66,13 +67,38 @@ class OperatorTests(unittest.IsolatedAsyncioTestCase):
         workspace = Path(card["workspace"])
         (workspace / "x.txt").write_text("x", "utf-8")
         result = await self.app.operator_tool(
-            "project.delete", {"project_id": card["id"]})
+            "project.delete", {"project_id": card["id"],
+                               "confirm": card["name"]})
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["data"]["workspace_purged"])
         self.assertFalse(workspace.parent.exists())
         types = [record.type for record in self.app.eventlog.tail(50)]
         self.assertIn("operator.action", types)
         self.assertIn("project.deleted", types)
+
+    async def test_project_delete_requires_explicit_confirmation(self):
+        card = await self.app.create_project("操作员删除确认", "confirm required",
+                                             spawn_lead=False)
+
+        missing = await self.app.operator_tool(
+            "project.delete", {"project_id": card["id"]})
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["code"], "BAD_REQUEST")
+        self.assertIn("confirm", missing["error"])
+
+        wrong = await self.app.operator_tool(
+            "project.delete", {"project_id": card["id"],
+                               "confirm": "别的项目名"})
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["code"], "BAD_REQUEST")
+        self.assertEqual(self.app.projects.get(card["id"]).id, card["id"])
+
+        confirmed = await self.app.operator_tool(
+            "project.delete", {"project_id": card["id"],
+                               "confirm": card["name"]})
+        self.assertTrue(confirmed["ok"], confirmed)
+        with self.assertRaises(NotFound):
+            self.app.projects.get(card["id"])
 
     async def test_rule_and_config_management(self):
         rule = await self.app.operator_tool("rule.create", {

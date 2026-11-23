@@ -288,6 +288,30 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sys.actions("event.since")[0],
                          {"seq": 3, "limit": 5, "project_id": "p-1"})
 
+    async def test_project_delete_requires_explicit_confirm(self) -> None:
+        result = await self.executor.run("project.delete", {"project_id": "p-1"})
+        self.assertFalse(result.ok)
+        self.assertIn("confirm", result.error or "")
+        self.assertEqual(self.sys.calls, [],
+                         "missing confirm must fail before any RPC")
+
+        confirmed = await self.executor.run(
+            "project.delete", {"project_id": "p-1", "confirm": "p-1"})
+        self.assertTrue(confirmed.ok, confirmed.error)
+        call = self.sys.actions("project.delete")[0]
+        self.assertEqual(call["confirm"], "p-1")
+        self.assertTrue(call["purge_workspace"])
+        self.assertEqual(self.sys.actions("project.get"), [],
+                         "confirm must never be fetched from the project record")
+
+    async def test_project_delete_rejects_non_bool_purge(self) -> None:
+        result = await self.executor.run("project.delete", {
+            "project_id": "p-1", "confirm": "p-1",
+            "purge_workspace": "false"})
+        self.assertFalse(result.ok)
+        self.assertIn("boolean", result.error or "")
+        self.assertEqual(self.sys.calls, [])
+
     async def test_tools_for_roles(self) -> None:
         coder_tools = {spec.name for spec in tools_for("coder")}
         self.assertIn("fs.write", coder_tools)
@@ -297,7 +321,17 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("agent.spawn", lead_tools)
         self.assertIn("task.create", lead_tools)
         self.assertNotIn("shell.exec", lead_tools)
+        assistant_tools = {spec.name for spec in tools_for("assistant")}
+        self.assertNotIn("project.delete", assistant_tools)
         self.assertEqual(tools_for("nobody"), [])
+
+    async def test_no_worker_role_is_granted_project_delete(self) -> None:
+        from stackflowos.agents.roles import ROLES
+
+        for role in ROLES:
+            names = {spec.name for spec in tools_for(role)}
+            self.assertNotIn("project.delete", names,
+                             f"role {role!r} must not delete projects")
 
 
 if __name__ == "__main__":  # pragma: no cover

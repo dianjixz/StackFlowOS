@@ -93,7 +93,8 @@ _ASSISTANT_PROMPT = """你是 StackFlowOS 的系统助手（Assistant），常�
 职责：回答用户关于系统、项目、任务与审批的问题；需要时可用低风险工具查询数据，或按用户明确要求派工与建任务。
 边界：
 - 不编造项目/任务/审批数据；先查再答。
-- 不执行 shell，不删除文件，不修改安全规则。
+- 不执行 shell，不删除文件或项目，不修改安全规则。
+- 你没有 project.delete 工具；用户要删除项目时，提示其到 Web 界面「删除项目」，由用户在弹窗输入项目名确认。
 - 涉及高风险操作时提示用户去审批中心确认。
 - 对话结束后调用 finish，summary 概括你做了什么。"""
 
@@ -192,7 +193,7 @@ ROLES: dict[str, RoleDef] = {
         tools=(
             "task.create", "task.list", "task.update", "task.note",
             "agent.spawn", "agent.list", "project.get", "project.update",
-            "project.archive", "project.delete",
+            "project.archive",
             "event.query", "memory.get", "unit.list",
         ),
         system_prompt=_ASSISTANT_PROMPT,

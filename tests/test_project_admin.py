@@ -65,6 +65,8 @@ class ProjectAdminTests(unittest.IsolatedAsyncioTestCase):
         fixture = await self._project()
         pid = fixture["card"]["id"]
         with self.assertRaises(BadRequest):
+            await self.app.delete_project(pid)
+        with self.assertRaises(BadRequest):
             await self.app.delete_project(pid, confirm="错误的名字")
         self.assertEqual(self.app.projects.get(pid).id, pid)
         self.assertTrue(fixture["workspace"].exists())
@@ -96,6 +98,7 @@ class ProjectAdminTests(unittest.IsolatedAsyncioTestCase):
         pid = fixture["card"]["id"]
         result = await self.app.assistant_tool("project.delete", {
             "project_id": pid, "purge_workspace": True,
+            "confirm": fixture["card"]["name"],
         })
         self.assertTrue(result["ok"], result)
         with self.assertRaises(NotFound):
@@ -108,12 +111,11 @@ class ProjectAdminTests(unittest.IsolatedAsyncioTestCase):
             fixture = await self._project("HTTP 删除测试")
             pid = fixture["card"]["id"]
 
-            def call():
+            def call(body):
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{server.port}/api/projects/{pid}",
                     method="DELETE",
-                    data=json.dumps({"confirm": fixture["card"]["name"],
-                                     "purge_workspace": True}).encode())
+                    data=json.dumps(body).encode())
                 request.add_header("Content-Type", "application/json")
                 request.add_header("X-SFO-Request", "1")
                 request.add_header("Authorization", f"Bearer {server.launch_token}")
@@ -123,7 +125,14 @@ class ProjectAdminTests(unittest.IsolatedAsyncioTestCase):
                 except urllib.error.HTTPError as exc:
                     return exc.code, json.loads(exc.read().decode())
 
-            status, payload = await asyncio.to_thread(call)
+            # Without a human-supplied confirm the API refuses with 400.
+            status, payload = await asyncio.to_thread(
+                call, {"purge_workspace": True})
+            self.assertEqual(status, 400, payload)
+            self.assertEqual(self.app.projects.get(pid).id, pid)
+
+            status, payload = await asyncio.to_thread(call, {
+                "confirm": fixture["card"]["name"], "purge_workspace": True})
             self.assertEqual(status, 200, payload)
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["data"]["deleted"], pid)

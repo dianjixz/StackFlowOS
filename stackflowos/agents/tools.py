@@ -308,6 +308,14 @@ def _arg_dict(args: dict, key: str, default: dict | None = None) -> dict:
     return value
 
 
+def _require_delete_confirm(args: dict) -> str:
+    """``confirm`` must be supplied by the caller; never auto-filled (M6)."""
+    confirm = _arg_optional_str(args, "confirm")
+    if not confirm:
+        raise ToolError("project deletion requires confirm=<project name>")
+    return confirm
+
+
 def _board(payload: Any) -> list[dict]:
     """Compact task board rows from a ``task.list`` reply."""
     rows = payload
@@ -924,6 +932,7 @@ class ToolExecutor:
             project_id = _arg_optional_str(args, "project_id", self.project_id)
             if not project_id:
                 raise ToolError("project_id is required")
+            _require_delete_confirm(args)
             purge = args.get("purge_workspace", True)
             if not isinstance(purge, bool):
                 raise ToolError("argument 'purge_workspace' must be a boolean")
@@ -1356,11 +1365,7 @@ class ToolExecutor:
         project_id = _arg_optional_str(args, "project_id", self.project_id)
         if not project_id:
             raise ToolError("project_id is required")
-        confirm = _arg_optional_str(args, "confirm")
-        if not confirm:
-            project = await call_ok(self.sys, "project.get",
-                                    {"project_id": project_id})
-            confirm = str(project.get("name") or project_id)
+        confirm = _require_delete_confirm(args)
         purge = args.get("purge_workspace", True)
         if not isinstance(purge, bool):
             raise ToolError("argument 'purge_workspace' must be a boolean")

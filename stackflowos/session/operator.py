@@ -58,8 +58,10 @@ OPERATOR_TOOLS: dict[str, OperatorTool] = {
         "project.archive", "project.archive", "归档项目并停止其 Agent",
         {"project_id": "string"}),
     "project.delete": OperatorTool(
-        "project.delete", "project.delete", "永久删除项目、任务与工作区",
-        {"project_id": "string", "purge_workspace": "boolean?"}),
+        "project.delete", "project.delete",
+        "永久删除项目、任务与工作区（confirm 必须是项目名，由用户提供）",
+        {"project_id": "string", "purge_workspace": "boolean?",
+         "confirm": "string"}),
     "project.complete": OperatorTool(
         "project.complete", "project.update", "人工确认项目完成",
         {"project_id": "string"}),
@@ -342,14 +344,17 @@ class OperatorTools:
     async def _project_delete(self, args: dict) -> dict:
         project_id = str(args.get("project_id") or "")
         target = self.app.projects.get(project_id)
-        confirm = args.get("confirm")
-        if confirm is not None and str(confirm) not in (target.name, target.id):
-            raise BadRequest("confirm does not match project name")
+        confirm = str(args.get("confirm") or "").strip()
+        # The human must type the project name; never fill it from the record.
+        if confirm not in (target.name, target.id):
+            raise BadRequest(
+                "project deletion requires confirm=<project name>",
+                detail={"project_id": project_id, "name": target.name})
         purge = args.get("purge_workspace", True)
         if not isinstance(purge, bool):
             purge = True
         return await self.app.delete_project(
-            project_id, purge_workspace=purge, confirm=target.name,
+            project_id, purge_workspace=purge, confirm=confirm,
             by="agent-assistant")
 
     async def _project_complete(self, args: dict) -> dict:
