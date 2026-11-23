@@ -180,8 +180,13 @@ async def _attach(args) -> int:
 
 
 def _build_config(args, *, for_web: bool = True) -> Config:
-    cfg = Config.load(root=Path(args.root) if args.root else None,
-                      state_dir=Path(args.state_dir) if args.state_dir else None)
+    # ``status`` only exposes ``--url/--token`` (it needs the running hub's
+    # address, not a repo path); every other subcommand gets ``--root`` etc.
+    # from ``_add_common``.  Read them defensively so both shapes work.
+    root = getattr(args, "root", None)
+    state_dir = getattr(args, "state_dir", None)
+    cfg = Config.load(root=Path(root) if root else None,
+                      state_dir=Path(state_dir) if state_dir else None)
     patch: dict = {}
     if getattr(args, "transport", None):
         patch.setdefault("transport", {})["mode"] = args.transport
