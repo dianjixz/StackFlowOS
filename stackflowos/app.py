@@ -99,6 +99,26 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _lease_project_id(lease: Any) -> str | None:
+    """Return the project a lease belongs to, matched by *exact* id (L2).
+
+    ``project:<id>:<role>`` resources name their owner; any other resource may
+    carry one in ``metadata.project_id``.  Everything else is unowned.  Never
+    replace this with a substring test: ``"p-1" in json.dumps(resource)`` also
+    matched ``project:p-10:lead`` (plan §6.2).
+    """
+    resource = str(getattr(lease, "resource", "") or "")
+    if resource.startswith("project:"):
+        parts = resource.split(":", 2)
+        return parts[1] if len(parts) > 1 and parts[1] else None
+    metadata = getattr(lease, "metadata", None)
+    if isinstance(metadata, dict):
+        project_id = metadata.get("project_id")
+        if isinstance(project_id, str) and project_id:
+            return project_id
+    return None
+
+
 class MemoryStore:
     """Per-project key/value memory for agents (small, JSON persisted)."""
 
@@ -1973,7 +1993,7 @@ class App:
         card["agents"] = agents
         card["pending_approvals"] = len(pending)
         card["leases"] = [l.to_dict() for l in leases
-                          if card.get("id") in json_dumps_safe(l.resource)]
+                          if _lease_project_id(l) == project_id]
         return card
 
     def health(self) -> dict:
