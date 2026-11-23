@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import secrets
 from typing import Any, Awaitable, Callable
 
 from ..errors import BadRequest, SfoError
@@ -17,16 +18,73 @@ from ..util.logging import get_logger
 
 Handler = Callable[[re.Match, dict, dict], Awaitable[tuple[int, Any]]]
 
+_INTEGER = re.compile(r"^[+-]?[0-9]+$")
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"", "0", "false", "no", "off"})
+
 
 def _ok(data: Any, status: int = 200) -> tuple[int, dict]:
     return status, {"ok": True, "data": data}
 
 
-def _as_bool(value: Any) -> bool:
-    """JSON `true`/`false`, plus the string spellings the UI may send."""
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Strict boolean parsing for JSON bodies and query strings (L1).
+
+    JSON ``true``/``false`` and the string spellings the UI may send are
+    accepted; everything else is a 400 instead of silently becoming ``True``
+    (``bool("false")``) or ``False``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        raise BadRequest("expected a boolean value")
     if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    raise BadRequest("expected a boolean value")
+
+
+def _parse_int(raw: Any, name: str, default: int, minimum: int,
+               maximum: int | None = None) -> int:
+    """Strict integer parsing for one query/body field (L1)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise BadRequest(f"{name} must be an integer")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        text = str(raw).strip()
+        if not _INTEGER.fullmatch(text):
+            raise BadRequest(f"{name} must be an integer")
+        try:
+            value = int(text, 10)
+        except ValueError:  # pragma: no cover - guarded by the regex
+            raise BadRequest(f"{name} must be an integer") from None
+    if value < minimum:
+        raise BadRequest(f"{name} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise BadRequest(f"{name} must be <= {maximum}")
+    return value
+
+
+def _int_query(query: dict, key: str, default: int, minimum: int,
+               maximum: int | None = None) -> int:
+    """Parse ``query[key]`` as an integer, rejecting bad values with a 400."""
+    return _parse_int(query.get(key), key, default, minimum, maximum)
+
+
+def _int_body(body: dict, key: str, default: int, minimum: int,
+              maximum: int | None = None) -> int:
+    """Parse ``body[key]`` as an integer, rejecting bad values with a 400."""
+    return _parse_int(body.get(key), key, default, minimum, maximum)
 
 
 class WebAPI:
@@ -54,10 +112,16 @@ class WebAPI:
                 return status, result
             except SfoError as exc:
                 return exc.http_status, {"ok": False, "error": exc.to_dict()}
-            except Exception as exc:
-                self.log.exception("api handler failed: %s %s", method, path)
+            except Exception:
+                # Never leak exception text (paths, internals) to the client;
+                # the traceback goes to the log under a correlation id.
+                request_id = secrets.token_hex(8)
+                self.log.exception(
+                    "api handler failed: %s %s (request_id=%s)",
+                    method, path, request_id)
                 return 500, {"ok": False, "error": {
-                    "code": "INTERNAL", "message": str(exc)}}
+                    "code": "INTERNAL", "message": "internal server error",
+                    "request_id": request_id}}
         return 404, {"ok": False, "error": {"code": "NOT_FOUND",
                                             "message": f"no route {method} {path}"}}
 
@@ -125,14 +189,8 @@ class WebAPI:
         return _ok(self.app.snapshot())
 
     async def events(self, match, query, body):
-        try:
-            since = int(query.get("since") or 0)
-        except ValueError:
-            since = 0
-        try:
-            limit = min(int(query.get("limit") or 200), 1000)
-        except ValueError:
-            limit = 200
+        since = _int_query(query, "since", 0, 0)
+        limit = _int_query(query, "limit", 200, 1, 1000)
         records = self.app.eventlog.since(since, limit=limit,
                                           project_id=query.get("project_id") or None)
         return _ok({"events": [r.to_dict() for r in records],
@@ -142,19 +200,13 @@ class WebAPI:
         types: list[str] | None = None
         if query.get("types"):
             types = [t.strip() for t in str(query["types"]).split(",") if t.strip()]
-        try:
-            limit = min(int(query.get("limit") or 200), 1000)
-        except ValueError:
-            limit = 200
+        limit = _int_query(query, "limit", 200, 1, 1000)
         rows = self.app.console(types=types, project_id=query.get("project_id") or None,
                                 limit=limit)
         return _ok({"events": rows})
 
     async def chat_history(self, match, query, body):
-        try:
-            limit = min(int(query.get("limit") or 100), 200)
-        except ValueError:
-            limit = 100
+        limit = _int_query(query, "limit", 100, 1, 200)
         return _ok({"messages": self.app.chat.history(limit)})
 
     async def chat_send(self, match, query, body):
@@ -192,7 +244,7 @@ class WebAPI:
         card = await self.app.attach_project(
             name, path,
             goal=str(body.get("goal") or ""),
-            allow_writes=_as_bool(body.get("allow_writes", False)),
+            allow_writes=_as_bool(body.get("allow_writes"), default=False),
             created_by="human:operator")
         return _ok(card, 201 if card.get("attached_now") else 200)
 
@@ -210,7 +262,7 @@ class WebAPI:
         return _ok(self.app.project_card(project_id))
 
     async def project_access(self, match, query, body):
-        allow = _as_bool(body.get("allow_writes", False))
+        allow = _as_bool(body.get("allow_writes"), default=False)
         confirm = body.get("confirm")
         if allow and not (confirm is True or
                           (isinstance(confirm, str) and
@@ -224,12 +276,10 @@ class WebAPI:
                                                   by="human:operator"))
 
     async def project_delete(self, match, query, body):
-        purge = body.get("purge_workspace", True)
-        if isinstance(purge, str):
-            purge = purge.lower() not in ("0", "false", "no")
+        purge = _as_bool(body.get("purge_workspace"), default=True)
         confirm = body.get("confirm") or query.get("confirm")
         return _ok(await self.app.delete_project(
-            match.group(1), purge_workspace=bool(purge), confirm=confirm,
+            match.group(1), purge_workspace=purge, confirm=confirm,
             by="human:operator"))
 
     async def project_complete(self, match, query, body):
@@ -247,7 +297,7 @@ class WebAPI:
             raise BadRequest("title required")
         task = self.app.projects.add_task(
             project_id, title, str(body.get("description") or ""),
-            role=body.get("role"), priority=int(body.get("priority") or 0),
+            role=body.get("role"), priority=_int_body(body, "priority", 0, 0, 3),
             deps=list(body.get("deps") or []), created_by="human:operator",
         )
         return _ok(task.to_dict(), 201)
@@ -267,14 +317,16 @@ class WebAPI:
     async def task_check(self, match, query, body):
         task = self.app.projects.task_check(
             match.group(1), item_id=body.get("item_id"), text=body.get("text"),
-            done=bool(body.get("done", True)), note=str(body.get("note") or ""))
+            done=_as_bool(body.get("done"), default=True),
+            note=str(body.get("note") or ""))
         return _ok(task.to_dict())
 
     async def approvals_list(self, match, query, body):
         status = query.get("status") or None
-        items = self.app.approvals.list(status=status,
-                                        project_id=query.get("project_id") or None,
-                                        limit=min(int(query.get("limit") or 200), 500))
+        items = self.app.approvals.list(
+            status=status,
+            project_id=query.get("project_id") or None,
+            limit=_int_query(query, "limit", 200, 1, 500))
         # Lists must stay small: only the truncated preview plus its digest.
         return _ok({"approvals": [a.to_public_dict() for a in items]})
 
@@ -296,7 +348,8 @@ class WebAPI:
         return _ok(request)
 
     async def rules_list(self, match, query, body):
-        rules = self.app.policy.list_rules(active_only=bool(query.get("active_only")))
+        rules = self.app.policy.list_rules(
+            active_only=_as_bool(query.get("active_only"), default=False))
         return _ok({"rules": [r.to_dict() for r in rules]})
 
     async def rules_create(self, match, query, body):
@@ -376,9 +429,10 @@ class WebAPI:
         return _ok(await self.app.update_config(patch))
 
     async def leases_list(self, match, query, body):
-        leases = self.app.leases.list(holder=query.get("holder") or None,
-                                      resource=query.get("resource") or None,
-                                      active_only=query.get("all") not in ("1", "true"))
+        leases = self.app.leases.list(
+            holder=query.get("holder") or None,
+            resource=query.get("resource") or None,
+            active_only=not _as_bool(query.get("all"), default=False))
         return _ok({"leases": [l.to_dict() for l in leases]})
 
 
@@ -387,8 +441,9 @@ def _decode_body(body: bytes) -> dict:
         return {}
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid JSON body: {exc}") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Keep the client message stable: no parser internals, no body echo.
+        raise ValueError("invalid JSON body") from None
     if not isinstance(payload, dict):
         raise ValueError("JSON body must be an object")
     return payload

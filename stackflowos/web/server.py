@@ -31,6 +31,13 @@ from .auth import WebAuth, security_headers
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
 MAX_BODY = 1024 * 1024
+# Request framing limits (L1).  A loopback console still must not let one
+# client tie up memory with a giant request line, header block or body.
+MAX_REQUEST_LINE = 8192
+MAX_HEADERS = 100
+MAX_HEADER_BYTES = 16 * 1024
+HEADER_TIMEOUT_S = 10.0
+BODY_TIMEOUT_S = 30.0
 DEFAULT_SSE_HEARTBEAT_S = 15.0
 DEFAULT_SSE_MAX_CLIENTS = 32
 DEFAULT_SSE_LIMIT = 200
@@ -40,6 +47,23 @@ MAX_SSE_HEARTBEAT_S = 300.0
 
 _INT_PARAM = re.compile(r"^[+-]?\d+$")
 _FLOAT_PARAM = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_CONTENT_LENGTH = re.compile(r"^[0-9]+$")
+
+
+class _HttpError(Exception):
+    """A rejected request that still deserves a JSON error response (L1).
+
+    Raised while parsing the request head/body, i.e. before authentication.
+    ``_handle_client`` renders it through :meth:`WebServer._send_json` so the
+    rejection carries the same security headers as every other response.
+    """
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
 
 _EXTRA_TYPES = {
     ".js": "text/javascript; charset=utf-8",
@@ -138,7 +162,22 @@ class WebServer:
             if request is None:
                 return
             method, target, headers, body = request
-            parts = urlsplit(target)
+            if _has_control_chars(target):
+                await self._send_json(writer, 400, {"ok": False, "error": {
+                    "code": "BAD_REQUEST", "message": "invalid request path"}})
+                return
+            try:
+                parts = urlsplit(target)
+            except ValueError:
+                await self._send_json(writer, 400, {"ok": False, "error": {
+                    "code": "BAD_REQUEST", "message": "invalid request target"}})
+                return
+            if _invalid_path(parts.path):
+                # NUL/control characters would reach ``Path.resolve()`` and
+                # surface as an opaque 500; reject them before admission.
+                await self._send_json(writer, 400, {"ok": False, "error": {
+                    "code": "BAD_REQUEST", "message": "invalid request path"}})
+                return
             path = _normalize_path(parts.path)
             if path is None:
                 await self._send_json(writer, 403, {"ok": False, "error": {
@@ -170,6 +209,12 @@ class WebServer:
             pass
         except asyncio.CancelledError:
             raise
+        except _HttpError as exc:
+            try:
+                await self._send_json(writer, exc.status, {"ok": False, "error": {
+                    "code": exc.code, "message": exc.message}})
+            except Exception:
+                pass
         except SfoError as exc:
             try:
                 await self._send_json(writer, exc.http_status, {"ok": False,
@@ -193,33 +238,85 @@ class WebServer:
                 pass
 
     async def _read_request(self, reader: asyncio.StreamReader):
+        """Read one request head/body with hard framing limits (L1).
+
+        Every rejection raises :class:`_HttpError` so the caller can answer with
+        a normal JSON error instead of falling through to the generic 500.
+        """
         try:
-            request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+            request_line = await asyncio.wait_for(reader.readline(),
+                                                  timeout=HEADER_TIMEOUT_S)
         except asyncio.TimeoutError:
             return None
+        except (ValueError, asyncio.LimitOverrunError):
+            raise _HttpError(414, "URI_TOO_LONG",
+                             "request line is too long") from None
         if not request_line or not request_line.strip():
             return None
+        if len(request_line) > MAX_REQUEST_LINE:
+            raise _HttpError(414, "URI_TOO_LONG", "request line is too long")
         try:
             method, target, _version = request_line.decode("latin-1").strip().split(" ", 2)
-        except ValueError:
-            return None
+        except (ValueError, UnicodeDecodeError):
+            raise _HttpError(400, "BAD_REQUEST", "malformed request line") from None
+
         headers: dict[str, str] = {}
+        header_count = 0
+        header_bytes = 0
         while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=30)
+            try:
+                line = await asyncio.wait_for(reader.readline(),
+                                              timeout=HEADER_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return None
+            except (ValueError, asyncio.LimitOverrunError):
+                raise _HttpError(431, "HEADERS_TOO_LARGE",
+                                 "request headers are too large") from None
             if not line or line in (b"\r\n", b"\n"):
                 break
-            key, _, value = line.decode("latin-1").partition(":")
-            headers[key.strip().lower()] = value.strip()
+            header_count += 1
+            header_bytes += len(line)
+            if header_count > MAX_HEADERS:
+                raise _HttpError(431, "TOO_MANY_HEADERS",
+                                 "too many request headers")
+            if header_bytes > MAX_HEADER_BYTES or len(line) > MAX_HEADER_BYTES:
+                raise _HttpError(431, "HEADERS_TOO_LARGE",
+                                 "request headers are too large")
+            key, separator, value = line.decode("latin-1").partition(":")
+            if not separator:
+                raise _HttpError(400, "BAD_REQUEST", "malformed request header")
+            key = key.strip().lower()
+            value = value.strip()
+            if not key or _has_control_chars(key) or _has_control_chars(value):
+                raise _HttpError(400, "BAD_REQUEST", "malformed request header")
+            headers[key] = value
+
+        transfer_encoding = (headers.get("transfer-encoding") or "").strip().lower()
+        if transfer_encoding:
+            # Only identity framing with Content-Length is implemented.
+            if transfer_encoding == "chunked":
+                raise _HttpError(501, "NOT_IMPLEMENTED",
+                                 "chunked transfer encoding is not supported")
+            raise _HttpError(400, "BAD_REQUEST", "unsupported Transfer-Encoding")
+
         length = 0
-        try:
-            length = int(headers.get("content-length") or 0)
-        except ValueError:
-            length = 0
-        if length > MAX_BODY:
-            raise SfoError("request body too large", code="BAD_REQUEST")
+        raw_length = headers.get("content-length")
+        if raw_length is not None:
+            if not _CONTENT_LENGTH.fullmatch(raw_length):
+                raise _HttpError(400, "BAD_REQUEST", "invalid Content-Length")
+            length = int(raw_length)
+            if length > MAX_BODY:
+                raise _HttpError(413, "PAYLOAD_TOO_LARGE",
+                                 "request body is too large")
         body = b""
         if length:
-            body = await asyncio.wait_for(reader.readexactly(length), timeout=30)
+            try:
+                body = await asyncio.wait_for(reader.readexactly(length),
+                                              timeout=BODY_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return None
+            except asyncio.IncompleteReadError:
+                return None
         return method.upper(), target, headers, body
 
     async def _send_json(self, writer: asyncio.StreamWriter, status: int, payload: Any) -> None:
@@ -257,7 +354,14 @@ class WebServer:
         if path in ("/", ""):
             path = "/index.html"
         relative = path.lstrip("/")
-        candidate = (self.assets_dir / relative).resolve()
+        try:
+            candidate = (self.assets_dir / relative).resolve()
+        except (OSError, ValueError):
+            # Defence in depth: NUL/overlong paths are rejected before routing,
+            # but ``resolve()`` must never turn a bad path into a 500.
+            await self._send_json(writer, 400, {"ok": False, "error": {
+                "code": "BAD_REQUEST", "message": "invalid request path"}})
+            return
         try:
             candidate.relative_to(self.assets_dir.resolve())
         except ValueError:
@@ -402,6 +506,17 @@ def _display_host(host: str) -> str:
     return host
 
 
+def _has_control_chars(text: str) -> bool:
+    """True when ``text`` contains C0 controls or DEL (NUL included)."""
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in text)
+
+
+def _invalid_path(raw_path: str) -> bool:
+    """Reject control characters before and after percent-decoding."""
+    return _has_control_chars(raw_path or "") or _has_control_chars(
+        unquote(raw_path or ""))
+
+
 def _normalize_path(raw_path: str) -> str | None:
     """Unquote and collapse ``.``/``//`` before admission and routing.
 
@@ -427,7 +542,9 @@ def _reason(status: int) -> str:
         303: "See Other",
         400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
         405: "Method Not Allowed", 409: "Conflict",
+        411: "Length Required", 413: "Payload Too Large", 414: "URI Too Long",
         415: "Unsupported Media Type",
-        500: "Internal Server Error",
+        431: "Request Header Fields Too Large",
+        500: "Internal Server Error", 501: "Not Implemented",
         503: "Service Unavailable", 504: "Gateway Timeout",
     }.get(status, "OK")
