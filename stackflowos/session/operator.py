@@ -13,12 +13,12 @@ circular import with :mod:`stackflowos.app`.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..errors import BadRequest, SfoError
 from ..util.logging import get_logger
+from ..util.redact import is_secret_key, redact_text
 
 
 @dataclass(frozen=True)
@@ -167,8 +167,6 @@ ALIASES: dict[str, str] = {
     "task.get": "task.list",
 }
 
-_SECRET_KEY = re.compile(r"(?i)(key|token|secret|password|credential|authorization)")
-
 
 def catalog_text() -> str:
     """Compact tool catalogue embedded in the assistant system prompt."""
@@ -195,7 +193,7 @@ def _redact_args(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
-            if _SECRET_KEY.search(str(key)):
+            if is_secret_key(key):
                 out[key] = "***"
             else:
                 out[key] = _redact_args(item, depth=depth + 1)
@@ -203,6 +201,9 @@ def _redact_args(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact_args(item, depth=depth + 1) for item in value[:20]]
     if isinstance(value, str):
+        # Inline rules run before truncation so a cut never leaves half a
+        # credential behind (M8, shared with tool previews).
+        value = redact_text(value)
         return value if len(value) <= 300 else value[:299] + "…"
     return value
 

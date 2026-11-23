@@ -39,6 +39,7 @@ from ..util.net import (
     InvalidTarget,
     validate_fetch_url,
 )
+from ..util.redact import is_secret_key, redact_text
 from .api import call_ok, emit_event, request_permission
 from .roles import get_role
 
@@ -80,9 +81,6 @@ _SHELL_CANCEL_KILL_GRACE_S = 1.0
 _SHELL_GROUP_POLL_S = 0.05
 
 _ENV_SECRET = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
-_SECRET_TEXT = re.compile(
-    r"(?i)\b(api[_-]?key|token|secret|password|credential|authorization)\b"
-    r"(\s*[=:]\s*)([^\s,;]+)")
 
 
 @dataclass(frozen=True)
@@ -336,8 +334,12 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _redact(text: str) -> str:
-    """Best-effort removal of inline credentials from human previews."""
-    return _SECRET_TEXT.sub(lambda match: f"{match.group(1)}{match.group(2)}***", text)
+    """Best-effort removal of inline credentials from human previews.
+
+    Delegates to :func:`stackflowos.util.redact.redact_text` so previews and
+    operator audits share one rule set (M8).
+    """
+    return redact_text(text)
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +789,9 @@ class ToolExecutor:
         for key, value in args.items():
             if key in ("content", "value", "patch"):
                 continue
-            if isinstance(value, str):
+            if is_secret_key(key):
+                out[key] = "***"
+            elif isinstance(value, str):
                 out[key] = _truncate(_redact(value), 200)
             elif isinstance(value, (int, float, bool)):
                 out[key] = value
