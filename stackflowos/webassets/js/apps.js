@@ -77,6 +77,8 @@ let current = null;
 let lastFocused = null;
 let renderTimer = null;
 let pendingRender = false;
+let pointerDown = false;
+let lastSheetSignature = '';
 let consoleTimer = null;
 
 const view = {
@@ -101,6 +103,7 @@ const view = {
   settingsTab: 'general',
   settingsNotice: [],
   settingsReady: false,
+  ruleForm: null,
 };
 
 /* ================================================================== */
@@ -131,10 +134,28 @@ export function initApps() {
     }, 0);
   });
 
+  // A re-render between mousedown and mouseup swallows the click, so hold
+  // back live refreshes while a button is being pressed inside the sheet.
+  els.body.addEventListener('pointerdown', () => { pointerDown = true; }, true);
+  const pointerRelease = () => {
+    if (!pointerDown) return;
+    pointerDown = false;
+    if (current && pendingRender && !isFormFocused()) {
+      window.setTimeout(() => {
+        if (!pendingRender) return;
+        pendingRender = false;
+        scheduleSheetRender();
+      }, 0);
+    }
+  };
+  document.addEventListener('pointerup', pointerRelease, true);
+  document.addEventListener('pointercancel', pointerRelease, true);
+
   on('state', () => {
     if (!current) return;
     if (current.name === 'settings' && view.settingsReady) return;
-    if (isFormFocused()) {
+    if (current.name === 'approvals' && sheetSignature() === lastSheetSignature) return;
+    if (isFormFocused() || pointerDown) {
       pendingRender = true;
       return;
     }
@@ -293,6 +314,17 @@ function isFormFocused() {
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable;
 }
 
+// Agents emit events constantly; the approvals sheet only needs to redraw
+// when the pending list (or project names shown on cards) actually changes.
+function sheetSignature() {
+  if (!current || current.name !== 'approvals') return '';
+  return JSON.stringify([
+    state.loaded,
+    state.approvals.map((item) => [item.id, item.status, item.expires_at]),
+    state.projects.map((item) => [item.id, item.name]),
+  ]);
+}
+
 function scheduleSheetRender() {
   if (renderTimer) return;
   renderTimer = window.setTimeout(() => {
@@ -304,6 +336,7 @@ function scheduleSheetRender() {
 function renderSheet({ preserveScroll = true } = {}) {
   if (!current) return;
   const scrollTop = preserveScroll ? els.body.scrollTop : 0;
+  lastSheetSignature = sheetSignature();
   els.body.replaceChildren();
   let content = null;
   switch (current.name) {
@@ -1420,11 +1453,10 @@ function renderApprovalCard(approval) {
       });
   };
 
-  const alwaysLabel = approval.capability === 'shell.exec' ? '总是允许此类命令' : '总是允许';
   actions.append(
     el('button', { class: 'btn btn-sm btn-ok', type: 'button', onclick: () => decide('allow', 'once', '一次') }, '允许一次'),
-    el('button', { class: 'btn btn-sm', type: 'button', onclick: () => decide('allow', 'session', '1 小时') }, '允许 1 小时'),
-    el('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => decide('allow', 'always', '总是') }, alwaysLabel),
+    el('button', { class: 'btn btn-sm', type: 'button', title: '1 小时内，同一项目里同类角色的同类操作不再询问', onclick: () => decide('allow', 'session', '1 小时') }, '允许 1 小时'),
+    el('button', { class: 'btn btn-sm btn-primary', type: 'button', title: '创建长期规则：同类角色的同类操作不再询问（可在下方规则列表删除）', onclick: () => decide('allow', 'always', '总是') }, '总是允许'),
     el('span', { class: 'spacer' }),
     el('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => decide('deny', 'once', '拒绝') }, '拒绝'),
   );
@@ -1518,18 +1550,35 @@ function ruleRow(rule) {
   );
 }
 
+const RULE_CAPABILITIES = [
+  'fs.read', 'fs.list', 'fs.write', 'fs.delete', 'shell.exec', 'net.fetch',
+  'llm.chat', 'project.create', 'project.update', 'project.archive',
+  'project.delete', 'task.manage', 'agent.spawn', 'agent.kill',
+  'unit.control', 'sys.config', 'data.read', 'data.write',
+];
+
+// The form is built once and re-attached on every render, so a half-typed
+// rule survives the live refreshes of the sheet.
 function renderRuleForm() {
+  if (!view.ruleForm) view.ruleForm = buildRuleForm();
+  return view.ruleForm;
+}
+
+function buildRuleForm() {
   const errorNode = el('div', { class: 'form-error', role: 'alert' });
   const effect = select({ 'aria-label': '规则效果' }, [
     { value: 'allow', label: '允许 allow' },
     { value: 'deny', label: '拒绝 deny' },
   ]);
-  const capability = input({ placeholder: '例如 shell.run 或 fs.write', class: 'input mono', 'aria-label': '能力' });
-  const principal = input({ value: '*', placeholder: '*', class: 'input mono', 'aria-label': '主体' });
+  const capability = select({ 'aria-label': '能力', class: 'select mono' }, [
+    { value: '*', label: '* （全部能力）' },
+    ...RULE_CAPABILITIES,
+  ]);
+  const principal = input({ value: '*', placeholder: '* 或 agent-coder-*', class: 'input mono', 'aria-label': '主体' });
   const riskMax = select({ 'aria-label': '风险上限' }, [
-    { value: 'low', label: 'low' },
+    { value: 'high', label: 'high（含高风险）' },
     { value: 'medium', label: 'medium' },
-    { value: 'high', label: 'high' },
+    { value: 'low', label: 'low' },
   ]);
   const scopeJson = textarea({
     placeholder: '{ "project_id": "p-1" }（可选）',
@@ -1544,7 +1593,7 @@ function renderRuleForm() {
 
   const form = el('form', { class: 'form-card', style: { 'margin-top': '12px' } },
     el('h3', {}, '新增规则'),
-    el('p', { class: 'form-hint' }, '规则只影响之后的操作；deny 优先于 allow。'),
+    el('p', { class: 'form-hint' }, '规则只影响之后的操作；deny 优先于 allow。主体示例：agent-coder-*（所有 coder）、*（所有人）；风险上限表示该规则最多放行到哪一级风险。'),
     el('div', { class: 'form-grid is-3' },
       field('效果', effect),
       field('能力 capability', capability),
@@ -1563,11 +1612,6 @@ function renderRuleForm() {
     event.preventDefault();
     errorNode.textContent = '';
     const capabilityValue = capability.value.trim();
-    if (!capabilityValue) {
-      errorNode.textContent = '能力 capability 不能为空。';
-      capability.focus();
-      return;
-    }
     let scope = {};
     if (scopeJson.value.trim()) {
       try {
@@ -1596,6 +1640,7 @@ function renderRuleForm() {
           note: note.value.trim(),
         });
         toast('规则已添加', 'success');
+        form.reset();
         await Promise.all([loadRules(), loadState({ quiet: true })]);
         renderSheet();
       } catch (error) {

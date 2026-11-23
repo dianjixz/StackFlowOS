@@ -30,7 +30,7 @@ from .projects import ProjectStore, plan_for
 from .security import ApprovalBroker, PolicyEngine
 from .session.chat import ChatService
 from .session.operator import OperatorTools
-from .transport import AddressAllocator, HubTransport
+from .transport import AddressAllocator, HubTransport, socket_dir_for
 from .util.jsonio import read_json, write_json
 from .util.logging import get_logger, setup_logging
 
@@ -106,7 +106,7 @@ class App:
         self.allocator = AddressAllocator(
             mode=cfg.transport.mode,
             host=cfg.transport.host,
-            run_dir=self.paths.run_dir,
+            run_dir=socket_dir_for(self.paths.run_dir, cfg.transport.mode, log),
             port_pool=(cfg.transport.port_pool_start, cfg.transport.port_pool_end),
             advertise_host=cfg.transport.advertise_host,
             logger=get_logger("address"),
@@ -436,7 +436,8 @@ class App:
             if task is None:
                 data = env.data if isinstance(env.data, dict) else {}
                 task = asyncio.create_task(
-                    self.handle_rpc_action(action, data, src=env.src))
+                    self.handle_rpc_action(action, data, src=env.src,
+                                           external=True))
                 self._rpc_inflight[key] = task
 
                 def _done(t: asyncio.Task, key: str = key) -> None:
@@ -458,13 +459,31 @@ class App:
             return payload
         return handle
 
-    async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0") -> dict:
+    async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0",
+                                external: bool = False) -> dict:
+        """Dispatch one sys action.
+
+        ``external`` marks calls that arrived over the transport: ``src`` is
+        then self-reported by the peer, so it never grants privileges and the
+        caller can only act as the agent bound to its own unit.
+        """
         handler = self._actions.get(action)
         if handler is None:
             raise BadRequest(f"unknown action: {action}")
-        if action in PRIVILEGED_ACTIONS and src not in ("sys.0", "operator", "web"):
+        if action in PRIVILEGED_ACTIONS and (
+                external or src not in ("sys.0", "operator", "web")):
             raise Denied(f"{action} is a privileged action; ask the operator")
-        return await handler(data or {}, src)
+        data = dict(data or {})
+        if external and action == "approval.request":
+            data["principal"] = self._bind_principal(data.get("principal"), src)
+        return await handler(data, src)
+
+    def _bind_principal(self, claimed, src: str) -> str:
+        agent = self._agent_for_unit(src)
+        actual = agent.id if agent is not None else src
+        if claimed and str(claimed) != actual:
+            raise Denied(f"{src} may not request approvals as {claimed!r}")
+        return actual
 
     async def _control_unit(self, work_id: str, action: str, data: dict | None = None):
         return await self.transport.call(work_id, action, data or {}, timeout=3.0)
@@ -730,7 +749,6 @@ class App:
             preview=str(data.get("preview") or "")[: self.config.security.max_preview_chars],
             project_id=data.get("project_id"),
             task_id=data.get("task_id"),
-            risk=data.get("risk"),
             ttl_s=int(data["ttl_s"]) if data.get("ttl_s") else None,
         )
         return request.to_dict()
@@ -775,11 +793,14 @@ class App:
             note=str(data.get("note") or ""),
             created_by=str(data.get("created_by") or "operator"),
         )
+        if rule.effect == "allow":
+            self.approvals.resolve_pending()
         return rule.to_dict()
 
     async def _rule_update(self, data, src):
         rule = self.policy.update_rule(str(data.get("rule_id") or data.get("id") or ""),
                                        dict(data.get("patch") or {}))
+        self.approvals.resolve_pending()
         return rule.to_dict()
 
     async def _rule_delete(self, data, src):
@@ -1440,6 +1461,7 @@ class App:
             self.policy.auto_allow_low = cfg.security.auto_allow_low
             self.policy.medium_default = cfg.security.medium_default
             self.policy.high_default = cfg.security.high_default
+            self.approvals.resolve_pending()
         except Exception:
             self.log.exception("live config application failed")
         # Chat sessions hold a provider instance; rebuild it so a model

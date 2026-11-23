@@ -284,6 +284,7 @@ class WebAPI:
             note=str(body.get("note") or ""),
             created_by="human:operator",
         )
+        self.app.approvals.resolve_pending()
         return _ok(rule.to_dict(), 201)
 
     async def rules_delete(self, match, query, body):

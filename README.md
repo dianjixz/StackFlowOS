@@ -124,6 +124,9 @@ transport.mode = "ipc"   # ipc://<state>/run/<work_id>.rpc.sock
 transport.mode = "tcp"   # tcp://127.0.0.1:<port>（advertise_host 可指向远端可达地址）
 ```
 
+IPC 的 socket 路径受 `sockaddr_un`（约 100 字节）限制；状态目录过深时，hub 会自动把 socket
+放到 `<tmp>/sfo-<hash>`，`stackflowos doctor` 会给出警告。
+
 单元启动时向 sys 要地址（`unit.addresses`），然后绑定自己的 REP/PUB。
 换设备时，把 hub 的 `sys_rpc` 换成 `tcp://<host>:<port>` 即可让那台设备上的
 worker 接进来——语义上它就是同一台机器上的另一个进程。
@@ -209,8 +212,10 @@ append-only JSONL（`<state>/events/events.jsonl`），全局单调 `seq`，
 审批口就是手机 App 的权限弹窗：
 
 - **允许一次**：一次性 grant，用完即失效
-- **允许 1 小时**：session grant
-- **总是允许**：落成一条规则，可在设置里删除
+- **允许 1 小时**：session grant，按角色泛化（`agent-coder-3` → `agent-coder-*`），
+  读写类限定在项目工作区、`shell.exec` 仍精确到该命令、网络按域名；危险能力（删除/终止等）保持精确
+- **总是允许**：落成一条同样泛化的规则，可在设置里删除
+- 放行后，同一批还在排队的同类请求会自动通过（`approval.auto`）；新增/修改规则也会立即生效于排队请求
 - **拒绝**：动作失败，Agent 收到 `DENIED`
 - 没人处理时到期自动拒绝（fail closed）
 - 放行规则可限定 principal（`coder.*`）、路径前缀、命令正则、域名、项目、风险上限

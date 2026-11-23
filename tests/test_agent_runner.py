@@ -190,6 +190,31 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("agent.failed", self.sys.event_types())
         self.assertIn("task.blocked", self.sys.event_types())
 
+    async def test_repeated_identical_failures_stop_the_run(self) -> None:
+        class MissingFile:
+            async def next_action(self, view: AgentView) -> Action:
+                return Action(tool="fs.read", args={"path": "nope.txt"})
+
+        result = await self._runner(MissingFile(), max_steps=20).run()
+        self.assertEqual(result.status, "blocked")
+        self.assertLess(result.steps, 20)
+        self.assertEqual(self.sys.task["status"], "blocked")
+
+    async def test_observe_receives_tool_results(self) -> None:
+        seen: list[Any] = []
+
+        class Watching:
+            async def next_action(self, view: AgentView) -> Action:
+                if seen:
+                    return Action(finish={"summary": "done", "status": "done"})
+                return Action(tool="fs.list", args={"path": "."})
+
+            def observe(self, action: Action, result: Any) -> None:
+                seen.append((action.tool, result.ok))
+
+        await self._runner(Watching()).run()
+        self.assertEqual(seen, [("fs.list", True)])
+
     async def test_pause_stops_without_finishing_agent(self) -> None:
         runner = self._runner(MockBrain("coder", max_steps=8))
         runner.pause()

@@ -38,6 +38,8 @@ DEFAULT_MAX_BYTES = 200_000
 MAX_READ_BYTES = 2_000_000
 #: Outbound HTTP timeout (seconds).
 NET_TIMEOUT_S = 15.0
+#: Longest single ``wait`` tool call (seconds).
+MAX_WAIT_S = 60.0
 
 _ENV_SECRET = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 _SECRET_TEXT = re.compile(
@@ -89,9 +91,12 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
           {"command": "string", "cwd": "string", "timeout_s": "number"}, "high"),
     _spec("net.fetch", "net.fetch", "抓取 http/https 网页",
           {"url": "string", "max_bytes": "integer"}, "medium"),
-    _spec("task.update", "task.manage", "更新任务字段/状态",
+    _spec("task.update", "task.manage",
+          "更新任务（task_id 默认自己的任务；patch 可含 status=todo|doing|review|done|blocked、"
+          "title、description、error）",
           {"task_id": "string", "patch": "object"}),
-    _spec("task.artifact", "task.manage", "为任务登记产物",
+    _spec("task.artifact", "task.manage",
+          "为任务登记产物（artifact 如 {\"type\":\"file\",\"path\":\"src/a.py\",\"title\":\"...\"}）",
           {"task_id": "string", "artifact": "object"}),
     _spec("task.note", "task.manage", "给任务追加一条备注",
           {"task_id": "string", "text": "string"}),
@@ -123,6 +128,9 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
     _spec("memory.set", "data.write", "写入项目记忆",
           {"project_id": "string", "key": "string", "value": "object"}, "medium"),
     _spec("unit.list", "data.read", "列出在线单元", {}),
+    _spec("wait", "data.read",
+          "等待若干秒后返回最新任务看板（派工后等待工人推进时使用）",
+          {"seconds": "number"}),
 )}
 
 
@@ -198,6 +206,19 @@ def _arg_dict(args: dict, key: str, default: dict | None = None) -> dict:
     return value
 
 
+def _board(payload: Any) -> list[dict]:
+    """Compact task board rows from a ``task.list`` reply."""
+    rows = payload
+    if isinstance(payload, dict):
+        rows = payload.get("tasks", payload.get("value", []))
+    out = []
+    for item in rows if isinstance(rows, list) else []:
+        if isinstance(item, dict):
+            out.append({key: item.get(key) for key in
+                        ("id", "title", "status", "role", "assignee")})
+    return out
+
+
 def _truncate(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
@@ -244,6 +265,13 @@ class ToolExecutor:
     @property
     def task_id(self) -> str | None:
         return getattr(self.agent, "task_id", None)
+
+    def _task_id_arg(self, args: dict) -> str:
+        """``task_id`` argument, defaulting to the agent's own task."""
+        task_id = _arg_optional_str(args, "task_id") or self.task_id
+        if not task_id:
+            raise ToolError("argument 'task_id' is required (agent has no task)")
+        return task_id
 
     # -- path confinement -------------------------------------------------
     def check_path(self, path: str | Path, *, must_exist: bool = False) -> Path:
@@ -328,6 +356,17 @@ class ToolExecutor:
             return await self._fail(
                 spec, f"{type(exc).__name__}: {exc}", preview=preview)
 
+        if not await self._spend_once_grant(approval):
+            reason = "one-shot approval was already used"
+            await self._emit("tool.denied", {
+                "tool": spec.name,
+                "capability": spec.capability,
+                "request_id": str(approval.get("id") or ""),
+                "reason": reason,
+                "preview": preview,
+            })
+            return ToolResult(ok=False, error=f"DENIED: {reason}", preview=preview)
+
         handler = self._handlers().get(spec.name)
         if handler is None:  # pragma: no cover - registry/handler mismatch
             return await self._fail(spec, f"no executor for tool {spec.name!r}",
@@ -367,10 +406,26 @@ class ToolExecutor:
         })
         return ToolResult(ok=False, error=error, preview=preview)
 
+    async def _spend_once_grant(self, approval: dict) -> bool:
+        """Spend a human one-shot grant *before* acting; fail closed."""
+        if str(approval.get("mode") or "") != "once":
+            return True
+        grant_id = approval.get("grant_id")
+        if not grant_id:
+            return False
+        try:
+            result = await call_ok(self.sys, "approval.use",
+                                   {"grant_id": str(grant_id)})
+        except Exception:  # noqa: BLE001 - cannot prove the grant: refuse
+            self.log.debug("approval.use failed for grant %s", grant_id,
+                           exc_info=True)
+            return False
+        return bool(result.get("ok"))
+
     async def _use_grant(self, approval: dict) -> None:
         grant_id = approval.get("grant_id") if isinstance(approval, dict) else None
         mode = str(approval.get("mode") or "") if isinstance(approval, dict) else ""
-        if not grant_id or mode not in ("once", "grant"):
+        if not grant_id or mode != "grant":
             return
         try:
             await call_ok(self.sys, "approval.use", {"grant_id": str(grant_id)})
@@ -469,7 +524,7 @@ class ToolExecutor:
             return scope, "抓取网页", _truncate(_redact(url), limit)
 
         if name == "task.update":
-            task_id = _arg_str(args, "task_id", required=True)
+            task_id = self._task_id_arg(args)
             patch = _arg_dict(args, "patch")
             scope = {**base_scope, "task_id": task_id}
             preview = _truncate(
@@ -477,7 +532,7 @@ class ToolExecutor:
             return scope, "更新任务", preview
 
         if name == "task.artifact":
-            task_id = _arg_str(args, "task_id", required=True)
+            task_id = self._task_id_arg(args)
             artifact = _arg_dict(args, "artifact")
             scope = {**base_scope, "task_id": task_id}
             preview = _truncate(
@@ -485,7 +540,7 @@ class ToolExecutor:
             return scope, "登记任务产物", preview
 
         if name == "task.note":
-            task_id = _arg_str(args, "task_id", required=True)
+            task_id = self._task_id_arg(args)
             text = _arg_str(args, "text", required=True)
             scope = {**base_scope, "task_id": task_id}
             return scope, "记录任务备注", _truncate(_redact(text), limit)
@@ -602,6 +657,11 @@ class ToolExecutor:
         if name == "unit.list":
             return {}, "读取单元列表", "unit.list"
 
+        if name == "wait":
+            seconds = _arg_float(args, "seconds", 5.0)
+            scope = {"project_id": self.project_id} if self.project_id else {}
+            return scope, "等待任务推进", f"wait {min(max(seconds, 0.0), MAX_WAIT_S):g}s"
+
         raise ToolError(f"no planner for tool {name!r}")  # pragma: no cover
 
     @staticmethod
@@ -637,6 +697,7 @@ class ToolExecutor:
             "memory.get": self._memory_get,
             "memory.set": self._memory_set,
             "unit.list": self._unit_list,
+            "wait": self._wait,
         }
 
     async def _fs_read(self, args: dict, scope: dict) -> dict:
@@ -826,19 +887,19 @@ class ToolExecutor:
 
     # -- sys-bound tools --------------------------------------------------
     async def _task_update(self, args: dict, scope: dict) -> dict:
-        task_id = _arg_str(args, "task_id", required=True)
+        task_id = self._task_id_arg(args)
         patch = _arg_dict(args, "patch")
         return await call_ok(self.sys, "task.update",
                              {"task_id": task_id, "patch": patch})
 
     async def _task_artifact(self, args: dict, scope: dict) -> dict:
-        task_id = _arg_str(args, "task_id", required=True)
+        task_id = self._task_id_arg(args)
         artifact = _arg_dict(args, "artifact")
         return await call_ok(self.sys, "task.artifact",
                              {"task_id": task_id, "artifact": artifact})
 
     async def _task_note(self, args: dict, scope: dict) -> dict:
-        task_id = _arg_str(args, "task_id", required=True)
+        task_id = self._task_id_arg(args)
         text = _arg_str(args, "text", required=True)
         return await call_ok(self.sys, "task.note",
                              {"task_id": task_id, "text": text,
@@ -964,6 +1025,16 @@ class ToolExecutor:
 
     async def _unit_list(self, args: dict, scope: dict) -> dict:
         return await call_ok(self.sys, "unit.list", {})
+
+    async def _wait(self, args: dict, scope: dict) -> dict:
+        seconds = min(max(_arg_float(args, "seconds", 5.0), 0.0), MAX_WAIT_S)
+        await asyncio.sleep(seconds)
+        out: dict[str, Any] = {"waited_s": seconds}
+        if self.project_id:
+            tasks = await call_ok(self.sys, "task.list",
+                                  {"project_id": self.project_id})
+            out["tasks"] = _board(tasks)
+        return out
 
 
 __all__ = [

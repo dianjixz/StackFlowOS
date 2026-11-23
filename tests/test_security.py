@@ -474,7 +474,7 @@ class ApprovalTests(SecurityTestBase):
         self.assertTrue(self.broker.use(grant.id))
         self.assertIsNotNone(self.policy.get_rule(grant.id))
 
-    def test_decide_always_creates_standing_rule(self):
+    def test_decide_always_creates_exact_standing_rule(self):
         request = self.broker.request(
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make"}, project_id="p-1")
@@ -488,33 +488,84 @@ class ApprovalTests(SecurityTestBase):
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make"}, risk="high").outcome,
             "allow")
-        # "always" generalises to the command family, so a different target
-        # of the same binary does not ask again.
+        # Merged policy: a standing shell grant stays exact per command.
         self.assertEqual(self.policy.evaluate(
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make test"},
-            risk="high").outcome, "allow")
+            risk="high").outcome, "ask")
         self.assertTrue(self.broker.use(rule.id))
         self.assertIsNotNone(self.policy.get_rule(rule.id))
 
-    def test_decide_always_generalises_shell_command_family(self):
-        request = self.broker.request(
-            "agent.coder.1", "shell.exec",
-            {"cwd": str(self.workspace),
-             "command": "sed -n '1p' README.md"}, project_id="p-1")
-        decided = self.broker.decide(request.id, decision="allow",
-                                     mode="always")
-        rule = self.policy.get_rule(decided.grant_id)
-        self.assertIn("command_regex", rule.scope)
-        self.assertNotIn("command", rule.scope)
-        self.assertEqual(self.policy.evaluate(
-            "agent.coder.1", "shell.exec",
-            {"cwd": str(self.workspace), "command": "sed -n '2p' docs/x.md"},
-            risk="high").outcome, "allow")
-        self.assertEqual(self.policy.evaluate(
-            "agent.coder.1", "shell.exec",
-            {"cwd": str(self.workspace), "command": "cat README.md"},
-            risk="high").outcome, "ask")
+    def test_standing_grant_covers_later_requests_by_same_role(self):
+        first = self.broker.request(
+            "agent-coder-1", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "a.py"),
+             "bytes": 10}, project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="session")
+        later = self.broker.request(
+            "agent-coder-7", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "pkg" / "b.py"),
+             "bytes": 999}, project_id="p-1")
+        self.assertEqual(later.status, "approved")
+        other_role = self.broker.request(
+            "agent-reviewer-2", "fs.write",
+            {"project_id": "p-1", "path": str(self.workspace / "b.py"),
+             "bytes": 1}, project_id="p-1")
+        self.assertEqual(other_role.status, "pending")
+        other_project = self.broker.request(
+            "agent-coder-7", "fs.write",
+            {"project_id": "p-2", "path": str(self.workspace / "b.py"),
+             "bytes": 1}, project_id="p-2")
+        self.assertEqual(other_project.status, "pending")
+
+    def test_standing_grant_outside_workspace_stays_exact_path(self):
+        outside = self.workspace.parent / "elsewhere" / "a.txt"
+        first = self.broker.request(
+            "agent-coder-1", "fs.write",
+            {"project_id": "p-1", "path": str(outside), "bytes": 1},
+            project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        sibling = self.broker.request(
+            "agent-coder-2", "fs.write",
+            {"project_id": "p-1", "path": str(outside.parent / "b.txt"),
+             "bytes": 1}, project_id="p-1")
+        self.assertEqual(sibling.status, "pending")
+        same = self.broker.request(
+            "agent-coder-2", "fs.write",
+            {"project_id": "p-1", "path": str(outside), "bytes": 1},
+            project_id="p-1")
+        self.assertEqual(same.status, "approved")
+
+    def test_standing_shell_grant_stays_exact_per_command(self):
+        first = self.broker.request(
+            "agent-coder-1", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q"}, project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        same = self.broker.request(
+            "agent-coder-2", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q"}, project_id="p-1")
+        self.assertEqual(same.status, "approved")
+        different = self.broker.request(
+            "agent-coder-2", "shell.exec",
+            {"project_id": "p-1", "cwd": str(self.workspace),
+             "command": "pytest -q && rm -rf x"}, project_id="p-1")
+        self.assertEqual(different.status, "pending")
+
+    def test_standing_decision_resolves_waiting_siblings(self):
+        scope = {"project_id": "p-1", "path": str(self.workspace / "a.py"),
+                 "bytes": 3}
+        first = self.broker.request("agent-coder-1", "fs.write", scope,
+                                    project_id="p-1")
+        second = self.broker.request("agent-coder-2", "fs.write",
+                                     {**scope, "bytes": 4}, project_id="p-1")
+        unrelated = self.broker.request("agent-architect-1", "fs.write", scope,
+                                        project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="always")
+        self.assertEqual(self.broker.get(second.id).status, "approved")
+        self.assertEqual(self.broker.get(second.id).decided_by, "policy")
+        self.assertEqual(self.broker.get(unrelated.id).status, "pending")
 
     def test_decide_deny(self):
         request = self.broker.request(
@@ -565,9 +616,13 @@ class ApprovalTests(SecurityTestBase):
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make"}, project_id="p-1")
         approved = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "ls"}, project_id="p-1")
+        self.broker.decide(approved.id, decision="allow", mode="once")
+        auto = self.broker.request(
             "agent.coder.1", "fs.read",
             {"path": str(self.workspace / "a.txt")}, project_id="p-1")
-        self.assertEqual(approved.status, "approved")
+        self.assertEqual(auto.status, "approved")
 
         reloaded = ApprovalBroker(
             self.ctx, self.policy, self.log,
@@ -578,6 +633,44 @@ class ApprovalTests(SecurityTestBase):
         self.assertEqual(reloaded.get(approved.id).status, "approved")
         self.assertEqual(len(reloaded.list()), 2)
         self.assertEqual(reloaded.list(status="pending")[0].id, pending.id)
+        # policy-decided requests live in the event log, not approvals.json
+        with self.assertRaises(NotFound):
+            reloaded.get(auto.id)
+
+    def test_one_shot_grant_cannot_be_reused(self):
+        scope = {"cwd": str(self.workspace), "command": "make"}
+        first = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                    project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="once")
+        second = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                     project_id="p-1")
+        third = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                    project_id="p-1")
+        self.assertEqual(second.status, "approved")
+        self.assertEqual(third.status, "pending")
+
+    def test_decide_rejects_expired_request(self):
+        request = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "slow"}, project_id="p-1",
+            ttl_s=1)
+        request.expires_at = now_ms() - 1
+        with self.assertRaises(Conflict):
+            self.broker.decide(request.id, decision="allow", mode="always")
+        self.assertEqual(self.broker.get(request.id).status, "expired")
+        self.assertEqual(self.policy.list_rules(), [])
+
+    def test_auto_decisions_do_not_evict_human_history(self):
+        human = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "h"}, project_id="p-1")
+        self.broker.decide(human.id, decision="deny")
+        for i in range(120):
+            self.broker.request("agent.coder.1", "fs.read",
+                                {"path": str(self.workspace / f"{i}.txt")},
+                                project_id="p-1")
+        self.assertEqual(self.broker.get(human.id).status, "denied")
+        self.assertLessEqual(len(self.broker.list(limit=1000)), 52)
 
     def test_request_validation(self):
         with self.assertRaises(BadRequest):

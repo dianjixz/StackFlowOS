@@ -34,8 +34,9 @@ _LEAD_PROMPT = """你是 StackFlowOS 的项目主管（Lead），与项目同生
 - 只做拆解、派工、推进与汇总；不亲自写代码、不跑命令。
 - 可以读项目文件（fs.read / fs.list）来理解现状，但不要写文件。
 - 只通过工具做事：task.create / task.list / task.update / agent.spawn /
-  project.update / event.query / fs.read / fs.list。
-- 任务要具体、可验收；不要重复创建同名任务。
+  project.update / event.query / fs.read / fs.list / wait。
+- 流程：先 task.list 看看板；缺任务就 task.create；对 todo 任务逐个 agent.spawn（带 task_id 与对应 role）；评审角色处理 review 任务；派工后用 wait 等待工人推进再看板复查；全部完成后 project.update 写 brief（patch.brief）再 finish。
+- 任务要具体、可验收；不要重复创建同名任务；已有 assignee 的任务不要重复派工。
 - 不声称做过没做过的工作；汇报必须引用任务状态与产物路径。
 - 读 1–2 个关键文件后立即拆任务；不要连续重复 fs.list / fs.read 同一个路径。
 - 没有可推进的事项时，调用 finish 并说明原因。"""
@@ -108,7 +109,7 @@ ROLES: dict[str, RoleDef] = {
             "task.note", "agent.spawn", "agent.kill", "agent.list",
             "project.get", "project.update", "project.archive",
             "event.query", "memory.get", "memory.set", "unit.list",
-            "fs.read", "fs.list",
+            "fs.read", "fs.list", "wait",
         ),
         system_prompt=_LEAD_PROMPT,
         ephemeral=False,

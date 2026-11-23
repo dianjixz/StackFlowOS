@@ -24,6 +24,16 @@ from .prompts import SYSTEM_PROMPT_OS, role_prompt, tool_call_protocol
 _log = get_logger("ai.llm")
 
 
+_TRANSIENT_HTTP = ("LLM HTTP 429", "LLM HTTP 500", "LLM HTTP 502",
+                   "LLM HTTP 503", "LLM HTTP 504")
+
+
+def _is_transient(message: str) -> bool:
+    return (message.startswith(_TRANSIENT_HTTP)
+            or message.startswith("LLM connection failed")
+            or message.startswith("LLM request failed"))
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Minimal text-completion interface used by the agents."""
@@ -125,8 +135,9 @@ class OpenAICompatibleProvider:
     name = "openai"
 
     def __init__(self, *, base_url: str, model: str, api_key: str = "",
-                 temperature: float = 0.2, max_tokens: int = 1200,
-                 timeout_s: float = 60.0) -> None:
+                 temperature: float = 0.2, max_tokens: int = 4096,
+                 timeout_s: float = 60.0, retries: int = 2,
+                 retry_backoff_s: float = 0.5) -> None:
         if not base_url:
             raise BadRequest("llm.base_url is required for the openai provider")
         if not model:
@@ -139,6 +150,8 @@ class OpenAICompatibleProvider:
         # own limit. Do not silently rewrite an operator's setting.
         self.max_tokens = max(1, int(max_tokens))
         self.timeout_s = float(timeout_s)
+        self.retries = max(0, int(retries))
+        self.retry_backoff_s = max(0.0, float(retry_backoff_s))
         self._endpoint: str | None = None
 
     async def chat(self, messages: list[dict], *,
@@ -155,7 +168,7 @@ class OpenAICompatibleProvider:
         # `tools` is accepted for interface parity; the JSON action protocol
         # keeps provider-native tool calling out of the critical path.
         _ = tools
-        raw = await asyncio.to_thread(self._post, body)
+        raw = await self._post_with_retry(body)
         try:
             payload = json.loads(raw)
         except ValueError as exc:
@@ -168,6 +181,20 @@ class OpenAICompatibleProvider:
         if not text:
             raise Unavailable("LLM returned an empty message")
         return text
+
+    async def _post_with_retry(self, body: dict) -> str:
+        """POST, retrying transient failures (429/5xx/timeouts/connection)."""
+        for attempt in range(self.retries + 1):
+            try:
+                return await asyncio.to_thread(self._post, body)
+            except Unavailable as exc:
+                if attempt >= self.retries or not _is_transient(str(exc)):
+                    raise
+                delay = self.retry_backoff_s * (2 ** attempt)
+                _log.info("LLM transient error (%s); retry %d/%d in %.1fs",
+                          exc, attempt + 1, self.retries, delay)
+                await asyncio.sleep(delay)
+        raise Unavailable("LLM request failed")  # pragma: no cover
 
     def _candidate_urls(self) -> list[str]:
         """Plausible chat-completion URLs for the configured base URL.
@@ -268,7 +295,7 @@ def make_provider(cfg: Any) -> LLMProvider:
             model=str(getattr(cfg, "model", "") or ""),
             api_key=str(getattr(cfg, "api_key", "") or ""),
             temperature=float(getattr(cfg, "temperature", 0.2)),
-            max_tokens=int(getattr(cfg, "max_tokens", 1200)),
+            max_tokens=int(getattr(cfg, "max_tokens", 4096)),
             timeout_s=float(getattr(cfg, "timeout_s", 60.0)),
         )
     raise BadRequest(f"unsupported llm provider: {provider!r}")
@@ -280,7 +307,9 @@ def make_provider(cfg: Any) -> LLMProvider:
 
 def _first_json_object(text: str) -> dict | None:
     """Return the first complete JSON object embedded in ``text``."""
-    decoder = json.JSONDecoder()
+    # strict=False tolerates raw newlines/tabs inside strings, which models
+    # emit constantly when writing file content.
+    decoder = json.JSONDecoder(strict=False)
     if not isinstance(text, str):
         return None
     for index, char in enumerate(text):
@@ -293,6 +322,28 @@ def _first_json_object(text: str) -> dict | None:
         if isinstance(value, dict):
             return value
     return None
+
+
+def _clip_value(value: Any, limit: int) -> Any:
+    """Recursively shorten long strings so one result cannot flood the context."""
+    if isinstance(value, str):
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"…[已截断，共 {len(value)} 字符]"
+    if isinstance(value, dict):
+        return {key: _clip_value(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clip_value(item, limit) for item in value[:60]]
+    return value
+
+
+def _board_line(view: Any) -> str:
+    tasks = getattr(view, "tasks", []) or []
+    rows = [f"{item.get('id')}|{_compact(str(item.get('title') or ''), 40)}|"
+            f"{item.get('status')}|{item.get('role') or '-'}|"
+            f"{item.get('assignee') or '-'}"
+            for item in tasks[:20] if isinstance(item, dict)]
+    return "\n".join(rows)
 
 
 def _compact_state(view: Any) -> str:
@@ -362,39 +413,121 @@ def _compact_state(view: Any) -> str:
     return json.dumps(state, ensure_ascii=False, indent=2)
 
 
+#: Conversation budget: keep the opening context plus the newest turns.
+MAX_HISTORY_MESSAGES = 40
+MAX_HISTORY_CHARS = 60_000
+RESULT_STR_LIMIT = 6000
+ACTION_STR_LIMIT = 1500
+
+
 class LLMBrain:
-    """Brain that asks an :class:`LLMProvider` for one JSON action per step."""
+    """Brain that asks an :class:`LLMProvider` for one JSON action per step.
+
+    It keeps one conversation per agent run: the opening state, every action
+    the model chose and every tool result (``observe``), so the model can read
+    files, react to errors/denials and build on earlier steps like any
+    ordinary tool-using agent.
+    """
 
     def __init__(self, provider: LLMProvider, role: str, *,
                  max_steps: int = 16) -> None:
         self.provider = provider
         self.role = str(role)
         self.max_steps = int(max_steps)
+        self._history: list[dict] = []
+        self._pending: Any = None
+        self._board_sig = ""
+        self._dropped = 0
 
     async def chat(self, messages: list[dict]) -> str:
         """Delegate a plain chat turn to the provider."""
         return await self.provider.chat(messages)
+
+    # -- conversation memory ---------------------------------------------
+    def _system(self) -> str:
+        return "\n\n".join((SYSTEM_PROMPT_OS, role_prompt(self.role),
+                             tool_call_protocol(self.role)))
+
+    def observe(self, action: Any, result: Any) -> None:
+        """Record the tool result for the action returned by ``next_action``."""
+        payload: dict[str, Any] = {"tool": getattr(action, "tool", None),
+                                   "ok": bool(getattr(result, "ok", False))}
+        error = getattr(result, "error", None)
+        if error:
+            payload["error"] = _compact(str(error), 800)
+            if str(error).startswith("DENIED"):
+                payload["hint"] = "该操作被人工/策略拒绝，请换一种方式或 finish(blocked)。"
+        data = getattr(result, "data", None)
+        if data:
+            payload["data"] = _clip_value(data, RESULT_STR_LIMIT)
+        text = json.dumps(payload, ensure_ascii=False)
+        if len(text) > 12_000:
+            text = text[:12_000] + "…[结果已截断]"
+        self._history.append({"role": "user", "content": f"工具结果：{text}"})
+        self._pending = None
+
+    def _remember_action(self, action: Any, reply: str) -> None:
+        if getattr(action, "tool", None):
+            record = {"tool": action.tool,
+                      "args": _clip_value(dict(action.args or {}),
+                                          ACTION_STR_LIMIT)}
+            if getattr(action, "say", ""):
+                record["say"] = action.say
+            content = json.dumps(record, ensure_ascii=False)
+        else:
+            content = _compact(reply, 600)
+        self._history.append({"role": "assistant", "content": content})
+
+    def _trim(self) -> None:
+        """Drop the oldest assistant/user pairs (index 0 holds the opening)."""
+        def size() -> int:
+            return sum(len(item["content"]) for item in self._history)
+        while len(self._history) > 3 and (
+                len(self._history) > MAX_HISTORY_MESSAGES
+                or size() > MAX_HISTORY_CHARS):
+            del self._history[1:3]
+            self._dropped += 1
+
+    def _step_hint(self, view: Any) -> str:
+        step = getattr(view, "step", 0)
+        hint = f"步数：{step}/{self.max_steps}。"
+        if self.max_steps and step >= self.max_steps - 2:
+            hint += "步数即将用尽，请尽快 finish 并如实汇报进度。"
+        if self._dropped:
+            hint += f"（较早的 {self._dropped} 轮对话已省略。）"
+        return hint
 
     async def next_action(self, view: Any) -> Any:
         """Ask the model for one action, retrying malformed replies twice."""
         from ..agents.brain import Action
         from ..agents.tools import TOOLS, tools_for
 
-        system = "\n\n".join((SYSTEM_PROMPT_OS, role_prompt(self.role),
-                              tool_call_protocol()))
-        user = (
-            f"当前状态（JSON）：\n{_compact_state(view)}\n\n"
-            f"步数：{getattr(view, 'step', 0)}/{self.max_steps}。"
-            "请给出下一步：调用一个工具，或 finish。只输出一个 JSON 对象。")
-        messages: list[dict] = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        tools = [
-            {"name": spec.name, "description": spec.description,
-             "capability": spec.capability, "args": spec.args}
-            for spec in tools_for(self.role)
-        ]
+        specs = tools_for(self.role)
+        allowed = {spec.name for spec in specs} or set(TOOLS)
+        if not self._history:
+            self._history.append({"role": "user", "content": (
+                f"当前状态（JSON）：\n{_compact_state(view)}\n\n"
+                f"{self._step_hint(view)}请给出下一步：调用一个工具，或 finish。"
+                "只输出一个 JSON 对象。")})
+        else:
+            board = _board_line(view)
+            tail = [self._step_hint(view)]
+            if board and board != self._board_sig:
+                tail.append("当前任务看板（id|标题|状态|角色|负责人）：\n" + board)
+            self._board_sig = board
+            tail.append("请给出下一步（只输出一个 JSON 对象）。")
+            if self._history[-1]["role"] == "user":
+                self._history[-1]["content"] += "\n\n" + "\n".join(tail)
+            else:
+                self._history.append({"role": "user",
+                                      "content": "\n".join(tail)})
+        self._trim()
+
+        tools = [{"name": spec.name, "description": spec.description,
+                  "capability": spec.capability, "args": spec.args}
+                 for spec in specs]
+        messages: list[dict] = ([{"role": "system", "content": self._system()}]
+                                + [dict(item) for item in self._history])
         last_error = ""
         for _attempt in range(3):
             try:
@@ -409,8 +542,10 @@ class LLMBrain:
                     "summary": f"LLM 调用失败：{type(exc).__name__}",
                     "status": "failed"})
             payload = _first_json_object(reply)
-            action, error = self._parse(payload, TOOLS)
+            action, error = self._parse(payload, allowed)
             if action is not None:
+                self._remember_action(action, reply)
+                self._pending = action
                 return action
             last_error = error
             messages.append({"role": "assistant", "content": _compact(reply, 500)})
@@ -422,7 +557,7 @@ class LLMBrain:
             "status": "failed"})
 
     @staticmethod
-    def _parse(payload: dict | None, tools: dict) -> tuple[Any, str]:
+    def _parse(payload: dict | None, tools: Any) -> tuple[Any, str]:
         from ..agents.brain import Action
 
         if payload is None:
@@ -430,8 +565,10 @@ class LLMBrain:
         if "tool" in payload:
             tool = payload.get("tool")
             if not isinstance(tool, str) or tool not in tools:
-                return None, f"未知工具 {tool!r}"
+                return None, f"未知工具 {tool!r}（可用：{sorted(tools)}）"
             args = payload.get("args", {})
+            if args is None:
+                args = {}
             if not isinstance(args, dict):
                 return None, "args 必须是对象"
             say = payload.get("say")

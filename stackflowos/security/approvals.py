@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import threading
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -28,10 +27,30 @@ from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
 from ..util.jsonio import read_json, write_json
 from .capabilities import risk_of
-from .policy import PolicyEngine
+from .policy import Decision, PolicyEngine
 
 _MODE_CHOICES = ("once", "session", "always")
+#: Destructive/targeted capabilities keep their exact scope in standing grants.
+_EXACT_SCOPE_CAPS = frozenset({"fs.delete", "project.delete", "project.archive",
+                               "agent.kill", "sys.config", "unit.control"})
+_AGENT_ID = re.compile(r"^(agent([-.])[a-z_]+)\2\d+$")
+
+
+def _generalise_principal(principal: str) -> str:
+    """``agent-coder-3`` -> ``agent-coder-*`` (any worker of the same role)."""
+    match = _AGENT_ID.match(str(principal))
+    return f"{match.group(1)}{match.group(2)}*" if match else str(principal)
+
+
+def _host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
 _DECISION_CHOICES = ("allow", "deny")
+_KEEP_DECIDED = 200
+_KEEP_AUTO_DECIDED = 50
 
 
 @dataclass
@@ -118,13 +137,17 @@ class ApprovalBroker:
             task_id=task_id,
             created_at=now,
         )
+        if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
+            # A one-shot grant lost the race (or was already spent): a human
+            # has to decide again instead of reusing it.
+            decision = Decision("ask", risk, "one-shot grant already spent")
         if decision.outcome == "deny":
             request.status = "denied"
             request.mode = "auto"
             request.decided_at = now
             request.decided_by = "policy"
             request.note = decision.reason
-            self._store(request)
+            self._store(request, persist=False)
             self._emit("approval.auto", request, decision="deny",
                        rule_id=decision.rule.id if decision.rule else None,
                        policy_reason=decision.reason)
@@ -138,7 +161,7 @@ class ApprovalBroker:
             request.decided_at = now
             request.decided_by = "policy"
             request.note = decision.reason
-            self._store(request)
+            self._store(request, persist=False)
             self._emit("approval.auto", request, decision="allow",
                        rule_id=request.grant_id, mode=request.mode,
                        policy_reason=decision.reason)
@@ -183,59 +206,43 @@ class ApprovalBroker:
         if decision == "allow" and mode not in _MODE_CHOICES:
             raise BadRequest(f"mode must be one of {list(_MODE_CHOICES)}")
         now = _now_ms()
+        expired = False
         with self._lock:
             request = self.get(request_id)
             if request.status != "pending":
                 raise Conflict(
                     f"approval {request_id!r} is already {request.status!r}",
                     detail={"request_id": request_id, "status": request.status})
-        if decision == "deny":
-            request.status = "denied"
-            request.mode = None
-        else:
-            request.status = "approved"
-            request.mode = mode
-            grant = self._materialise_grant(request, mode, by, now)
-            request.grant_id = grant.id
-        request.decided_at = now
-        request.decided_by = str(by or "operator")
-        request.note = str(note or request.note or "")
-        request.expires_at = request.expires_at or now
-        with self._lock:
+            if request.expires_at and now >= request.expires_at:
+                request.status = "expired"
+                request.decided_at = now
+                request.note = request.note or "expired"
+                expired = True
+            elif decision == "deny":
+                request.status = "denied"
+                request.mode = None
+            else:
+                grant = self._materialise_grant(request, mode, by, now)
+                request.status = "approved"
+                request.mode = mode
+                request.grant_id = grant.id
+            if not expired:
+                request.decided_at = now
+                request.decided_by = str(by or "operator")
+                request.note = str(note or request.note or "")
+                request.expires_at = request.expires_at or now
             self._requests[request.id] = request
         self.save()
+        if expired:
+            self._emit("approval.expired", request)
+            raise Conflict(f"approval {request_id!r} has expired",
+                           detail={"request_id": request_id, "status": "expired"})
         self._emit("approval.decided", request, decision=decision,
                    mode=request.mode, by=request.decided_by,
                    grant_id=request.grant_id)
+        if decision == "allow" and mode != "once":
+            self.resolve_pending()
         return request
-
-    def _always_scope(self, request: ApprovalRequest) -> dict:
-        """Generalise a shell ``always`` decision to a command family.
-
-        Approving ``sed -n '1p' file`` with mode=always used to create an
-        exact-command rule, so the next ``sed -n '2p' other`` asked again.
-        Generalise to the first executable token inside the same project/cwd.
-        Other capabilities keep their exact scope (a file grant is a file grant).
-        """
-        scope = dict(request.scope or {})
-        if request.capability != "shell.exec":
-            return scope
-        command = str(scope.get("command") or "").strip()
-        if not command:
-            return scope
-        try:
-            parts = shlex.split(command)
-        except ValueError:
-            parts = command.split()
-        token = next((part for part in parts if "=" not in part and part), "")
-        if not token:
-            return scope
-        general: dict = {}
-        if scope.get("cwd"):
-            general["path_prefix"] = str(scope["cwd"])
-        general["command_regex"] = (
-            rf"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*{re.escape(token)}(?:\s|$)")
-        return general
 
     def _materialise_grant(self, request: ApprovalRequest, mode: str,
                            by: str, now: int) -> Any:
@@ -248,10 +255,15 @@ class ApprovalBroker:
                 uses_left=1,
                 note=f"approval {request.id} (once)",
                 created_by=by, source="grant")
+        # Workers are ephemeral and their paths/commands vary, so a standing
+        # grant is widened to "the same kind of action by the same role";
+        # an exact copy of the request would never match again.
+        principal = _generalise_principal(request.principal)
+        scope = self._generalise_scope(request)
         if mode == "session":
             return self.policy.add_rule(
                 effect="allow", capability=request.capability,
-                principal=request.principal, scope=request.scope,
+                principal=principal, scope=scope,
                 risk_max=request.risk,
                 expires_at=now + self.grant_ttl_s * 1000,
                 uses_left=None,
@@ -259,15 +271,100 @@ class ApprovalBroker:
                 created_by=by, source="grant")
         return self.policy.add_rule(
             effect="allow", capability=request.capability,
-            principal=request.principal,
-            scope=(self._always_scope(request) if mode == "always"
-                   else request.scope),
+            principal=principal, scope=scope,
             risk_max=request.risk,
             expires_at=None, uses_left=None,
-            note=(f"approval {request.id} (always, command family)"
-                  if request.capability == "shell.exec"
-                  else f"approval {request.id} (always)"),
+            note=f"approval {request.id} (always)",
             created_by=by, source="rule")
+
+    def _generalise_scope(self, request: ApprovalRequest) -> dict:
+        """Rule scope pattern covering requests like ``request``."""
+        scope = dict(request.scope or {})
+        capability = request.capability
+        if capability in _EXACT_SCOPE_CAPS:
+            return scope
+        project_id = scope.get("project_id")
+        pattern: dict[str, Any] = {}
+        if project_id:
+            pattern["project_id"] = project_id
+        if capability in ("fs.read", "fs.list", "fs.write"):
+            raw = scope.get("path") or scope.get("cwd")
+            if raw:
+                root = self._workspace_root(raw, project_id)
+                if root:
+                    pattern["path_prefix"] = root
+                else:
+                    # Never widen beyond the workspace: approving one outside
+                    # file must not open its whole directory.
+                    pattern["path"] = raw
+            return pattern
+        if capability == "shell.exec":
+            if scope.get("command") is not None:
+                pattern["command"] = scope["command"]
+            return pattern
+        if capability == "net.fetch":
+            host = _host_of(str(scope.get("url") or ""))
+            if host:
+                return {"domain": host}
+            return scope
+        return pattern
+
+    def _workspace_root(self, raw: Any, project_id: str | None) -> str | None:
+        """The project workspace when ``raw`` is inside it, else ``None``."""
+        projects_root = getattr(self.policy, "projects_root", None)
+        if not (project_id and projects_root):
+            return None
+        workspace = Path(projects_root) / str(project_id) / "workspace"
+        try:
+            Path(str(raw)).resolve().relative_to(workspace.resolve())
+        except (ValueError, OSError):
+            return None
+        return str(workspace)
+
+    def resolve_pending(self, *, by: str = "policy") -> list[ApprovalRequest]:
+        """Approve/deny parked requests that current rules now decide.
+
+        Called after a rule is created so already-waiting requests (several
+        workers often ask for the same thing) do not each need a click.
+        """
+        now = _now_ms()
+        resolved: list[ApprovalRequest] = []
+        with self._lock:
+            pending = [r for r in self._requests.values()
+                       if r.status == "pending"]
+        for request in pending:
+            try:
+                decision = self.policy.evaluate(
+                    request.principal, request.capability, request.scope,
+                    risk=request.risk, now_ms=now)
+            except Exception:  # noqa: BLE001 - stale request must not block others
+                continue
+            if decision.outcome not in ("allow", "deny"):
+                continue
+            with self._lock:
+                if request.status != "pending":
+                    continue
+                if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
+                    continue
+                rule = decision.rule
+                if decision.outcome == "allow":
+                    request.status = "approved"
+                    request.mode = ("rule" if rule is not None
+                                    and rule.source == "rule" else "grant")
+                    request.grant_id = rule.id if rule is not None else None
+                else:
+                    request.status = "denied"
+                    request.mode = "auto"
+                request.decided_at = now
+                request.decided_by = by
+                request.note = decision.reason
+            resolved.append(request)
+            self._emit("approval.auto", request, decision=decision.outcome,
+                       rule_id=request.grant_id, mode=request.mode,
+                       policy_reason=decision.reason)
+        if resolved:
+            self.save()
+        return resolved
 
     # -- usage / expiry ---------------------------------------------------
     def poll(self, request_id: str) -> ApprovalRequest:
@@ -322,12 +419,13 @@ class ApprovalBroker:
             pending = [request for request in self._requests.values()
                        if request.status == "pending"]
             decided = [request for request in self._requests.values()
-                       if request.status != "pending"]
+                       if request.status != "pending"
+                       and request.decided_by != "policy"]
         decided.sort(key=lambda request: (request.decided_at or request.created_at,
                                           request.id))
         payload = {
             "version": 1,
-            "requests": [request.to_dict() for request in pending + decided[-200:]],
+            "requests": [request.to_dict() for request in pending + decided[-_KEEP_DECIDED:]],
         }
         write_json(self.approvals_path, payload)
 
@@ -355,10 +453,33 @@ class ApprovalBroker:
             self._requests = requests
 
     # -- internals --------------------------------------------------------
-    def _store(self, request: ApprovalRequest) -> None:
+    def _store(self, request: ApprovalRequest, *, persist: bool = True) -> None:
         with self._lock:
             self._requests[request.id] = request
-        self.save()
+            self._prune()
+        if persist:
+            self.save()
+
+    def _prune(self) -> None:
+        """Bound memory: policy-decided requests are only audit noise (the
+        event log keeps them), so they never push human decisions out."""
+        decided = sorted(
+            (r for r in self._requests.values() if r.status != "pending"),
+            key=lambda r: (r.decided_at or r.created_at, r.id))
+        human = [r for r in decided if r.decided_by != "policy"]
+        auto = [r for r in decided if r.decided_by == "policy"]
+        drop = human[:-_KEEP_DECIDED] + auto[:-_KEEP_AUTO_DECIDED]
+        for request in drop:
+            self._requests.pop(request.id, None)
+
+    def _spend_one_shot(self, rule: Any) -> bool:
+        """Consume a one-shot grant when ``rule`` is one; standing rules pass."""
+        if rule is None or rule.uses_left is None:
+            return True
+        if not self.policy.consume(rule.id):
+            return False
+        self._emit_grant_used(rule.id, rule)
+        return True
 
     def _risk_for(self, capability: str, scope: dict,
                   project_id: str | None) -> str:

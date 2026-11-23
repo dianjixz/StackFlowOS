@@ -13,6 +13,7 @@ failed and blocks the task, but never crashes the worker.  It also exposes
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,14 @@ from typing import Any
 from ..errors import BadRequest, Conflict, NotFound, SfoError, ValidationError
 from ..util.logging import get_logger
 from .api import call_ok, emit_event
-from .brain import AgentView, Brain
+from .brain import Action, AgentView, Brain
 from .models import Agent, now_ms
-from .tools import ToolExecutor, ToolResult
+from .tools import TOOLS, ToolExecutor, ToolResult, tools_for
+
+#: Loop guards: give up instead of burning steps on a hopeless agent.
+MAX_FAIL_STREAK = 6
+MAX_REPEAT_FAILURES = 3
+MAX_REPEAT_DENIED = 2
 
 #: Terminal run statuses returned to the worker glue.
 TERMINAL_RUN_STATUSES = ("done", "failed", "blocked", "killed", "paused")
@@ -100,6 +106,9 @@ class AgentRunner:
         self._last_seq = 0
         self._events: list[dict] = []
         self._tool_results: list[dict] = []
+        self._fail_streak = 0
+        self._repeat_key: tuple | None = None
+        self._repeat_count = 0
 
     # -- control flags (unit.pause / unit.kill) --------------------------
     def pause(self) -> None:
@@ -159,8 +168,7 @@ class AgentRunner:
                 if not action.tool:
                     return await self._finish("大脑未给出工具调用或结束动作。",
                                               "failed", self._steps)
-                result = await self.executor.run(action.tool,
-                                                 dict(action.args or {}))
+                result = await self._execute(action)
                 self._steps += 1
                 self._bump_stats(result)
                 # The LLM needs the *content* of fs.read/shell output, not
@@ -186,6 +194,10 @@ class AgentRunner:
                 if not result.ok:
                     self.log.info("tool %s failed for %s: %s", action.tool,
                                   self.agent.id, result.error)
+                await self._observe(action, result)
+                stuck = self._track_failure(action, result)
+                if stuck:
+                    return await self._finish(stuck, "blocked", self._steps)
                 if action.say:
                     await self._emit("agent.step", {
                         "agent_id": self.agent.id,
@@ -200,6 +212,58 @@ class AgentRunner:
             except Exception:  # pragma: no cover - sys unreachable
                 self.log.exception("cannot report failure for %s", self.agent.id)
                 return RunResult(summary, "failed", self._steps)
+
+    # -- tool execution helpers --------------------------------------------
+    async def _execute(self, action: Action) -> ToolResult:
+        """Run one tool call; role-forbidden calls become failed results."""
+        tool = str(action.tool)
+        allowed = {spec.name for spec in tools_for(self.agent.role)}
+        if allowed and tool in TOOLS and tool not in allowed:
+            return ToolResult(
+                ok=False,
+                error=(f"tool {tool!r} is not available to role "
+                       f"{self.agent.role!r}; available: {sorted(allowed)}"))
+        return await self.executor.run(tool, dict(action.args or {}))
+
+    async def _observe(self, action: Action, result: ToolResult) -> None:
+        """Feed the tool outcome back to brains that keep a conversation."""
+        observe = getattr(self.brain, "observe", None)
+        if observe is None:
+            return
+        try:
+            outcome = observe(action, result)
+            if hasattr(outcome, "__await__"):
+                await outcome
+        except Exception:  # noqa: BLE001 - memory failure must not kill the agent
+            self.log.exception("brain.observe failed for %s", self.agent.id)
+
+    def _track_failure(self, action: Action, result: ToolResult) -> str:
+        """Return a stop reason when the agent is looping on failures."""
+        if result.ok:
+            self._fail_streak = 0
+            self._repeat_key = None
+            self._repeat_count = 0
+            return ""
+        self._fail_streak += 1
+        try:
+            key = (action.tool, json.dumps(action.args or {}, sort_keys=True,
+                                           default=str))
+        except Exception:  # pragma: no cover - unserialisable args
+            key = (action.tool, repr(action.args))
+        if key == self._repeat_key:
+            self._repeat_count += 1
+        else:
+            self._repeat_key, self._repeat_count = key, 1
+        denied = str(result.error or "").startswith("DENIED")
+        if denied and self._repeat_count >= MAX_REPEAT_DENIED:
+            return (f"工具 {action.tool} 被拒绝 {self._repeat_count} 次，停止重试："
+                    f"{result.error}")
+        if self._repeat_count >= MAX_REPEAT_FAILURES:
+            return (f"同一调用 {action.tool} 连续失败 {self._repeat_count} 次，"
+                    f"停止：{result.error}")
+        if self._fail_streak >= MAX_FAIL_STREAK:
+            return f"连续 {self._fail_streak} 次工具调用失败，停止：{result.error}"
+        return ""
 
     # -- lifecycle helpers ------------------------------------------------
     async def _claim(self) -> RunResult | None:
