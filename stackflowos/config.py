@@ -61,6 +61,8 @@ class WebCfg:
     port: int = 17800
     open_browser: bool = False
     sse_heartbeat_s: float = 15.0
+    #: Bound on concurrent SSE streams; protects fds/memory (H2).
+    sse_max_clients: int = 32
     # Extra exact ``host[:port]`` authorities accepted in the Host header when
     # the console is bound to a non-loopback interface (H1 admission).
     trusted_hosts: list[str] = field(default_factory=list)
@@ -234,6 +236,10 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("web.port out of range")
         if not (1 <= section.cookie_ttl_days <= 365):
             raise ConfigError("web.cookie_ttl_days out of range (1..365)")
+        if not (1 <= section.sse_heartbeat_s <= 300):
+            raise ConfigError("web.sse_heartbeat_s out of range (1..300)")
+        if not (1 <= section.sse_max_clients <= 256):
+            raise ConfigError("web.sse_max_clients out of range (1..256)")
         if any(not item.strip() for item in section.trusted_hosts):
             raise ConfigError("web.trusted_hosts entries must be non-empty strings")
     elif name == "security":

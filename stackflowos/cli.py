@@ -193,6 +193,8 @@ def _web_server(app, cfg):
         port=cfg.web.port,
         trusted_hosts=tuple(cfg.web.trusted_hosts),
         cookie_ttl_days=cfg.web.cookie_ttl_days,
+        sse_heartbeat_s=cfg.web.sse_heartbeat_s,
+        sse_max_clients=cfg.web.sse_max_clients,
         launch_token=os.environ.get("SFO_WEB_TOKEN") or None,
     )
 

@@ -15,21 +15,31 @@ the console's security headers.  Only CSS/JS/images/favicon are anonymous.
 from __future__ import annotations
 
 import asyncio
+import math
 import mimetypes
 import posixpath
+import re
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from ..errors import SfoError
+from ..errors import BadRequest, SfoError, Unavailable
 from ..protocol import dumps
 from ..util.logging import get_logger
 from .auth import WebAuth, security_headers
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
 MAX_BODY = 1024 * 1024
-HEARTBEAT_S = 15.0
+DEFAULT_SSE_HEARTBEAT_S = 15.0
+DEFAULT_SSE_MAX_CLIENTS = 32
+DEFAULT_SSE_LIMIT = 200
+MAX_SSE_LIMIT = 1000
+MIN_SSE_HEARTBEAT_S = 1.0
+MAX_SSE_HEARTBEAT_S = 300.0
+
+_INT_PARAM = re.compile(r"^[+-]?\d+$")
+_FLOAT_PARAM = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 
 _EXTRA_TYPES = {
     ".js": "text/javascript; charset=utf-8",
@@ -47,7 +57,9 @@ class WebServer:
                  trusted_hosts: tuple[str, ...] = (),
                  cookie_ttl_days: int = 7,
                  secure: bool = False,
-                 launch_token: str | None = None) -> None:
+                 launch_token: str | None = None,
+                 sse_heartbeat_s: float = DEFAULT_SSE_HEARTBEAT_S,
+                 sse_max_clients: int = DEFAULT_SSE_MAX_CLIENTS) -> None:
         self.app = app
         self.host = host
         self.port = port
@@ -55,6 +67,11 @@ class WebServer:
         self.log = logger or get_logger("web")
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[asyncio.Task] = set()
+        # SSE defaults come from ``config.web``; the request may override
+        # ``heartbeat``/``since``/``limit`` within their validated ranges.
+        self.sse_heartbeat_s = float(sse_heartbeat_s)
+        self.sse_max_clients = int(sse_max_clients)
+        self._sse_clients = 0
         # Browser admission: token -> HMAC cookie, Host/Origin/CSRF checks.
         # Both secrets are per-process and memory-only.
         self.auth = WebAuth(host=host, port=port,
@@ -278,7 +295,29 @@ class WebServer:
         await writer.drain()
 
     async def _serve_sse(self, writer: asyncio.StreamWriter, query: dict) -> None:
+        """Open an authenticated event stream.
+
+        Every query parameter is validated *before* the 200 response and
+        before subscribing: a rejected request must neither look like a live
+        stream nor leave a queue behind.  The response deliberately carries no
+        ``Access-Control-*`` headers (H2): the console is same-origin only.
+        """
+        try:
+            heartbeat = _parse_heartbeat(query.get("heartbeat"), self.sse_heartbeat_s)
+            since = _parse_int_param("since", query.get("since"),
+                                     default=0, minimum=0)
+            limit = _parse_int_param("limit", query.get("limit"),
+                                     default=DEFAULT_SSE_LIMIT,
+                                     minimum=1, maximum=MAX_SSE_LIMIT)
+            if self._sse_clients >= self.sse_max_clients:
+                raise Unavailable("too many concurrent event stream clients")
+        except SfoError as exc:
+            await self._send_json(writer, exc.http_status, {
+                "ok": False, "error": exc.to_dict(),
+            })
+            return
         queue = self.app.eventlog.subscribe()
+        self._sse_clients += 1
         try:
             header = (
                 "HTTP/1.1 200 OK\r\n"
@@ -286,25 +325,17 @@ class WebServer:
                 + security_headers(cache="no-cache, no-store")
                 + "Connection: close\r\n"
                 "X-Accel-Buffering: no\r\n"
-                # NOTE: removed by H2, intentionally kept in H1.
-                "Access-Control-Allow-Origin: *\r\n"
                 "\r\n"
             ).encode("latin-1")
             writer.write(header)
             writer.write(b"retry: 2000\n\n")
-            since = 0
-            try:
-                since = int(query.get("since") or 0)
-            except ValueError:
-                since = 0
             if since > 0:
-                for record in self.app.eventlog.since(since, limit=500):
-                    writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
+                backlog = self.app.eventlog.since(since, limit=limit)
             else:
-                for record in self.app.eventlog.tail(30):
-                    writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
+                backlog = self.app.eventlog.tail(limit)
+            for record in backlog:
+                writer.write(b"data: " + dumps(record.to_dict()).encode("utf-8") + b"\n\n")
             await writer.drain()
-            heartbeat = float(query.get("heartbeat") or HEARTBEAT_S)
             while True:
                 try:
                     record = await asyncio.wait_for(queue.get(), timeout=heartbeat)
@@ -319,10 +350,47 @@ class WebServer:
         except Exception:
             self.log.debug("sse stream ended", exc_info=True)
         finally:
+            self._sse_clients -= 1
             try:
                 self.app.eventlog.unsubscribe(queue)
             except Exception:
                 pass
+
+
+def _parse_heartbeat(raw: str | None, default: float) -> float:
+    """Strictly parse ``?heartbeat=``; ``None`` means "use the config value"."""
+    if raw is None:
+        return float(default)
+    text = raw.strip()
+    if not _FLOAT_PARAM.match(text):
+        raise BadRequest("heartbeat must be a number")
+    try:
+        value = float(text)
+    except (TypeError, ValueError):  # pragma: no cover - guarded by the regex
+        raise BadRequest("heartbeat must be a number") from None
+    if not math.isfinite(value) or not (
+            MIN_SSE_HEARTBEAT_S <= value <= MAX_SSE_HEARTBEAT_S):
+        raise BadRequest("heartbeat must be a finite number in [1, 300]")
+    return value
+
+
+def _parse_int_param(name: str, raw: str | None, *, default: int,
+                     minimum: int, maximum: int | None = None) -> int:
+    """Strictly parse one integer query parameter inside its allowed range."""
+    if raw is None:
+        return default
+    text = raw.strip()
+    if not _INT_PARAM.match(text):
+        raise BadRequest(f"{name} must be an integer")
+    try:
+        value = int(text, 10)
+    except ValueError:  # pragma: no cover - guarded by the regex
+        raise BadRequest(f"{name} must be an integer") from None
+    if value < minimum or (maximum is not None and value > maximum):
+        if maximum is None:
+            raise BadRequest(f"{name} must be >= {minimum}")
+        raise BadRequest(f"{name} must be in [{minimum}, {maximum}]")
+    return value
 
 
 def _display_host(host: str) -> str:
