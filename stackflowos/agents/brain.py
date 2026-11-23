@@ -149,6 +149,15 @@ class MockBrain:
         self._last_error = ""
         self._compile_pending = False
         self._coder_blocked = ""
+        # S5: an ``fs.read`` issued by the reviewer is settled on the next
+        # step.  A failed read rejects the review instead of being judged
+        # "pass"; the pending flag keeps the decision deterministic and stops
+        # the artifact from being read twice.
+        self._review_read_pending = False
+        self._review_read_failed = False
+        self._review_read_error = ""
+        self._review_rejected = False
+        self._review_done_pending = False
 
     # -- entry ------------------------------------------------------------
     async def next_action(self, view: AgentView) -> Action:
@@ -411,10 +420,20 @@ class MockBrain:
         title = _task_title(task)
         artifacts = _artifacts(task)
         artifact_path = str(artifacts[0].get("path") or "") if artifacts else ""
+        # S5: settle the artifact read issued on the previous step before any
+        # verdict, so a failed read cannot be judged "pass".
+        settled = self._settle_artifact_read(tid)
+        if settled is not None:
+            return settled
+        if self._review_read_failed:
+            return self._reject_artifact_read(tid)
         if step == 0:
             return _call("fs.list", path=".")
         if step == 1:
             if artifact_path:
+                # The outcome is inspected on the next call by
+                # ``_settle_artifact_read``; the read is issued only once.
+                self._review_read_pending = True
                 return _call("fs.read", path=artifact_path)
             siblings = [item for item in (view.tasks or [])
                         if _task_id(item) and _task_id(item) != tid]
@@ -451,11 +470,55 @@ class MockBrain:
                 "type": "file", "path": self._artifact_path,
                 "title": f"{title} 评审记录"})
         if step == 4:
+            if self._missing_artifacts:
+                return _call("task.update", task_id=tid,
+                             patch={"status": "todo"})
+            if _task_status(task) in ("todo", "doing"):
+                # The planned "评审" task is claimed from todo, so a direct
+                # doing -> done transition is illegal: close it via review.
+                self._review_done_pending = True
+                return _call("task.update", task_id=tid,
+                             patch={"status": "review"})
             return _call("task.update", task_id=tid,
-                         patch={"status": "todo" if self._missing_artifacts else "done"})
+                         patch={"status": "done"})
+        if self._review_done_pending:
+            self._review_done_pending = False
+            return _call("task.update", task_id=tid, patch={"status": "done"})
         if self._missing_artifacts:
             return _finish(f"任务 {tid} 产物缺失，已退回 todo。", "blocked")
         return _finish(f"任务 {tid} 评审通过，已置为 done。")
+
+    def _settle_artifact_read(self, tid: str) -> Action | None:
+        """Settle the reviewer's pending ``fs.read`` before it judges anything.
+
+        Returns the rejection ``task.note`` when the read failed (or was never
+        executed), and ``None`` when no read is pending or it succeeded.
+        Clearing the pending flag here makes the decision deterministic and
+        guarantees the artifact is never read twice.
+        """
+        if not self._review_read_pending:
+            return None
+        self._review_read_pending = False
+        if self._last_tool == "fs.read" and self._last_ok:
+            return None
+        if self._last_tool == "fs.read":
+            reason = self._last_error or "读取失败"
+        else:
+            reason = "读取命令未执行"
+        self._review_read_failed = True
+        self._review_read_error = reason
+        # Keep the existing "打回" verdict machinery truthful as well.
+        self._missing_artifacts = True
+        return _call("task.note", task_id=tid,
+                     text=f"读取产物失败：{reason}")
+
+    def _reject_artifact_read(self, tid: str) -> Action:
+        """Return a task whose artifact could not be read: ``todo``, then stop."""
+        if not self._review_rejected:
+            self._review_rejected = True
+            return _call("task.update", task_id=tid, patch={"status": "todo"})
+        return _finish(f"任务 {tid} 读取产物失败：{self._review_read_error}；"
+                       "已退回 todo。", "blocked")
 
     def _researcher(self, view: AgentView, step: int) -> Action:
         task, stop = self._require_task(view)

@@ -735,8 +735,11 @@ tests/
 6. **演示规则**：`demo` 只是替操作员预置一组项目范围内的 allow 规则
    （fs.read/list/write、无害 shell、agent.spawn、project.update、data.*），
    不是绕过审批；项目外写入仍是 pending，等待人工。
-7. **MockBrain 是开环的**：它按角色/步数决定动作，不解析工具返回值（避免把
-   演示写成假智能）。真实模型用 `LLMBrain`，动作协议是 JSON tool call。
+7. **MockBrain 是开环规划的，但失败会终止/打回，不伪装成功**：它按角色/步数
+   决定动作，不解析工具返回值来做“自由决策”（避免把演示写成假智能）。S4/S5
+   之后，coder 的自检（`shell.exec`）失败会终止任务，reviewer 读取产物
+   （`fs.read`）失败会写失败备注并把任务退回 `todo`、以 blocked 结束，
+   不会把失败判成“通过”。真实模型用 `LLMBrain`，动作协议是 JSON tool call。
 8. **Chat 助手**：`mock` provider 下是确定性意图（状态/建项目/审批/帮助）；
    `openai` provider 下把实时状态放进 system prompt，工具调用仍走审批口。
 9. **Web**：SSE 断线按 `since` 续传；静态页支持 `?no-sse=1` 快照模式（截图/测试用）。

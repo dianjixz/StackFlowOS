@@ -1,10 +1,11 @@
-"""S4: MockBrain must stop the coder when its self-check fails.
+"""S4/S5: MockBrain must fail closed when a tool outcome says it failed.
 
-The runner executes one action at a time and reports the outcome through
-``brain.observe``.  The coder keeps its deterministic, plan-driven design but
-uses that outcome to decide whether a pending ``shell.exec`` self-check passed;
-a failure terminates the task as ``blocked`` instead of registering a bad
-artifact and moving it to review.
+S4: the coder stops when its ``shell.exec`` self-check fails instead of
+registering a bad artifact and moving the task to review.
+S5: the reviewer settles its ``fs.read`` on the next step; a failed read
+writes a failure note and returns the task to ``todo`` (blocked) instead of
+writing a "pass" verdict.  Successful reads and project-level reviews keep
+their existing behaviour.
 """
 
 from __future__ import annotations
@@ -44,7 +45,8 @@ def _view(step: int, task: dict, *, tasks: list[dict] | None = None,
 
 
 async def _drive(brain: MockBrain, task: dict, outcomes: list[ToolResult],
-                 *, max_steps: int = 6) -> list[Action]:
+                 *, tasks: list[dict] | None = None,
+                 max_steps: int = 6) -> list[Action]:
     """Call ``next_action`` and feed one scripted outcome per tool call.
 
     Recording stops at the first finish action (the runner does the same).
@@ -53,7 +55,7 @@ async def _drive(brain: MockBrain, task: dict, outcomes: list[ToolResult],
     actions: list[Action] = []
     step = 0
     for outcome in outcomes:
-        action = await brain.next_action(_view(step, task))
+        action = await brain.next_action(_view(step, task, tasks=tasks))
         actions.append(action)
         if action.finish is not None:
             return actions
@@ -63,7 +65,7 @@ async def _drive(brain: MockBrain, task: dict, outcomes: list[ToolResult],
             if action.tool == "task.update":
                 task.update(action.args.get("patch") or {})
             step += 1
-    action = await brain.next_action(_view(step, task))
+    action = await brain.next_action(_view(step, task, tasks=tasks))
     actions.append(action)
     return actions
 
@@ -168,10 +170,136 @@ class MockBrainObserveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(brain._compiled)
 
 
-class ObserveIsolationTests(unittest.IsolatedAsyncioTestCase):
-    """``observe`` must not change plan-driven roles other than the coder."""
+class ReviewerArtifactReadTests(unittest.IsolatedAsyncioTestCase):
+    """S5: a failed artifact read must reject the review, not fake a pass."""
 
-    ROLES = ("lead", "architect", "tester", "reviewer", "researcher",
+    def _review_task(self, **overrides) -> dict:
+        task = _task(
+            status="review", role="reviewer",
+            title="评审实现",
+            artifacts=[{"type": "file", "path": "src/t-1-impl.py",
+                        "title": "实现产物"}])
+        task.update(overrides)
+        return task
+
+    async def test_read_failure_returns_task_to_todo_and_blocks(self) -> None:
+        brain = MockBrain("reviewer")
+        task = self._review_task()
+        actions = await _drive(brain, task, [
+            ToolResult(ok=True),                                  # fs.list
+            ToolResult(ok=False,
+                       error="Permission denied: src/t-1-impl.py"),
+            ToolResult(ok=True),                                  # task.note
+            ToolResult(ok=True),                                  # task.update -> todo
+        ])
+
+        tools = [action.tool for action in actions]
+        # The read is issued once and settled before any verdict.
+        self.assertEqual(tools[:3], ["fs.list", "fs.read", "task.note"])
+        self.assertEqual(tools.count("fs.read"), 1)
+        self.assertNotIn("task.artifact", tools)
+
+        note = actions[2]
+        self.assertEqual(note.tool, "task.note")
+        self.assertIn("读取产物失败", note.args["text"])
+        self.assertIn("Permission denied", note.args["text"])
+
+        updates = [action for action in actions if action.tool == "task.update"]
+        self.assertTrue(updates)
+        statuses = [action.args.get("patch", {}).get("status")
+                    for action in updates]
+        self.assertEqual(statuses[-1], "todo")
+        self.assertNotIn("done", statuses)
+        self.assertNotIn("review", statuses)
+
+        # No "pass" review may be written.
+        self.assertFalse(any(
+            action.tool == "fs.write"
+            and "结论：通过" in str(action.args.get("content") or "")
+            for action in actions))
+
+        finish = actions[-1]
+        self.assertIsNotNone(finish.finish)
+        self.assertEqual(finish.finish["status"], "blocked")
+        self.assertIn("读取产物失败", finish.finish["summary"])
+        self.assertFalse(brain._review_read_pending)
+        self.assertTrue(brain._review_read_failed)
+        self.assertTrue(brain._missing_artifacts)
+
+    async def test_read_success_keeps_the_normal_pass_verdict(self) -> None:
+        brain = MockBrain("reviewer")
+        task = self._review_task()
+        actions = await _drive(brain, task, [ToolResult(ok=True)] * 5)
+
+        tools = [action.tool for action in actions]
+        self.assertEqual(tools, ["fs.list", "fs.read", "fs.write",
+                                 "task.artifact", "task.update", None])
+        self.assertEqual(tools.count("fs.read"), 1)
+        review = actions[2]
+        self.assertIn("结论：通过", review.args["content"])
+
+        updates = [action for action in actions if action.tool == "task.update"]
+        self.assertEqual(updates[-1].args["patch"]["status"], "done")
+        finish = actions[-1]
+        self.assertEqual(finish.finish["status"], "done")
+        self.assertFalse(brain._review_read_pending)
+        self.assertFalse(brain._review_read_failed)
+        self.assertFalse(brain._missing_artifacts)
+
+    async def test_project_level_review_without_artifact_still_passes(self) -> None:
+        brain = MockBrain("reviewer")
+        task = _task(id="t-review", status="review", role="reviewer",
+                     title="项目级验收", artifacts=[])
+        siblings = [
+            _task(id="t-1", status="done"),
+            _task(id="t-2", status="review"),
+        ]
+        actions = await _drive(brain, task, [ToolResult(ok=True)] * 5,
+                               tasks=[task, *siblings])
+
+        tools = [action.tool for action in actions]
+        self.assertNotIn("fs.read", tools)
+        project_note = next(action for action in actions
+                            if action.tool == "task.note")
+        self.assertIn("项目级验收", project_note.args["text"])
+
+        review = next(action for action in actions if action.tool == "fs.write")
+        self.assertIn("结论：通过", review.args["content"])
+        updates = [action for action in actions if action.tool == "task.update"]
+        self.assertEqual(updates[-1].args["patch"]["status"], "done")
+        finish = actions[-1]
+        self.assertEqual(finish.finish["status"], "done")
+        self.assertFalse(brain._review_read_failed)
+        self.assertFalse(brain._missing_artifacts)
+
+
+    async def test_claimed_project_level_review_closes_via_review_status(self) -> None:
+        """A review task claimed from todo must pass through review to done."""
+        brain = MockBrain("reviewer")
+        task = _task(id="t-review", status="doing", role="reviewer",
+                     title="项目级验收", artifacts=[])
+        siblings = [_task(id="t-1", status="done"),
+                    _task(id="t-2", status="done")]
+        actions = await _drive(brain, task, [ToolResult(ok=True)] * 6,
+                               tasks=[task, *siblings])
+
+        updates = [action for action in actions if action.tool == "task.update"]
+        self.assertEqual([action.args["patch"]["status"] for action in updates],
+                         ["review", "done"])
+        finish = actions[-1]
+        self.assertEqual(finish.finish["status"], "done")
+        self.assertFalse(brain._missing_artifacts)
+
+
+class ObserveIsolationTests(unittest.IsolatedAsyncioTestCase):
+    """``observe`` must not change plan-driven roles that do not use outcomes.
+
+    The coder (S4) and reviewer (S5) deliberately consume observed tool
+    outcomes; their behaviour is covered by the tests above.  Every other
+    role must keep producing the same plan with or without observations.
+    """
+
+    ROLES = ("lead", "architect", "tester", "researcher",
              "aggregator", "assistant")
 
     async def _sequence(self, role: str, *, observe: bool) -> list[dict]:
