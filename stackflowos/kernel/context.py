@@ -26,6 +26,12 @@ from .events import EventBus
 _MISSING = object()
 Disposer = Callable[[], Any]
 
+#: How long ``dispose`` waits for in-flight plugin startups before cancelling.
+#: A plugin that takes longer is considered stuck; disposal must still finish.
+_STARTUP_TIMEOUT_S = 5.0
+#: Grace period granted to a cancelled startup task to unwind.
+_STARTUP_CANCEL_GRACE_S = 1.0
+
 
 class PluginHandle:
     """Handle for a plugin mounted on a child context."""
@@ -63,6 +69,16 @@ class Context:
         self._isolated: set[str] = set()
         self._service_target: "Context | None" = None
         self._disposed = False
+        # Plugin startup tasks mounted on this context. ``dispose`` settles
+        # them before tearing anything down so a late ``run`` cannot register
+        # effects after the disposer list has been cleared.
+        self._start_tasks: set[asyncio.Task] = set()
+        # Serialises the "check disposed/append disposer" window against the
+        # "snapshot and clear disposers" window in ``dispose``. Both critical
+        # sections are synchronous; the lock is never held across an await.
+        self._lifecycle_lock = asyncio.Lock()
+        # The handle of the plugin this context was created for, if any.
+        self._plugin_handle: PluginHandle | None = None
         self._bus = bus or (parent._bus if parent else EventBus())
         self._logger = logger or (
             parent._logger.getChild(_safe_name(name)) if parent else get_logger(name))
@@ -230,6 +246,7 @@ class Context:
         # that siblings (and the mounting context itself) can resolve them.
         child._service_target = self
         handle = PluginHandle(child, child.name)
+        child._plugin_handle = handle
 
         async def run() -> None:
             try:
@@ -241,12 +258,35 @@ class Context:
                     target = plugin(child, config if config is not None else {})
                 target = await _maybe_await(target)
                 if target is not None:
-                    child._disposers.append(target)
-                if getattr(child, "_disposed", False):
-                    # Plugin disposed itself while starting.
-                    handle.state = "disposed"
-                else:
-                    handle.state = "active"
+                    # Register and check under the lifecycle lock: if dispose
+                    # won the race while this plugin was awaiting, the effect
+                    # must be torn down here instead of being appended to a
+                    # list that has already been drained.
+                    late = False
+                    async with child._lifecycle_lock:
+                        if child._disposed:
+                            late = True
+                        else:
+                            child._disposers.append(target)
+                            if child._disposed:
+                                # dispose() slipped in between append and this
+                                # check; undo the registration and clean up.
+                                try:
+                                    child._disposers.remove(target)
+                                except ValueError:
+                                    pass
+                                late = True
+                    if late:
+                        try:
+                            await _run_disposer(target)
+                        except Exception:
+                            child.log.exception(
+                                "plugin %s disposer failed during startup cleanup", name)
+                handle.state = "disposed" if child._disposed else "active"
+            except asyncio.CancelledError:
+                # dispose() settled/cancelled this in-flight startup.
+                handle.state = "disposed"
+                raise
             except Exception as exc:
                 handle.state = "failed"
                 handle.error = exc
@@ -275,27 +315,75 @@ class Context:
                 child.log.exception("plugin %s failed to start", name)
         else:
             handle._task = loop.create_task(run())
+            # Track the startup task on both the mounting context and the
+            # plugin context: either one can be disposed first while the
+            # plugin is still awaiting.
+            for owner in (self, child):
+                owner._start_tasks.add(handle._task)
+                handle._task.add_done_callback(owner._start_tasks.discard)
         return handle
 
     async def dispose(self) -> None:
         if self._disposed:
             return
+        # Mark disposed first: a startup that returns after this point must
+        # clean up its own effect instead of registering it.
         self._disposed = True
+        await self._settle_start_tasks()
         for child in reversed(self._children):
             try:
                 await child.dispose()
             except Exception:
                 self.log.exception("error disposing child %s", child.path)
         self._children.clear()
-        for disposer in reversed(self._disposers):
+        # Snapshot and clear atomically, then run disposers without the lock
+        # (they may await and may themselves touch the context).
+        async with self._lifecycle_lock:
+            disposers = list(reversed(self._disposers))
+            self._disposers.clear()
+        for disposer in disposers:
             try:
-                result = disposer() if callable(disposer) else _close_of(disposer)()
-                if inspect.isawaitable(result):
-                    await result
+                await _run_disposer(disposer)
             except Exception:
                 self.log.exception("error running disposer in %s", self.path)
-        self._disposers.clear()
         self._services.clear()
+        if self._plugin_handle is not None and \
+                self._plugin_handle.state in ("pending", "active"):
+            self._plugin_handle.state = "disposed"
+
+    async def _settle_start_tasks(self) -> None:
+        """Wait for (and if needed cancel) plugin startups mounted here."""
+        current = asyncio.current_task()
+        tasks = [task for task in self._start_tasks
+                 if task is not current and not task.done()]
+        if not tasks:
+            return
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=_STARTUP_TIMEOUT_S)
+            for task in done:
+                _consume_task_result(task)
+            if pending:
+                self.log.warning(
+                    "plugin startup still running after %.1fs during dispose of %s; cancelling",
+                    _STARTUP_TIMEOUT_S, self.path)
+                for task in pending:
+                    task.cancel()
+                done, pending = await asyncio.wait(
+                    pending, timeout=_STARTUP_CANCEL_GRACE_S)
+                for task in done:
+                    _consume_task_result(task)
+                for task in pending:
+                    self.log.warning(
+                        "plugin startup ignored cancellation during dispose of %s",
+                        self.path)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+        finally:
+            for task in tasks:
+                self._start_tasks.discard(task)
 
     async def __aenter__(self) -> "Context":
         return self
@@ -357,6 +445,22 @@ def _close_of(target: Any) -> Callable[[], Any]:
         if callable(fn):
             return fn
     raise TypeError(f"object {target!r} has no close method")
+
+
+async def _run_disposer(disposer: Any) -> Any:
+    """Invoke a disposer (callable or close()-able) and await its result."""
+    result = disposer() if callable(disposer) else _close_of(disposer)()
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    """Retrieve a startup task's outcome so asyncio does not log it later."""
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def _run_sync_disposer(disposer: Any, log: logging.Logger) -> None:
