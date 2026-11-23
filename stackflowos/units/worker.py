@@ -77,8 +77,17 @@ async def run_worker(args: argparse.Namespace) -> int:
 
     work_id = args.work_id
 
+    # Protocol v2 identity: the supervisor/attach path hands the unit token
+    # through the environment, never argv (which shows up in ps/logs). The
+    # hub derives our principal from it; ``src`` is display-only.
+    unit_token = os.environ.get("SFO_UNIT_TOKEN") or ""
+    auth = {"kind": "unit", "id": work_id, "token": unit_token} if unit_token else None
+    if auth is None:
+        log.warning("SFO_UNIT_TOKEN is not set; an authenticated v2 hub will "
+                    "reject this unit with UNAUTHORIZED")
+
     # Bootstrap: ask the hub where this unit should bind its sockets.
-    boot = RpcClient(args.sys, src=work_id, dst="sys",
+    boot = RpcClient(args.sys, src=work_id, dst="sys", auth=auth,
                      timeout=cfg.transport.rpc_timeout_s)
     await boot.start()
     try:
@@ -90,6 +99,7 @@ async def run_worker(args: argparse.Namespace) -> int:
                               events=info["events_address"])
     unit = UnitTransport(sys_rpc=args.sys, work_id=work_id, addresses=addresses,
                          events_target=info["sys_events_address"],
+                         auth=auth,
                          logger=get_logger(f"unit.{work_id}"))
     sys_api = RemoteSys(unit)
 

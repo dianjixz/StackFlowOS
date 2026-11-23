@@ -20,7 +20,8 @@ from pathlib import Path
 from stackflowos.app import App
 from stackflowos.cli import seed_demo
 from stackflowos.config import Config, default_root
-from stackflowos.errors import Denied, Unavailable
+from stackflowos.errors import Denied, Unauthorized, Unavailable
+from stackflowos.security import Principal
 from stackflowos.web.server import WebServer
 
 REPO = default_root()
@@ -164,21 +165,31 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_transport_peers_cannot_self_approve_or_spoof_risk(self):
         self.app = await _boot_app(self.tmp, transport="ipc")
-        with self.assertRaises(Denied):
+        # H3/protocol v2: external calls must carry a verified principal; a
+        # self-reported src="operator" no longer reaches the dispatcher.
+        with self.assertRaises(Unauthorized):
             await self.app.handle_rpc_action(
                 "rule.create", {"effect": "allow", "capability": "shell.exec"},
                 src="operator", external=True)
+        unit = Principal(kind="unit", id="unit-coder-probe",
+                         agent_id="agent-coder-1")
+        with self.assertRaises(Denied):
+            await self.app.handle_rpc_action(
+                "rule.create", {"effect": "allow", "capability": "shell.exec"},
+                src="operator", external=True, principal=unit)
         with self.assertRaises(Denied):
             await self.app.handle_rpc_action(
                 "approval.request",
                 {"principal": "agent-other-1", "capability": "fs.read",
-                 "scope": {}}, src="coder.probe", external=True)
+                 "scope": {}}, src="coder.probe", external=True,
+                principal=unit)
         request = await self.app.handle_rpc_action("approval.request", {
-            "principal": "coder.probe", "capability": "shell.exec",
+            "principal": "agent-coder-1", "capability": "shell.exec",
             "scope": {"cwd": "/", "command": "ls"}, "risk": "low",
-        }, src="coder.probe", external=True)
+        }, src="coder.probe", external=True, principal=unit)
         self.assertNotEqual(request["risk"], "low")
         self.assertEqual(request["status"], "pending")
+        self.assertEqual(request["principal"], "agent-coder-1")
 
     async def test_chat_assistant_status_and_project_creation(self):
         self.app = await _boot_app(self.tmp, transport="ipc")

@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
-from ..errors import BadRequest, Conflict, NotFound, ValidationError
+from ..errors import BadRequest, Conflict, Denied, NotFound, ValidationError
 from ..kernel import Context
 from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
@@ -40,6 +40,20 @@ def _generalise_principal(principal: str) -> str:
     """``agent-coder-3`` -> ``agent-coder-*`` (any worker of the same role)."""
     match = _AGENT_ID.match(str(principal))
     return f"{match.group(1)}{match.group(2)}*" if match else str(principal)
+
+
+def _principal_owns(owner: str, principal: str) -> bool:
+    """True when ``owner`` is exactly ``principal`` or its role-general form.
+
+    One-shot grants keep the exact agent id; session/always grants are widened
+    to ``agent-<role>-*`` so any worker of that role can spend them.  Both
+    shapes must be accepted for the owning worker.
+    """
+    owner = str(owner or "")
+    principal = str(principal or "")
+    if not owner or not principal:
+        return False
+    return owner == principal or owner == _generalise_principal(principal)
 
 
 def _host_of(url: str) -> str:
@@ -367,9 +381,19 @@ class ApprovalBroker:
         return resolved
 
     # -- usage / expiry ---------------------------------------------------
-    def poll(self, request_id: str) -> ApprovalRequest:
-        """Refresh one request, expiring it when its TTL has passed."""
+    def poll(self, request_id: str, *,
+             principal: str | None = None) -> ApprovalRequest:
+        """Refresh one request, expiring it when its TTL has passed.
+
+        ``principal`` (H3) enforces that a unit may only observe its own
+        requests; operators pass ``None`` and keep the global view.
+        """
         request = self.get(request_id)
+        if principal is not None and not _principal_owns(request.principal,
+                                                         principal):
+            raise Denied(
+                f"{principal} may not read approval {request_id!r}",
+                detail={"request_id": request_id})
         now = _now_ms()
         if request.status == "pending" and request.expires_at and now >= request.expires_at:
             with self._lock:
@@ -380,9 +404,19 @@ class ApprovalBroker:
             self._emit("approval.expired", request)
         return request
 
-    def use(self, grant_id: str) -> bool:
-        """Spend one use of a grant; emits ``approval.used`` when allowed."""
+    def use(self, grant_id: str, *, principal: str | None = None) -> bool:
+        """Spend one use of a grant; emits ``approval.used`` when allowed.
+
+        ``principal`` (H3) enforces that only the grant's owner may spend it;
+        operators pass ``None`` and keep the global view.
+        """
         rule = self.policy.get_rule(grant_id)
+        if principal is not None:
+            owner = str(getattr(rule, "principal", "") or "")
+            if not _principal_owns(owner, principal):
+                raise Denied(
+                    f"{principal} may not use grant {grant_id!r}",
+                    detail={"grant_id": grant_id, "principal": owner})
         allowed = self.policy.consume(grant_id)
         if allowed:
             self._emit_grant_used(grant_id, rule)

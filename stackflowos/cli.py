@@ -67,6 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     attach.add_argument("--label", default="")
     attach.add_argument("--root", default=None)
     attach.add_argument("--state-dir", default=None)
+    attach.add_argument("--token", default=None,
+                        help="operator RPC token for protocol v2 auth "
+                             "(default: $SFO_RPC_TOKEN); the hub issues the "
+                             "unit token returned to the worker via env")
 
     worker = sub.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--sys", required=True)
@@ -122,16 +126,27 @@ async def _attach(args) -> int:
     This is the manual/remote path: the supervisor uses it internally for
     local workers, but an operator can also point it at tcp://hub:port from
     another device (the unit binds the addresses the hub allocated).
+
+    Protocol v2: the hub only accepts authenticated RPC, so ``--token`` (an
+    operator token) is required. ``unit.allocate`` returns a unit token which
+    is handed to the worker through ``SFO_UNIT_TOKEN`` (never argv).
     """
     import argparse as _argparse
 
     from .transport import RpcClient
     from .units.worker import run_worker
 
+    token = args.token or os.environ.get("SFO_RPC_TOKEN") or ""
+    if not token:
+        print("attach: an operator token is required (protocol v2): "
+              "pass --token or set SFO_RPC_TOKEN", file=sys.stderr)
+        return 2
     cfg = Config.load(root=Path(args.root) if args.root else None,
                       state_dir=Path(args.state_dir) if args.state_dir else None)
     setup_logging("INFO", cfg.paths.log_file)
-    client = RpcClient(args.sys, src="attach", dst="sys", timeout=15.0)
+    auth = {"kind": "operator", "id": "human:operator", "token": token}
+    client = RpcClient(args.sys, src="attach", dst="sys", timeout=15.0,
+                       auth=auth)
     await client.start()
     try:
         allocation = await client.call("unit.allocate", {
@@ -142,6 +157,12 @@ async def _attach(args) -> int:
     finally:
         await client.stop()
     work_id = allocation["work_id"]
+    unit_token = str(allocation.get("unit_token") or "")
+    if not unit_token:
+        print("attach: hub did not return a unit token; cannot authenticate "
+              "the worker", file=sys.stderr)
+        return 2
+    os.environ["SFO_UNIT_TOKEN"] = unit_token
     print(f"attached as {work_id} to {args.sys}")
     ns = _argparse.Namespace(
         sys=args.sys, work_id=work_id, role=args.role,

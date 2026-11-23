@@ -53,7 +53,9 @@ class AgentSupervisor:
                  config: Any, sys_rpc: str, state_dir: Path, root: Path,
                  popen_factory: Any = None, command_factory: Any = None,
                  spawn_timeout_s: float = 15.0, logger: Any = None,
-                 control: ControlFn | None = None) -> None:
+                 control: ControlFn | None = None,
+                 token_issuer: Any = None,
+                 token_revoker: Any = None) -> None:
         self.ctx = ctx
         self.registry = registry
         self.allocator = allocator
@@ -66,6 +68,12 @@ class AgentSupervisor:
         self.spawn_timeout_s = float(spawn_timeout_s)
         self.log = logger or get_logger("agents.supervisor")
         self.control = control
+        # Protocol v2 credential hooks (H3). ``token_issuer(work_id,
+        # project_id, role, agent_id)`` returns the unit token handed to the
+        # worker through SFO_UNIT_TOKEN; ``token_revoker(work_id)`` invalidates
+        # it when the process is released/restarted/killed.
+        self.token_issuer = token_issuer
+        self.token_revoker = token_revoker
         self._popen_factory = popen_factory
         self._command_factory = command_factory
 
@@ -119,6 +127,31 @@ class AgentSupervisor:
             return factory(command, kwargs)
         return subprocess.Popen(command, **kwargs)
 
+    async def _issue_token(self, work_id: str, project_id: str | None,
+                           role: str, agent_id: str | None) -> str | None:
+        """Ask the hub for this unit's token (sync or async issuer)."""
+        issuer = self.token_issuer
+        if issuer is None:
+            return None
+        value = issuer(work_id, project_id, role, agent_id)
+        if inspect.isawaitable(value):
+            value = await value
+        return str(value) if value else None
+
+    def _revoke_token(self, work_id: str | None) -> None:
+        revoker = self.token_revoker
+        if revoker is None or not work_id:
+            return
+        try:
+            value = revoker(str(work_id))
+            if inspect.isawaitable(value):
+                try:
+                    asyncio.get_running_loop().create_task(value)
+                except RuntimeError:  # pragma: no cover - no loop
+                    pass
+        except Exception:  # pragma: no cover - revocation is best effort
+            self.log.debug("revoke token for %s failed", work_id, exc_info=True)
+
     # ------------------------------------------------------------------
     # spawn
     # ------------------------------------------------------------------
@@ -144,7 +177,8 @@ class AgentSupervisor:
         agent = self.register(role=role, project_id=project_id,
                               unit_id=work_id, task_id=task_id)
         try:
-            await self._launch(agent, work_id)
+            token = await self._issue_token(work_id, project_id, role, agent.id)
+            await self._launch(agent, work_id, token=token)
         except Exception as exc:
             agent.status = "failed"
             agent.error = f"spawn failed: {exc}"
@@ -176,7 +210,8 @@ class AgentSupervisor:
         self.save()
         return agent
 
-    async def _launch(self, agent: Agent, work_id: str) -> None:
+    async def _launch(self, agent: Agent, work_id: str,
+                      token: str | None = None) -> None:
         """Start the worker process and wait for ``unit.register``."""
         command = self._command(agent.role, agent.project_id, agent.task_id,
                                 work_id)
@@ -184,6 +219,10 @@ class AgentSupervisor:
         env = os.environ.copy()
         env["SFO_ROOT"] = str(self.root)
         env["SFO_STATE_DIR"] = str(self.state_dir)
+        if token:
+            # Never in argv: argv shows up in ps/logs. The worker only reads
+            # this env var and its shell environment strips SFO_* anyway.
+            env["SFO_UNIT_TOKEN"] = token
         # The worker runs with cwd=<root> (the operator's workspace), which is
         # not necessarily where this package lives (tests use a temp root).
         # Put both on sys.path so `python -m stackflowos.worker` resolves.
@@ -268,7 +307,9 @@ class AgentSupervisor:
         try:
             addresses = await _maybe_await(self.allocator.allocate(new_work_id))
             self._addresses[new_work_id] = addresses
-            await self._launch(agent, new_work_id)
+            token = await self._issue_token(new_work_id, agent.project_id,
+                                            agent.role, agent.id)
+            await self._launch(agent, new_work_id, token=token)
         except Exception as exc:
             self.log.warning("restart of %s failed: %s", agent.id, exc)
             agent.status = "failed"
@@ -565,6 +606,7 @@ class AgentSupervisor:
     def _release(self, work_id: str | None) -> None:
         if not work_id:
             return
+        self._revoke_token(work_id)
         try:
             self.allocator.release(work_id)
         except Exception:  # pragma: no cover - release is best effort

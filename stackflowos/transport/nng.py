@@ -360,6 +360,7 @@ class RpcClient:
 
     def __init__(self, address: str, *, src: str = "sys", dst: str = "sys",
                  timeout: float = 8.0, contexts: int = 4,
+                 auth: dict | None = None,
                  logger: logging.Logger | None = None) -> None:
         if contexts < 1:
             raise ValueError("contexts must be >= 1")
@@ -370,6 +371,7 @@ class RpcClient:
         self._dst = dst
         self._timeout = float(timeout)
         self._contexts = contexts
+        self._auth = dict(auth) if isinstance(auth, dict) else None
         self._log = logger or get_logger("transport.rpc.client")
         self._sock: pynng.Req0 | None = None
         self._queue: asyncio.Queue[pynng.Context] | None = None
@@ -451,7 +453,7 @@ class RpcClient:
             raise Timeout(f"rpc {action}: timeout must be positive")
 
         env = Envelope.rpc(action, data or {}, src=self._src,
-                           dst=dst or self._dst)
+                           dst=dst or self._dst, auth=self._auth)
         last_error: SfoError | None = None
         for attempt in range(2):
             try:
@@ -854,11 +856,13 @@ class UnitTransport:
 
     def __init__(self, *, sys_rpc: str, work_id: str,
                  addresses: UnitAddresses, events_target: str,
+                 auth: dict | None = None,
                  logger: logging.Logger | None = None) -> None:
         self._sys_rpc = sys_rpc
         self._work_id = work_id
         self._addresses = addresses
         self._events_target = events_target
+        self._auth = dict(auth) if isinstance(auth, dict) else None
         self._log = logger or get_logger("transport.unit")
         self._handlers: dict[str, ActionHandler] = {}
         self._client: RpcClient | None = None
@@ -869,6 +873,10 @@ class UnitTransport:
     @property
     def work_id(self) -> str:
         return self._work_id
+
+    @property
+    def auth(self) -> dict | None:
+        return dict(self._auth) if self._auth is not None else None
 
     @property
     def addresses(self) -> UnitAddresses:
@@ -886,7 +894,7 @@ class UnitTransport:
         if self._running:
             return
         client = RpcClient(self._sys_rpc, src=self._work_id, dst="sys",
-                           logger=self._log)
+                           auth=self._auth, logger=self._log)
         server = RpcServer(self._addresses.rpc, name=f"unit-{self._work_id}",
                            contexts=4, logger=self._log)
         for action, handler in self._handlers.items():
@@ -921,7 +929,7 @@ class UnitTransport:
                       *, timeout: float | None = None) -> dict:
         """Place a one-off call to another unit's RPC endpoint."""
         client = RpcClient(address, src=self._work_id, dst="sys",
-                           logger=self._log)
+                           auth=self._auth, logger=self._log)
         await client.start()
         try:
             return await client.call(action, data, timeout=timeout)

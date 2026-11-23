@@ -99,13 +99,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _make(self, *, config: AgentsCfg | None = None,
-              spawn_timeout_s: float = 2.0, control=None) -> AgentSupervisor:
+              spawn_timeout_s: float = 2.0, control=None,
+              token_issuer=None,
+              token_revoker=None) -> AgentSupervisor:
         sup = AgentSupervisor(
             Context(), registry=self.registry, allocator=self.allocator,
             eventlog=self.eventlog, config=config or AgentsCfg(),
             sys_rpc="ipc://sys.rpc", state_dir=self.state, root=self.root,
             popen_factory=self._popen,
-            spawn_timeout_s=spawn_timeout_s, control=control)
+            spawn_timeout_s=spawn_timeout_s, control=control,
+            token_issuer=token_issuer, token_revoker=token_revoker)
         supervisors = getattr(self, "_supervisors", [])
         supervisors.append(sup)
         self._supervisors = supervisors
@@ -181,6 +184,39 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         await sup.spawn("coder", "p-1")
         with self.assertRaises(Conflict):
             await sup.spawn("tester", "p-1")
+
+    # -- protocol v2 tokens (H3) -----------------------------------------
+    async def test_spawn_passes_unit_token_only_through_env(self) -> None:
+        issued: list[tuple] = []
+
+        def issue(work_id, project_id, role, agent_id):
+            issued.append((work_id, project_id, role, agent_id))
+            return f"token-{work_id}"
+
+        sup = self._make(token_issuer=issue)
+        agent = await sup.spawn("coder", "p-1", task_id="t-1")
+        command, kwargs = self.popen_calls[-1]
+        self.assertEqual(kwargs["env"]["SFO_UNIT_TOKEN"], "token-coder.0")
+        self.assertNotIn("token-coder.0", command)
+        self.assertEqual(issued, [("coder.0", "p-1", "coder", agent.id)])
+
+    async def test_restart_revokes_old_token_and_issues_a_new_one(self) -> None:
+        issued: list[tuple] = []
+        revoked: list[str] = []
+
+        def issue(work_id, project_id, role, agent_id):
+            issued.append((work_id, project_id, role, agent_id))
+            return f"token-{work_id}"
+
+        sup = self._make(token_issuer=issue, token_revoker=revoked.append)
+        agent = await sup.spawn("coder", "p-1")
+        unit = SimpleNamespace(work_id="coder.0", kind="coder", project_id="p-1")
+        self.assertTrue(await sup.restart(unit, 1))
+        self.assertIn("coder.0", revoked)
+        self.assertEqual(issued[-1][0], "coder.1")
+        self.assertEqual(self.popen_calls[-1][1]["env"]["SFO_UNIT_TOKEN"],
+                         "token-coder.1")
+        self.assertEqual(agent.unit_id, "coder.1")
 
     # -- restart ----------------------------------------------------------
     async def test_restart_reuses_agent_with_new_unit(self) -> None:

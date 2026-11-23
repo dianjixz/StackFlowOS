@@ -23,11 +23,13 @@ from .agents import AgentSupervisor, ToolExecutor
 from .ai import make_provider
 from .config import Config
 from .errors import (BadRequest, Conflict, Denied, NotFound, SfoError,
-                     Unavailable, ValidationError)
+                     Unauthorized, Unavailable, ValidationError)
 from .kernel import Context
 from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler, UnitInfo, UnitRegistry
+from .protocol import PROTOCOL_VERSION
 from .projects import ProjectStore, plan_for
-from .security import ApprovalBroker, PolicyEngine
+from .security import (ApprovalBroker, PolicyEngine, Principal,
+                       RpcAuthRegistry)
 from .session.chat import ChatService
 from .session.operator import OperatorTools
 from .transport import AddressAllocator, HubTransport, socket_dir_for
@@ -35,8 +37,26 @@ from .util.jsonio import read_json, write_json
 from .util.logging import get_logger, setup_logging
 
 VERSION = "0.1.0"
-PRIVILEGED_ACTIONS = {"sys.config.set", "rule.create", "rule.update", "rule.delete",
-                      "approval.decide"}
+
+#: Operator-only actions.  Worker units are denied these over RPC regardless of
+#: the ``src`` they claim; in-process operator/web calls are unaffected.
+#: ``rule.*`` is expanded explicitly because the dispatch table is flat.
+PRIVILEGED_ACTIONS = {
+    "sys.config.set",
+    "rule.create", "rule.update", "rule.delete",
+    "approval.decide", "approval.list",
+    "project.delete", "project.archive",
+    "unit.kill", "unit.allocate",
+    "chat.send",
+}
+
+#: Actions whose handler receives the authenticated principal as a third
+#: argument (identity/owner binding: own unit, own lease, own approval).
+PRINCIPAL_ACTIONS = frozenset({
+    "unit.addresses", "unit.register", "unit.heartbeat", "unit.release",
+    "lease.acquire", "lease.renew", "lease.release", "lease.list",
+    "approval.status", "approval.use",
+})
 
 
 def now_ms() -> int:
@@ -84,6 +104,10 @@ class App:
         self._assistant_agent = None
         self.operator = OperatorTools(self)
         self.log = get_logger("app")
+        # Protocol v2 credentials: unit tokens are issued for every spawned
+        # worker; operator tokens exist only in this process' memory.
+        self.rpc_auth = RpcAuthRegistry(logger=get_logger("security.rpc_auth"))
+        self.operator_token: str | None = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -154,6 +178,8 @@ class App:
             state_dir=self.paths.state_dir,
             root=self.paths.root,
             control=self._control_unit,
+            token_issuer=self.rpc_auth.issue_unit,
+            token_revoker=self.rpc_auth.revoke,
             logger=get_logger("agents"),
         )
         self.supervisor.load()
@@ -318,6 +344,7 @@ class App:
             await self.ctx.dispose()
         except Exception:
             self.log.exception("context dispose failed")
+        self.rpc_auth.revoke_all()
         self._release_hub_lock()
 
     # ------------------------------------------------------------------
@@ -386,6 +413,7 @@ class App:
             "approval.status": self._approval_status,
             "approval.use": self._approval_use,
             "approval.list": self._approval_list,
+            "approval.decide": self._approval_decide,
             "rule.list": self._rule_list,
             "rule.create": self._rule_create,
             "rule.update": self._rule_update,
@@ -424,10 +452,15 @@ class App:
 
     def _make_env_handler(self, action: str, handler):
         async def handle(env):
+            # Authenticate *before* anything else: protocol v1 clients and
+            # missing/forged tokens are rejected with 401, and the replay
+            # cache is keyed by the authenticated principal (``src`` is
+            # self-reported and must never influence deduplication).
+            principal = self._authenticate_env(env)
             # RPC retries reuse the envelope id. Non-idempotent actions
             # (agent.spawn, project.create, ...) must be executed once: join
             # the in-flight task of the first attempt and replay its result.
-            key = f"{env.src}|{env.id}"
+            key = f"{principal.kind}:{principal.id}|{env.id}"
             cached = self._rpc_cache.get(key)
             now = time.time()
             if cached is not None and cached[0] > now - self.RPC_CACHE_TTL_S:
@@ -437,7 +470,7 @@ class App:
                 data = env.data if isinstance(env.data, dict) else {}
                 task = asyncio.create_task(
                     self.handle_rpc_action(action, data, src=env.src,
-                                           external=True))
+                                           external=True, principal=principal))
                 self._rpc_inflight[key] = task
 
                 def _done(t: asyncio.Task, key: str = key) -> None:
@@ -459,31 +492,112 @@ class App:
             return payload
         return handle
 
+    def _authenticate_env(self, env) -> Principal:
+        """Derive the caller principal from an external envelope (or raise 401).
+
+        ``Envelope.src`` never participates: protocol v2 requires a valid
+        ``auth`` mapping, and only the token registry decides identity.
+        """
+        version = int(getattr(env, "v", 0) or 0)
+        if version != PROTOCOL_VERSION:
+            raise Unauthorized(
+                f"unsupported rpc protocol version {version!r}; "
+                f"this hub requires v{PROTOCOL_VERSION}")
+        if getattr(env, "auth", None) is None:
+            raise Unauthorized("rpc auth required (protocol v2)")
+        return self.rpc_auth.verify(env.auth)
+
+    def _authorize(self, principal: Principal, action: str) -> None:
+        """Deny operator-only actions to units (``src`` is not consulted)."""
+        if principal.is_operator or principal.kind == "sys":
+            return
+        if action in PRIVILEGED_ACTIONS:
+            raise Denied(f"{action} is an operator action; worker units may not call it")
+        if not principal.is_unit:
+            raise Denied(f"unsupported rpc principal kind: {principal.kind!r}")
+
+    def _bind_external(self, principal: Principal, action: str,
+                       data: dict) -> dict:
+        """Bind identity-bearing fields to the authenticated principal.
+
+        A unit may only speak for itself: ``work_id``/``unit_id``, lease
+        holders and approval principals are forced to the connection's
+        principal, and an explicit mismatch is denied (not silently ignored).
+        ``data["principal"]`` is never trusted.
+        """
+        if principal.is_unit:
+            if action in ("unit.addresses", "unit.register",
+                          "unit.heartbeat", "unit.release"):
+                claimed = data.get("work_id")
+                if claimed is not None and str(claimed) != principal.id:
+                    raise Denied(
+                        f"{principal.id} may not act for unit {claimed!r}")
+                data["work_id"] = principal.id
+            elif action == "agent.register":
+                claimed = data.get("unit_id")
+                if claimed is not None and str(claimed) != principal.id:
+                    raise Denied(
+                        f"{principal.id} may not register an agent for {claimed!r}")
+                data["unit_id"] = principal.id
+            elif action == "approval.request":
+                claimed = data.get("principal")
+                actual = principal.identity
+                if claimed and str(claimed) != actual:
+                    raise Denied(
+                        f"{principal.id} may not request approvals as {claimed!r}")
+                data["principal"] = actual
+            elif action in ("lease.acquire", "lease.renew", "lease.release",
+                            "lease.list"):
+                claimed = data.get("holder")
+                if claimed is not None and str(claimed) != principal.id:
+                    raise Denied(
+                        f"{principal.id} may not act on leases of {claimed!r}")
+                data["holder"] = principal.id
+        elif principal.is_operator:
+            if action == "approval.request":
+                claimed = data.get("principal")
+                if claimed and str(claimed) != principal.identity:
+                    raise Denied(
+                        f"operator may not request approvals as {claimed!r}")
+                data["principal"] = principal.identity
+        return data
+
     async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0",
-                                external: bool = False) -> dict:
+                                external: bool = False,
+                                principal: Principal | None = None) -> dict:
         """Dispatch one sys action.
 
-        ``external`` marks calls that arrived over the transport: ``src`` is
-        then self-reported by the peer, so it never grants privileges and the
-        caller can only act as the agent bound to its own unit.
+        ``external`` marks calls that arrived over the transport: then a
+        verified ``principal`` is mandatory, privileged actions are denied to
+        units, identity fields are bound to the principal, and ``src`` is
+        display-only.  In-process calls (Web/CLI/chat) pass ``principal=None``
+        and keep the trusted operator path.
         """
         handler = self._actions.get(action)
         if handler is None:
             raise BadRequest(f"unknown action: {action}")
-        if action in PRIVILEGED_ACTIONS and (
-                external or src not in ("sys.0", "operator", "web")):
-            raise Denied(f"{action} is a privileged action; ask the operator")
         data = dict(data or {})
-        if external and action == "approval.request":
-            data["principal"] = self._bind_principal(data.get("principal"), src)
+        if external:
+            if principal is None:
+                raise Unauthorized("external rpc requires an authenticated principal")
+            self._authorize(principal, action)
+            data = self._bind_external(principal, action, data)
+        if action in PRINCIPAL_ACTIONS:
+            return await handler(data, src, principal)
         return await handler(data, src)
 
-    def _bind_principal(self, claimed, src: str) -> str:
-        agent = self._agent_for_unit(src)
-        actual = agent.id if agent is not None else src
-        if claimed and str(claimed) != actual:
-            raise Denied(f"{src} may not request approvals as {claimed!r}")
-        return actual
+    def issue_operator_token(self) -> str:
+        """Issue an in-memory operator token for the CLI/tests (never saved)."""
+        token = self.rpc_auth.issue_operator()
+        self.operator_token = token
+        return token
+
+    @staticmethod
+    def _owner_principal(principal: Principal | None) -> str | None:
+        """Owner string used by approval checks (``None`` = operator view)."""
+        if principal is None or principal.is_operator:
+            return None
+        return principal.identity
 
     async def _control_unit(self, work_id: str, action: str, data: dict | None = None):
         return await self.transport.call(work_id, action, data or {}, timeout=3.0)
@@ -545,6 +659,12 @@ class App:
             raise BadRequest("unit kind must be alphanumeric")
         work_id = self.allocator.new_work_id(kind)
         addresses = self.allocator.allocate(work_id)
+        # Only operator/in-process callers reach this handler (worker units are
+        # denied by PRIVILEGED_ACTIONS); the worker receives the token through
+        # SFO_UNIT_TOKEN, never through argv or the wire reply log.
+        unit_token = self.rpc_auth.issue_unit(work_id, data.get("project_id"),
+                                              role=kind,
+                                              agent_id=data.get("agent_id"))
         return {
             "work_id": work_id,
             "rpc_address": addresses.rpc,
@@ -552,10 +672,12 @@ class App:
             "sys_rpc_address": self.sys_addresses.rpc,
             "sys_events_address": self.sys_addresses.events,
             "transport": self.config.transport.mode,
+            "unit_token": unit_token,
         }
 
-    async def _unit_addresses(self, data, src):
-        work_id = str(data.get("work_id") or "")
+    async def _unit_addresses(self, data, src, principal=None):
+        work_id = (principal.id if principal is not None and principal.is_unit
+                   else str(data.get("work_id") or ""))
         if not work_id:
             raise BadRequest("work_id required")
         addresses = self.allocator.addresses(work_id)
@@ -570,8 +692,9 @@ class App:
             "transport": self.config.transport.mode,
         }
 
-    async def _unit_register(self, data, src):
-        work_id = str(data.get("work_id") or "").strip()
+    async def _unit_register(self, data, src, principal=None):
+        work_id = (principal.id if principal is not None and principal.is_unit
+                   else str(data.get("work_id") or "").strip())
         if not work_id:
             raise BadRequest("work_id required")
         kind = str(data.get("kind") or "worker")
@@ -614,8 +737,9 @@ class App:
                            exc_info=True)
         return {"work_id": info.work_id, "registered_at": info.last_seen}
 
-    async def _unit_heartbeat(self, data, src):
-        work_id = str(data.get("work_id") or src)
+    async def _unit_heartbeat(self, data, src, principal=None):
+        work_id = (principal.id if principal is not None and principal.is_unit
+                   else str(data.get("work_id") or src))
         unit = self.registry.heartbeat(work_id, stats=data.get("stats"))
         if unit is None:  # pragma: no cover - registry raises in practice
             raise NotFound(f"unit {work_id} not registered")
@@ -641,9 +765,12 @@ class App:
                 break
         return {"server_ts": now}
 
-    async def _unit_release(self, data, src):
-        work_id = str(data.get("work_id") or src)
+    async def _unit_release(self, data, src, principal=None):
+        work_id = (principal.id if principal is not None and principal.is_unit
+                   else str(data.get("work_id") or src))
         unit = self.registry.release(work_id, reason=str(data.get("reason") or "released"))
+        # The token dies with the unit even if it was already not registered.
+        self.rpc_auth.revoke(work_id)
         if unit is not None:
             self.transport.remove_unit(work_id)
             self.leases.release_holder(work_id, reason="unit_released")
@@ -705,12 +832,14 @@ class App:
     # ------------------------------------------------------------------
     # leases
     # ------------------------------------------------------------------
-    async def _lease_acquire(self, data, src):
+    async def _lease_acquire(self, data, src, principal=None):
         if not data.get("resource"):
             raise BadRequest("resource required")
+        holder = (principal.id if principal is not None and principal.is_unit
+                  else str(data.get("holder") or src))
         lease = self.leases.acquire(
             str(data["resource"]),
-            str(data.get("holder") or src),
+            holder,
             int(data.get("ttl_s") or 300),
             renewable=bool(data.get("renewable", True)),
             preemptible=bool(data.get("preemptible", False)),
@@ -719,20 +848,30 @@ class App:
         )
         return lease.to_dict()
 
-    async def _lease_renew(self, data, src):
-        lease = self.leases.renew(str(data.get("lease_id") or ""),
-                                  str(data.get("holder") or src),
+    async def _lease_renew(self, data, src, principal=None):
+        holder = (principal.id if principal is not None and principal.is_unit
+                  else str(data.get("holder") or src))
+        lease = self.leases.renew(str(data.get("lease_id") or ""), holder,
                                   int(data["ttl_s"]) if data.get("ttl_s") else None)
         return lease.to_dict()
 
-    async def _lease_release(self, data, src):
+    async def _lease_release(self, data, src, principal=None):
+        holder = (principal.id if principal is not None and principal.is_unit
+                  else (data.get("holder") or src))
         lease = self.leases.release(str(data.get("lease_id") or ""),
-                                    holder=data.get("holder") or src,
+                                    holder=holder,
                                     reason=str(data.get("reason") or "released"))
         return lease.to_dict()
 
-    async def _lease_list(self, data, src):
-        leases = self.leases.list(holder=data.get("holder"),
+    async def _lease_list(self, data, src, principal=None):
+        holder = data.get("holder")
+        if principal is not None and principal.is_unit:
+            # A unit sees only the leases it holds; asking for another holder
+            # is treated as an attempt to enumerate someone else's state.
+            if holder is not None and str(holder) != principal.id:
+                raise Denied(f"{principal.id} may not list leases of {holder!r}")
+            holder = principal.id
+        leases = self.leases.list(holder=holder,
                                    resource=data.get("resource"),
                                    active_only=bool(data.get("active_only", True)))
         return {"leases": [lease.to_dict() for lease in leases]}
@@ -753,12 +892,16 @@ class App:
         )
         return request.to_dict()
 
-    async def _approval_status(self, data, src):
-        request = self.approvals.poll(str(data.get("request_id") or ""))
+    async def _approval_status(self, data, src, principal=None):
+        request = self.approvals.poll(
+            str(data.get("request_id") or ""),
+            principal=self._owner_principal(principal))
         return request.to_dict()
 
-    async def _approval_use(self, data, src):
-        ok = self.approvals.use(str(data.get("grant_id") or ""))
+    async def _approval_use(self, data, src, principal=None):
+        ok = self.approvals.use(
+            str(data.get("grant_id") or ""),
+            principal=self._owner_principal(principal))
         return {"ok": ok}
 
     async def _approval_list(self, data, src):
@@ -918,6 +1061,10 @@ class App:
                 if data.get("model"):
                     patch["model"] = data["model"]
                 agent = self.supervisor.update(existing.id, patch)
+                # A unit's token remembers which agent it belongs to, so later
+                # approval requests are keyed by the agent (and cannot claim
+                # another). Attach flows only learn the agent id here.
+                self.rpc_auth.bind_agent(unit_id, agent.id)
                 return agent.to_dict()
         agent = self.supervisor.register(
             role=role,
@@ -926,6 +1073,7 @@ class App:
             task_id=data.get("task_id"),
             model=str(data.get("model") or ""),
         )
+        self.rpc_auth.bind_agent(unit_id, agent.id)
         if role == "lead" and agent.project_id:
             try:
                 project = self.projects.get(agent.project_id)
@@ -991,6 +1139,7 @@ class App:
         work_id = (data or {}).get("work_id")
         if not work_id:
             return
+        self.rpc_auth.revoke(work_id)
         self.transport.remove_unit(work_id)
         self.leases.release_holder(work_id, reason="unit_offline")
         agent = self._agent_for_unit(work_id)

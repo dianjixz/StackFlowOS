@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 #: Hard cap for a single envelope. Agents exchange references (paths, ids),
 #: not blobs; anything above this is a bug or an attack.
@@ -93,14 +93,19 @@ class Envelope:
     error: dict | None = None
     seq: int = 0
     trace: str | None = None
+    #: Connection credential for authenticated RPC (protocol v2).  ``src`` is
+    #: self-reported and display-only; the hub derives the principal from this
+    #: mapping (``{"kind": "unit"|"operator", "id": ..., "token": ...}``).
+    auth: dict | None = None
 
     # -- construction -----------------------------------------------------
     @classmethod
     def rpc(cls, action: str, data: dict | None = None, *, src: str,
             dst: str, object: Any = None, trace: str | None = None,
-            request_id: str | None = None) -> "Envelope":
+            request_id: str | None = None,
+            auth: dict | None = None) -> "Envelope":
         return cls(kind=KIND_RPC, action=action, src=src, dst=dst,
-                   data=data or {}, object=object, trace=trace,
+                   data=data or {}, object=object, trace=trace, auth=auth,
                    **({"id": request_id} if request_id else {}))
 
     @classmethod
@@ -158,6 +163,9 @@ class Envelope:
             raise ValueError("envelope.action must be a non-empty string")
         if not isinstance(src, str) or not isinstance(dst, str):
             raise ValueError("envelope.src/dst must be strings")
+        auth = obj.get("auth")
+        if auth is not None and not isinstance(auth, dict):
+            raise ValueError("envelope.auth must be an object or null")
         return cls(
             kind=kind,
             action=action,
@@ -172,6 +180,7 @@ class Envelope:
             error=obj.get("error") if isinstance(obj.get("error"), dict) else None,
             seq=int(obj.get("seq") or 0),
             trace=obj.get("trace"),
+            auth=auth,
         )
 
 

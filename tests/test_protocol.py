@@ -21,6 +21,14 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(back.v, PROTOCOL_VERSION)
         self.assertTrue(back.ok)
 
+    def test_rpc_auth_roundtrip(self):
+        auth = {"kind": "unit", "id": "coder.0", "token": "t0k3n"}
+        env = Envelope.rpc("sys.ping", {}, src="coder.0", dst="sys", auth=auth)
+        back = Envelope.from_bytes(env.to_bytes())
+        self.assertEqual(back.auth, auth)
+        plain = Envelope.rpc("sys.ping", {}, src="coder.0", dst="sys")
+        self.assertIsNone(Envelope.from_bytes(plain.to_bytes()).auth)
+
     def test_reply_ok(self):
         req = Envelope.rpc("x.y", {"a": 1}, src="a", dst="b")
         rep = req.reply({"value": 42})
@@ -70,6 +78,9 @@ class EnvelopeTests(unittest.TestCase):
             Envelope.from_dict({"kind": "bogus", "action": "a", "src": "s", "dst": "d"})
         with self.assertRaises(ValueError):
             Envelope.from_dict({"kind": "rpc", "action": "", "src": "s", "dst": "d"})
+        with self.assertRaises(ValueError):
+            Envelope.from_dict({"kind": "rpc", "action": "a", "src": "s",
+                                "dst": "d", "auth": "not-an-object"})
 
     def test_oversize_rejected(self):
         env = Envelope.rpc("x", {"blob": "a" * MAX_MESSAGE_BYTES}, src="a", dst="b")

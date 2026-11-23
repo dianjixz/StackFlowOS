@@ -6,7 +6,9 @@ Public surface:
 * :func:`risk_of` — dynamic risk escalation from the concrete scope;
 * :class:`PolicyEngine` / :class:`Rule` / :class:`Decision` — deny-first rules;
 * :class:`ApprovalBroker` / :class:`ApprovalRequest` — human decisions and
-  one-shot/session/permanent grants, fail-closed on expiry.
+  one-shot/session/permanent grants, fail-closed on expiry;
+* :class:`RpcAuthRegistry` / :class:`Principal` — authenticated RPC identity
+  (protocol v2 ``auth``), tokens kept as SHA-256 hashes in memory only.
 """
 
 from .approvals import ApprovalBroker, ApprovalRequest
@@ -21,6 +23,7 @@ from .capabilities import (
     risk_of,
 )
 from .policy import Decision, PolicyEngine, Rule
+from .rpc_auth import Principal, RpcAuthRegistry
 
 __all__ = [
     "CAPABILITIES",
@@ -36,4 +39,6 @@ __all__ = [
     "PolicyEngine",
     "ApprovalRequest",
     "ApprovalBroker",
+    "Principal",
+    "RpcAuthRegistry",
 ]
