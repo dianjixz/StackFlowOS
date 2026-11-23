@@ -69,9 +69,11 @@ class AgentSupervisor:
         self.log = logger or get_logger("agents.supervisor")
         self.control = control
         # Protocol v2 credential hooks (H3). ``token_issuer(work_id,
-        # project_id, role, agent_id)`` returns the unit token handed to the
-        # worker through SFO_UNIT_TOKEN; ``token_revoker(work_id)`` invalidates
-        # it when the process is released/restarted/killed.
+        # project_id, role, agent_id, task_id)`` returns the unit token handed
+        # to the worker through SFO_UNIT_TOKEN; ``token_revoker(work_id)``
+        # invalidates it when the process is released/restarted/killed.  The
+        # scope fields (project/role/agent/task) travel with the credential so
+        # later RPC calls can be authorized without trusting the wire.
         self.token_issuer = token_issuer
         self.token_revoker = token_revoker
         self._popen_factory = popen_factory
@@ -128,12 +130,13 @@ class AgentSupervisor:
         return subprocess.Popen(command, **kwargs)
 
     async def _issue_token(self, work_id: str, project_id: str | None,
-                           role: str, agent_id: str | None) -> str | None:
+                           role: str, agent_id: str | None,
+                           task_id: str | None = None) -> str | None:
         """Ask the hub for this unit's token (sync or async issuer)."""
         issuer = self.token_issuer
         if issuer is None:
             return None
-        value = issuer(work_id, project_id, role, agent_id)
+        value = issuer(work_id, project_id, role, agent_id, task_id)
         if inspect.isawaitable(value):
             value = await value
         return str(value) if value else None
@@ -177,7 +180,8 @@ class AgentSupervisor:
         agent = self.register(role=role, project_id=project_id,
                               unit_id=work_id, task_id=task_id)
         try:
-            token = await self._issue_token(work_id, project_id, role, agent.id)
+            token = await self._issue_token(work_id, project_id, role,
+                                            agent.id, task_id)
             await self._launch(agent, work_id, token=token)
         except Exception as exc:
             agent.status = "failed"
@@ -308,7 +312,7 @@ class AgentSupervisor:
             addresses = await _maybe_await(self.allocator.allocate(new_work_id))
             self._addresses[new_work_id] = addresses
             token = await self._issue_token(new_work_id, agent.project_id,
-                                            agent.role, agent.id)
+                                            agent.role, agent.id, agent.task_id)
             await self._launch(agent, new_work_id, token=token)
         except Exception as exc:
             self.log.warning("restart of %s failed: %s", agent.id, exc)

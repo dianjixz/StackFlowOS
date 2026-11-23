@@ -189,8 +189,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def test_spawn_passes_unit_token_only_through_env(self) -> None:
         issued: list[tuple] = []
 
-        def issue(work_id, project_id, role, agent_id):
-            issued.append((work_id, project_id, role, agent_id))
+        def issue(work_id, project_id, role, agent_id, task_id):
+            issued.append((work_id, project_id, role, agent_id, task_id))
             return f"token-{work_id}"
 
         sup = self._make(token_issuer=issue)
@@ -198,14 +198,15 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         command, kwargs = self.popen_calls[-1]
         self.assertEqual(kwargs["env"]["SFO_UNIT_TOKEN"], "token-coder.0")
         self.assertNotIn("token-coder.0", command)
-        self.assertEqual(issued, [("coder.0", "p-1", "coder", agent.id)])
+        self.assertEqual(issued,
+                         [("coder.0", "p-1", "coder", agent.id, "t-1")])
 
     async def test_restart_revokes_old_token_and_issues_a_new_one(self) -> None:
         issued: list[tuple] = []
         revoked: list[str] = []
 
-        def issue(work_id, project_id, role, agent_id):
-            issued.append((work_id, project_id, role, agent_id))
+        def issue(work_id, project_id, role, agent_id, task_id):
+            issued.append((work_id, project_id, role, agent_id, task_id))
             return f"token-{work_id}"
 
         sup = self._make(token_issuer=issue, token_revoker=revoked.append)

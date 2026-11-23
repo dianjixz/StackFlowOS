@@ -16,7 +16,7 @@ tokens live as long as the hub process and are never written to disk.
 
 Lifecycle::
 
-    supervisor.spawn/restart -> issue_unit(work_id, project_id, role, agent_id)
+    supervisor.spawn/restart -> issue_unit(work_id, project_id, role, agent_id, task_id)
     worker process           <- SFO_UNIT_TOKEN (env, not argv/logs)
     unit.release/offline     -> revoke(work_id)
     CLI/tests                -> issue_operator()
@@ -45,7 +45,8 @@ class Principal:
     ``kind`` is ``"unit"`` (worker), ``"operator"`` (CLI/console) or ``"sys"``
     (in-process only, never created from the wire).  ``id`` is the unit work id
     for units; ``agent_id`` is filled once the worker registers its agent, so
-    approval principals match the agent roster.
+    approval principals match the agent roster; ``task_id`` is the task the
+    unit was spawned for (M5 resource scoping for plain workers).
     """
 
     kind: str
@@ -53,6 +54,7 @@ class Principal:
     project_id: str | None = None
     role: str | None = None
     agent_id: str | None = None
+    task_id: str | None = None
 
     @property
     def is_unit(self) -> bool:
@@ -61,6 +63,16 @@ class Principal:
     @property
     def is_operator(self) -> bool:
         return self.kind == "operator"
+
+    @property
+    def is_lead(self) -> bool:
+        """True for a unit whose credential role is the project lead."""
+        return self.is_unit and self.role == "lead"
+
+    @property
+    def is_worker(self) -> bool:
+        """True for a non-lead unit (least privilege: own task only)."""
+        return self.is_unit and not self.is_lead
 
     @property
     def work_id(self) -> str | None:
@@ -85,6 +97,7 @@ class _UnitCredential:
     project_id: str | None = None
     role: str | None = None
     agent_id: str | None = None
+    task_id: str | None = None
 
 
 class RpcAuthRegistry:
@@ -101,11 +114,14 @@ class RpcAuthRegistry:
     # -- issuance ---------------------------------------------------------
     def issue_unit(self, work_id: str, project_id: str | None = None,
                    role: str | None = None,
-                   agent_id: str | None = None) -> str:
+                   agent_id: str | None = None,
+                   task_id: str | None = None) -> str:
         """Issue a fresh token for ``work_id`` and return it once.
 
         Re-issuing for the same work id replaces (and therefore revokes) the
-        previous token: a unit has exactly one live credential.
+        previous token: a unit has exactly one live credential.  ``project_id``,
+        ``role``, ``agent_id`` and ``task_id`` are the resource scope the token
+        authorizes (M5); the wire never supplies them.
         """
         work_id = str(work_id or "")
         if not work_id:
@@ -117,6 +133,7 @@ class RpcAuthRegistry:
                 project_id=_opt_str(project_id),
                 role=_opt_str(role),
                 agent_id=_opt_str(agent_id),
+                task_id=_opt_str(task_id),
             )
         return token
 
@@ -127,18 +144,24 @@ class RpcAuthRegistry:
             self._operator_hashes.append(self._hash(token))
         return token
 
-    def bind_agent(self, work_id: str, agent_id: str | None) -> None:
-        """Record the agent behind a unit once ``agent.register`` ran.
+    def bind_agent(self, work_id: str, agent_id: str | None,
+                   task_id: str | None = None) -> None:
+        """Record the agent (and its task) behind a unit once registered.
 
         Attach flows allocate a unit before any agent exists, so the agent id
-        is only known later; the next ``verify`` then returns it.
+        is only known later; the next ``verify`` then returns it.  The task id
+        is filled from the same roster entry so a token issued before
+        registration still gets strict own-task scoping.
         """
-        if not agent_id:
+        if not agent_id and not task_id:
             return
         with self._lock:
             credential = self._units.get(str(work_id or ""))
             if credential is not None:
-                credential.agent_id = str(agent_id)
+                if agent_id:
+                    credential.agent_id = str(agent_id)
+                if task_id:
+                    credential.task_id = str(task_id)
 
     # -- verification -----------------------------------------------------
     def verify(self, auth: dict | None) -> Principal:
@@ -168,7 +191,8 @@ class RpcAuthRegistry:
             return Principal(kind="unit", id=work_id,
                              project_id=credential.project_id,
                              role=credential.role,
-                             agent_id=credential.agent_id)
+                             agent_id=credential.agent_id,
+                             task_id=credential.task_id)
         if kind == "operator":
             if not self.verify_operator(token):
                 raise Unauthorized("unknown operator token")

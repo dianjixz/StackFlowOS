@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .agents import AgentSupervisor, ToolExecutor
+from .agents import AgentSupervisor, TASK_ROLES, ToolExecutor
 from .ai import make_provider
 from .config import Config
 from .errors import (BadRequest, Conflict, Denied, NotFound, SfoError,
@@ -41,14 +41,29 @@ VERSION = "0.1.0"
 #: Operator-only actions.  Worker units are denied these over RPC regardless of
 #: the ``src`` they claim; in-process operator/web calls are unaffected.
 #: ``rule.*`` is expanded explicitly because the dispatch table is flat.
+#: ``agent.kill``/``project.archive`` are *not* here since M5: a lead may do
+#: them inside its own project, which ``_authorize_scope`` enforces.  Creating
+#: or enumerating projects stays operator-only (no unit may see the global
+#: project table).
 PRIVILEGED_ACTIONS = {
     "sys.config.set",
     "rule.create", "rule.update", "rule.delete",
     "approval.decide", "approval.list",
-    "project.delete", "project.archive",
+    "project.create", "project.list", "project.delete",
     "unit.kill", "unit.allocate",
     "chat.send",
 }
+
+#: Task actions that resolve one task.  External units may only touch tasks of
+#: their own project; plain workers only the single task bound to their token.
+TASK_SCOPED_ACTIONS = frozenset({
+    "task.get", "task.update", "task.artifact", "task.note", "task.check",
+    "task.claim",
+})
+
+#: Fields a unit (lead or worker) may change through ``project.update``.  The
+#: rest of the card (name/goal/status/tags/color/degraded) is operator-only.
+UNIT_PROJECT_PATCH_FIELDS = frozenset({"brief"})
 
 #: Actions whose handler receives the authenticated principal as a third
 #: argument (identity/owner binding: own unit, own lease, own approval).
@@ -562,6 +577,221 @@ class App:
                 data["principal"] = principal.identity
         return data
 
+    # ------------------------------------------------------------------
+    # resource scopes (M5)
+    # ------------------------------------------------------------------
+    def _authorize_scope(self, principal: Principal, action: str,
+                         data: dict) -> dict:
+        """Enforce project/task/agent resource ranges for external units.
+
+        H3 bound *identity* (work_id/lease holder/approval principal); this
+        layer adds *scope* (plan §5.2.5/§5.2.6): a unit only sees and mutates
+        the project its credential was issued for, a plain worker only the one
+        task it was spawned for, and only a lead may create tasks, spawn/kill
+        agents or archive its own project.  Operators and in-process (``sys``)
+        callers keep the global view.  ``data`` is mutated and returned so the
+        handler never sees a caller-chosen project/src.
+        """
+        if principal.is_operator or principal.kind == "sys":
+            return data
+        if not principal.is_unit:
+            raise Denied(f"unsupported rpc principal kind: {principal.kind!r}")
+
+        if action == "task.list":
+            return self._force_own_project(principal, data)
+        if action in TASK_SCOPED_ACTIONS:
+            return self._scope_task(principal, action, data)
+        if action == "task.create":
+            return self._scope_task_create(principal, data)
+        if action == "agent.spawn":
+            return self._scope_agent_spawn(principal, data)
+        if action == "agent.kill":
+            return self._scope_agent_kill(principal, data)
+        if action in ("agent.register", "agent.update", "agent.finish"):
+            return self._scope_agent_identity(principal, action, data)
+        if action == "agent.list":
+            return self._force_own_project(principal, data)
+        if action == "event.append":
+            # The hub assigns audit provenance: a unit cannot emit events for
+            # another project nor forge an agent/unit source string.  Event
+            # *type* whitelisting is X2, not M5.
+            data["project_id"] = principal.project_id
+            data["source"] = (f"agent:{principal.agent_id}"
+                              if principal.agent_id
+                              else f"unit:{principal.id}")
+            return data
+        if action == "event.since":
+            return self._force_own_project(principal, data)
+        if action in ("memory.get", "memory.set"):
+            return self._force_own_project(principal, data)
+        if action == "unit.list":
+            # The registry filter is the only view a unit gets: no global
+            # enumeration of other projects' processes.
+            data["project_id"] = self._require_own_project(principal)
+            return data
+        if action in ("project.get", "project.update"):
+            return self._scope_project(principal, action, data)
+        if action == "project.archive":
+            return self._scope_project_archive(principal, data)
+        return data
+
+    def _require_own_project(self, principal: Principal) -> str:
+        project_id = principal.project_id
+        if not project_id:
+            raise Denied(f"{principal.id} has no project scope")
+        return str(project_id)
+
+    def _force_own_project(self, principal: Principal, data: dict) -> dict:
+        """Force ``data['project_id']`` to the unit's project (403 on another)."""
+        own = self._require_own_project(principal)
+        requested = data.get("project_id")
+        if requested is not None and str(requested) != own:
+            raise Denied(
+                f"{principal.id} may not access project {requested!r}")
+        data["project_id"] = own
+        return data
+
+    def _principal_task_id(self, principal: Principal) -> str | None:
+        """The single task a plain worker may touch (credential or roster)."""
+        if principal.task_id:
+            return str(principal.task_id)
+        if not principal.agent_id:
+            return None
+        try:
+            agent = self.supervisor.get(principal.agent_id)
+        except SfoError:
+            return None
+        return agent.task_id
+
+    def _scope_task(self, principal: Principal, action: str,
+                    data: dict) -> dict:
+        task_id = str(data.get("task_id") or "").strip()
+        if not task_id:
+            raise BadRequest("task_id required")
+        task = self.projects.task_get(task_id)  # 404 for unknown ids
+        own_project = self._require_own_project(principal)
+        if task.project_id != own_project:
+            raise Denied(
+                f"{principal.id} may not access task {task.id} of project "
+                f"{task.project_id!r}")
+        if not principal.is_lead:
+            own_task = self._principal_task_id(principal)
+            if not own_task or task.id != str(own_task):
+                raise Denied(
+                    f"{principal.id} may only act on its own task {own_task!r}")
+        if action == "task.claim":
+            agent_id = principal.agent_id
+            if not agent_id:
+                raise Denied(f"{principal.id} has no bound agent to claim with")
+            claimed = data.get("agent_id")
+            if claimed is not None and str(claimed) != str(agent_id):
+                raise Denied(
+                    f"{principal.id} may not claim for agent {claimed!r}")
+            data["agent_id"] = str(agent_id)
+        return data
+
+    def _scope_task_create(self, principal: Principal, data: dict) -> dict:
+        if not principal.is_lead:
+            raise Denied("only a project lead may create tasks")
+        data["project_id"] = self._require_own_project(principal)
+        return data
+
+    def _scope_agent_spawn(self, principal: Principal, data: dict) -> dict:
+        if not principal.is_lead:
+            raise Denied("only a project lead may spawn agents")
+        role = str(data.get("role") or "")
+        if role not in TASK_ROLES:
+            raise Denied(
+                "lead may only spawn task roles "
+                f"({', '.join(TASK_ROLES)}), not {role!r}")
+        data["project_id"] = self._require_own_project(principal)
+        return data
+
+    def _scope_agent_kill(self, principal: Principal, data: dict) -> dict:
+        if not principal.is_lead:
+            raise Denied("only a project lead may kill agents")
+        agent_id = str(data.get("agent_id") or "").strip()
+        if not agent_id:
+            raise BadRequest("agent_id required")
+        target = self.supervisor.get(agent_id)  # 404 when unknown
+        own = self._require_own_project(principal)
+        if target.project_id != own:
+            raise Denied(
+                f"{principal.id} may not kill agent {target.id} of project "
+                f"{target.project_id!r}")
+        if (target.id == principal.agent_id
+                or (target.unit_id and target.unit_id == principal.id)):
+            raise Denied("a lead may not kill itself")
+        return data
+
+    def _scope_agent_identity(self, principal: Principal, action: str,
+                              data: dict) -> dict:
+        own_agent = principal.agent_id
+        if action == "agent.register":
+            # ``_bind_external`` already forced unit_id to the principal id.
+            claimed = data.get("agent_id")
+            allowed = {principal.id}
+            if own_agent:
+                allowed.add(str(own_agent))
+            if claimed is not None and str(claimed) not in allowed:
+                raise Denied(
+                    f"{principal.id} may not register agent {claimed!r}")
+            requested = data.get("project_id")
+            if requested is not None and str(requested) != str(principal.project_id):
+                raise Denied(
+                    f"{principal.id} may not register an agent in project "
+                    f"{requested!r}")
+            if principal.project_id is not None:
+                data["project_id"] = str(principal.project_id)
+            requested_task = data.get("task_id")
+            if requested_task is not None and principal.project_id:
+                task = self.projects.task_get(str(requested_task))
+                if task.project_id != principal.project_id:
+                    raise Denied(
+                        f"{principal.id} may not bind to task {task.id} of "
+                        f"project {task.project_id!r}")
+            return data
+        claimed = str(data.get("agent_id") or "")
+        if not own_agent:
+            raise Denied(f"{principal.id} has no bound agent")
+        if claimed != str(own_agent):
+            raise Denied(f"{principal.id} may not update agent {claimed!r}")
+        if action == "agent.update":
+            patch = data.get("patch")
+            if isinstance(patch, dict):
+                requested = patch.get("project_id")
+                if requested is not None and str(requested) != str(principal.project_id):
+                    raise Denied(
+                        f"{principal.id} may not move its agent to project "
+                        f"{requested!r}")
+                requested_task = patch.get("task_id")
+                if requested_task is not None:
+                    task = self.projects.task_get(str(requested_task))
+                    if task.project_id != principal.project_id:
+                        raise Denied(
+                            f"{principal.id} may not bind to task {task.id} "
+                            f"of project {task.project_id!r}")
+        return data
+
+    def _scope_project(self, principal: Principal, action: str,
+                       data: dict) -> dict:
+        data = self._force_own_project(principal, data)
+        if action == "project.update":
+            patch = data.get("patch")
+            if not isinstance(patch, dict):
+                raise BadRequest("project patch must be an object")
+            extra = sorted(set(patch) - UNIT_PROJECT_PATCH_FIELDS)
+            if extra:
+                raise Denied(
+                    "units may not change project fields "
+                    f"{extra}; only 'brief' is allowed")
+        return data
+
+    def _scope_project_archive(self, principal: Principal, data: dict) -> dict:
+        if not principal.is_lead:
+            raise Denied("only a project lead may archive its project")
+        return self._force_own_project(principal, data)
+
     async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0",
                                 external: bool = False,
                                 principal: Principal | None = None) -> dict:
@@ -569,9 +799,10 @@ class App:
 
         ``external`` marks calls that arrived over the transport: then a
         verified ``principal`` is mandatory, privileged actions are denied to
-        units, identity fields are bound to the principal, and ``src`` is
-        display-only.  In-process calls (Web/CLI/chat) pass ``principal=None``
-        and keep the trusted operator path.
+        units, identity fields are bound to the principal, resource scopes are
+        enforced (own project/unit/task), and ``src`` is display-only.
+        In-process calls (Web/CLI/chat) pass ``principal=None`` and keep the
+        trusted operator path.
         """
         handler = self._actions.get(action)
         if handler is None:
@@ -582,6 +813,7 @@ class App:
                 raise Unauthorized("external rpc requires an authenticated principal")
             self._authorize(principal, action)
             data = self._bind_external(principal, action, data)
+            data = self._authorize_scope(principal, action, data)
         if action in PRINCIPAL_ACTIONS:
             return await handler(data, src, principal)
         return await handler(data, src)
@@ -664,7 +896,8 @@ class App:
         # SFO_UNIT_TOKEN, never through argv or the wire reply log.
         unit_token = self.rpc_auth.issue_unit(work_id, data.get("project_id"),
                                               role=kind,
-                                              agent_id=data.get("agent_id"))
+                                              agent_id=data.get("agent_id"),
+                                              task_id=data.get("task_id"))
         return {
             "work_id": work_id,
             "rpc_address": addresses.rpc,
@@ -1061,10 +1294,11 @@ class App:
                 if data.get("model"):
                     patch["model"] = data["model"]
                 agent = self.supervisor.update(existing.id, patch)
-                # A unit's token remembers which agent it belongs to, so later
-                # approval requests are keyed by the agent (and cannot claim
-                # another). Attach flows only learn the agent id here.
-                self.rpc_auth.bind_agent(unit_id, agent.id)
+                # A unit's token remembers which agent (and task) it belongs
+                # to, so later approval requests are keyed by the agent and
+                # plain workers are scope-limited to that task. Attach flows
+                # only learn both here.
+                self.rpc_auth.bind_agent(unit_id, agent.id, agent.task_id)
                 return agent.to_dict()
         agent = self.supervisor.register(
             role=role,
@@ -1073,7 +1307,7 @@ class App:
             task_id=data.get("task_id"),
             model=str(data.get("model") or ""),
         )
-        self.rpc_auth.bind_agent(unit_id, agent.id)
+        self.rpc_auth.bind_agent(unit_id, agent.id, agent.task_id)
         if role == "lead" and agent.project_id:
             try:
                 project = self.projects.get(agent.project_id)

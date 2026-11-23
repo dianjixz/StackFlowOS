@@ -56,6 +56,14 @@ async def _wait_project(app: App, project_id: str, *, timeout: float = 90.0) -> 
         card = app.project_card(project_id)
         if card.get("status") in ("review", "done"):
             return card
+        # M5 scope: a unit may only patch ``project.brief`` -- flipping the
+        # project card to ``review`` is an operator action now.  The worker
+        # side is finished when every task is done and the lead has written
+        # its handoff brief; the human completes the project afterwards.
+        tasks = app.projects.task_list(project_id=project_id)
+        if (tasks and all(task.status == "done" for task in tasks)
+                and card.get("brief")):
+            return card
         await asyncio.sleep(0.5)
     card = app.project_card(project_id)
     raise AssertionError(f"project did not reach review: {json.dumps(card, ensure_ascii=False)}")
@@ -93,7 +101,10 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
                                goal="构建一个把 Markdown 转成 HTML 的命令行工具，包含实现、测试和文档")
         project_id = card["id"]
         final = await _wait_project(self.app, project_id, timeout=120)
-        self.assertIn(final["status"], ("review", "done"))
+        # ``review`` is set by the operator (or the lead on older builds);
+        # after M5 the worker-side handoff is "brief written".
+        self.assertIn(final["status"], ("active", "review", "done"))
+        self.assertTrue(final["brief"])
         self.assertEqual(final["counts"]["done"], final["total_tasks"])
         # A real converter artifact exists and the generated program passes
         # its own selftest.
@@ -127,7 +138,8 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         card = await seed_demo(self.app, name="集成：TCP",
                                goal="做一个 TCP 模式下可用的命令行计算器")
         final = await _wait_project(self.app, card["id"], timeout=90)
-        self.assertIn(final["status"], ("review", "done"))
+        self.assertIn(final["status"], ("active", "review", "done"))
+        self.assertTrue(final["brief"])
         self.assertGreater(files_count(final["workspace"]), 0)
 
     async def test_hub_lock_prevents_second_hub(self):

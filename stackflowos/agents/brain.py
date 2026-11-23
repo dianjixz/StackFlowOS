@@ -218,10 +218,11 @@ class MockBrain:
             self._briefed = True
             brief = (f"目标：{goal}\n任务 {len(tasks)} 个：完成 {done}，"
                      f"评审 {review}，进行中 {doing}，待办 {todo}，阻塞 {blocked}。")
-            # No open work left: hand the project to the human reviewer
-            # instead of leaving it "active" forever.
+            # No open work left: write the handoff summary.  Project status
+            # changes are operator-only (M5 scope: units may patch "brief"
+            # only), so the human reviewer moves the card to review/done.
             return _call("project.update", project_id=project_id,
-                         patch={"brief": brief, "status": "review"})
+                         patch={"brief": brief})
         if self._briefed or not open_tasks:
             return _finish(
                 f"项目推进中：任务 {len(tasks)} 个，完成 {done}，评审 {review}，"
