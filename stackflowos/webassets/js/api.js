@@ -23,14 +23,25 @@ export class ApiError extends Error {
 /** @param {string} path */
 async function requestJson(path, options = {}) {
   const { method = 'GET', body } = options;
+  const write = method !== 'GET' && method !== 'HEAD';
   /** @type {RequestInit} */
   const init = {
     method,
+    // The server authenticates via the HttpOnly `sfo_session` cookie set when
+    // the operator opens the launch URL (`/?token=...`).  Never store or send
+    // a token from JS.
+    credentials: 'same-origin',
     headers: { Accept: 'application/json' },
     cache: 'no-store',
   };
-  if (body !== undefined) {
+  if (write) {
+    // Admission requires both: a non-simple content type and this custom
+    // header.  A cross-site page cannot send either without a CORS preflight,
+    // and the server answers no preflight at all.
     init.headers['Content-Type'] = 'application/json';
+    init.headers['X-SFO-Request'] = '1';
+  }
+  if (body !== undefined) {
     init.body = JSON.stringify(body);
   }
 
@@ -42,6 +53,13 @@ async function requestJson(path, options = {}) {
       code: 'NETWORK',
       detail: cause instanceof Error ? cause.message : String(cause),
     });
+  }
+
+  if (response.status === 401) {
+    throw new ApiError(
+      '未认证或会话已过期：请用 StackFlowOS 启动时打印的登录 URL（含 ?token=...）重新打开控制台。',
+      { code: 'UNAUTHORIZED', status: 401 },
+    );
   }
 
   let payload = null;

@@ -53,6 +53,9 @@ def _parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="print a running hub's state")
     status.add_argument("--url", default=None, help="hub base URL (default: config web host/port)")
+    status.add_argument("--token", default=None,
+                        help="web launch token for Authorization: Bearer "
+                             "(default: $SFO_WEB_TOKEN)")
 
     attach = sub.add_parser("attach", help="attach one worker unit to a running hub")
     attach.add_argument("--sys", required=True, help="hub sys rpc address (ipc:// or tcp://)")
@@ -175,6 +178,42 @@ def _run_cli(factory) -> int:
         return 130
 
 
+def _web_server(app, cfg):
+    """Build a :class:`WebServer` with the browser authentication settings.
+
+    ``SFO_WEB_TOKEN`` is an explicit opt-in override for non-TTY deployments
+    (systemd, containers); by default a fresh per-process token is generated
+    and only printed on a TTY.  The token is never persisted by us.
+    """
+    from .web.server import WebServer
+
+    return WebServer(
+        app,
+        host=cfg.web.host,
+        port=cfg.web.port,
+        trusted_hosts=tuple(cfg.web.trusted_hosts),
+        cookie_ttl_days=cfg.web.cookie_ttl_days,
+        launch_token=os.environ.get("SFO_WEB_TOKEN") or None,
+    )
+
+
+def _print_web_url(server, label: str) -> None:
+    """Print the login URL only on a TTY; never leak the token otherwise.
+
+    systemd/journald capture stdout, so a token printed there would end up in
+    the journal.  Non-TTY operators set ``SFO_WEB_TOKEN`` explicitly and use
+    ``stackflowos status --token``; ``server.login_url`` remains available to
+    in-process callers (tests, future ``sfo url`` control socket).
+    """
+    if sys.stdout.isatty():
+        print(f"\n  {label}  →  {server.login_url}")
+        print("  登录链接只属于本次进程：token 只在这里显示，不写日志、不落盘。")
+    else:
+        print(f"\n  {label}  →  {server.url}")
+        print("  非交互终端：不打印登录 token。请在 TTY 中运行，"
+              "或在启动 hub 前设置 SFO_WEB_TOKEN，再用 `stackflowos status --token` 访问。")
+
+
 # ---------------------------------------------------------------------------
 # hub / demo
 # ---------------------------------------------------------------------------
@@ -185,7 +224,6 @@ def _hub(args) -> int:
 
 async def _run_hub(args, *, demo: bool = False) -> int:
     from .app import App
-    from .web.server import WebServer
 
     cfg = _build_config(args)
     setup_logging("INFO", cfg.paths.log_file)
@@ -193,15 +231,15 @@ async def _run_hub(args, *, demo: bool = False) -> int:
     await app.start()
     server = None
     if not getattr(args, "no_web", False):
-        server = WebServer(app, host=cfg.web.host, port=cfg.web.port)
-        url = await server.start()
-        print(f"\n  StackFlowOS 已启动  →  {url}")
+        server = _web_server(app, cfg)
+        await server.start()
+        _print_web_url(server, "StackFlowOS 已启动")
         print(f"  transport: {cfg.transport.mode}   state: {cfg.paths.state_dir}")
         print("  Ctrl-C 退出\n")
         if getattr(args, "open", False):
             try:
                 import webbrowser
-                webbrowser.open(url)
+                webbrowser.open(server.login_url)
             except Exception:
                 pass
     else:
@@ -228,7 +266,6 @@ async def _run_hub(args, *, demo: bool = False) -> int:
 
 async def _demo(args) -> int:
     from .app import App
-    from .web.server import WebServer
 
     cfg = _build_config(args)
     setup_logging("INFO", cfg.paths.log_file)
@@ -236,9 +273,9 @@ async def _demo(args) -> int:
     await app.start()
     server = None
     if not getattr(args, "no_web", False):
-        server = WebServer(app, host=cfg.web.host, port=cfg.web.port)
-        url = await server.start()
-        print(f"\n  StackFlowOS demo  →  {url}\n")
+        server = _web_server(app, cfg)
+        await server.start()
+        _print_web_url(server, "StackFlowOS demo")
 
     await seed_demo(app, name=args.name, goal=args.goal)
     if getattr(args, "until_done", False):
@@ -472,9 +509,21 @@ def _doctor(args) -> int:
 def _status(args) -> int:
     cfg = _build_config(args, for_web=False)
     url = args.url or f"http://{cfg.web.host}:{cfg.web.port}"
+    token = getattr(args, "token", None) or os.environ.get("SFO_WEB_TOKEN")
+    request = urllib.request.Request(f"{url}/api/state")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(f"{url}/api/state", timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            print(f"hub at {url} requires authentication: pass --token "
+                  "(or set SFO_WEB_TOKEN) with the login token printed by "
+                  "`stackflowos hub` on a TTY", file=sys.stderr)
+        else:
+            print(f"cannot read hub at {url}: HTTP {exc.code}", file=sys.stderr)
+        return 1
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"cannot reach hub at {url}: {exc}", file=sys.stderr)
         return 1

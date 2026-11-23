@@ -288,6 +288,8 @@ export function connectSSE() {
     source = null;
   }
   setSse(attempts > 0 ? 'reconnecting' : 'connecting');
+  // Same-origin EventSource: the browser attaches the HttpOnly `sfo_session`
+  // cookie automatically.  Never append the launch token to this URL.
   const url = `/api/events/stream?since=${encodeURIComponent(String(state.lastSeq || 0))}`;
   let stream;
   try {

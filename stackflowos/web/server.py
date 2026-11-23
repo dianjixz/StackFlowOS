@@ -5,16 +5,18 @@ needs exactly three things — static files, JSON endpoints and an event stream 
 and the stdlib covers all three. No build step, no ASGI stack, nothing to
 install on a robot or a phone-adjacent device.
 
-The server binds loopback by default and has no authentication; it is an
-operator console for one person on one machine. Binding it elsewhere is an
-explicit configuration decision (documented in the README).
+The server binds loopback by default and is an operator console for one person
+on one machine.  Every request passes :class:`stackflowos.web.auth.WebAuth`
+before routing: a per-process launch token is exchanged for an ``HttpOnly``
+cookie, Host/Origin are checked (DNS rebinding, CSRF) and all responses carry
+the console's security headers.  Only CSS/JS/images/favicon are anonymous.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import mimetypes
+import posixpath
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from ..errors import SfoError
 from ..protocol import dumps
 from ..util.logging import get_logger
+from .auth import WebAuth, security_headers
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
 MAX_BODY = 1024 * 1024
@@ -40,7 +43,11 @@ _EXTRA_TYPES = {
 
 class WebServer:
     def __init__(self, app, *, host: str = "127.0.0.1", port: int = 17800,
-                 assets_dir: Path | None = None, logger=None) -> None:
+                 assets_dir: Path | None = None, logger=None,
+                 trusted_hosts: tuple[str, ...] = (),
+                 cookie_ttl_days: int = 7,
+                 secure: bool = False,
+                 launch_token: str | None = None) -> None:
         self.app = app
         self.host = host
         self.port = port
@@ -48,13 +55,30 @@ class WebServer:
         self.log = logger or get_logger("web")
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[asyncio.Task] = set()
+        # Browser admission: token -> HMAC cookie, Host/Origin/CSRF checks.
+        # Both secrets are per-process and memory-only.
+        self.auth = WebAuth(host=host, port=port,
+                            trusted_hosts=trusted_hosts,
+                            cookie_ttl_days=cookie_ttl_days,
+                            secure=secure,
+                            launch_token=launch_token)
         # Imported lazily to keep server.py reusable in tests.
         from .api import WebAPI
         self.api = WebAPI(app)
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{_display_host(self.host)}:{self.port}"
+
+    @property
+    def launch_token(self) -> str:
+        """Per-process launch token (tests/CLI only; never log it)."""
+        return self.auth.launch_token
+
+    @property
+    def login_url(self) -> str:
+        """Browser login URL including the per-process launch token."""
+        return f"{self.url}/?token={self.auth.launch_token}"
 
     async def start(self) -> str:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port,
@@ -62,6 +86,8 @@ class WebServer:
         sockets = self._server.sockets or []
         if sockets:
             self.port = sockets[0].getsockname()[1]
+        # Keep the authority allow-list in sync with the ephemeral port.
+        self.auth.port = self.port
         self.log.info("web listening on %s", self.url)
         return self.url
 
@@ -96,8 +122,25 @@ class WebServer:
                 return
             method, target, headers, body = request
             parts = urlsplit(target)
-            path = unquote(parts.path)
-            query = {k: v[-1] if v else "" for k, v in parse_qs(parts.query).items()}
+            path = _normalize_path(parts.path)
+            if path is None:
+                await self._send_json(writer, 403, {"ok": False, "error": {
+                    "code": "FORBIDDEN", "message": "path traversal is not allowed"}})
+                return
+            query_pairs = parse_qs(parts.query, keep_blank_values=True)
+            query = {k: v[-1] if v else "" for k, v in query_pairs.items()}
+            decision = self.auth.check(method, path, headers,
+                                       query_pairs.get("token", ()))
+            if decision.login:
+                await self._send_redirect(
+                    writer, "./", self.auth.set_cookie_header(headers.get("host", "")))
+                return
+            if not decision.allowed:
+                await self._send_json(writer, decision.status, {
+                    "ok": False,
+                    "error": {"code": decision.code, "message": decision.message},
+                })
+                return
             if path == "/api/events/stream":
                 await self._serve_sse(writer, query)
                 return
@@ -168,11 +211,25 @@ class WebServer:
             f"HTTP/1.1 {status} {_reason(status)}\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
             f"Content-Length: {len(body)}\r\n"
-            "Cache-Control: no-store\r\n"
-            "Connection: close\r\n"
+            + security_headers(cache="no-store")
+            + "Connection: close\r\n"
             "\r\n"
         ).encode("latin-1")
         writer.write(header + body)
+        await writer.drain()
+
+    async def _send_redirect(self, writer: asyncio.StreamWriter, location: str,
+                             cookie: str) -> None:
+        header = (
+            "HTTP/1.1 303 See Other\r\n"
+            f"Location: {location}\r\n"
+            f"Set-Cookie: {cookie}\r\n"
+            "Content-Length: 0\r\n"
+            + security_headers(cache="no-store")
+            + "Connection: close\r\n"
+            "\r\n"
+        ).encode("latin-1")
+        writer.write(header)
         await writer.drain()
 
     async def _serve_static(self, writer: asyncio.StreamWriter, method: str, path: str) -> None:
@@ -211,8 +268,8 @@ class WebServer:
             f"HTTP/1.1 200 OK\r\n"
             f"Content-Type: {ctype}\r\n"
             f"Content-Length: {len(data)}\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
+            + security_headers(cache="no-cache")
+            + "Connection: close\r\n"
             "\r\n"
         ).encode("latin-1")
         writer.write(header)
@@ -226,9 +283,10 @@ class WebServer:
             header = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/event-stream; charset=utf-8\r\n"
-                "Cache-Control: no-cache, no-store\r\n"
-                "Connection: close\r\n"
+                + security_headers(cache="no-cache, no-store")
+                + "Connection: close\r\n"
                 "X-Accel-Buffering: no\r\n"
+                # NOTE: removed by H2, intentionally kept in H1.
                 "Access-Control-Allow-Origin: *\r\n"
                 "\r\n"
             ).encode("latin-1")
@@ -267,10 +325,41 @@ class WebServer:
                 pass
 
 
+def _display_host(host: str) -> str:
+    host = (host or "").strip()
+    if host in ("", "0.0.0.0", "::"):
+        return "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _normalize_path(raw_path: str) -> str | None:
+    """Unquote and collapse ``.``/``//`` before admission and routing.
+
+    Returns ``None`` when the request contains a ``..`` segment.  Without this,
+    ``/css/../index.html`` would look anonymous to the admission layer while
+    the static handler resolves it to the authenticated app shell; a hard 403
+    is simpler and safer than trying to normalise traversal away.
+    """
+    path = unquote(raw_path or "")
+    if not path.startswith("/"):
+        path = "/" + path
+    if any(segment == ".." for segment in path.split("/")):
+        return None
+    path = posixpath.normpath(path)
+    if path.startswith("//"):
+        path = "/" + path.lstrip("/")
+    return path
+
+
 def _reason(status: int) -> str:
     return {
         200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
-        400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-        405: "Method Not Allowed", 409: "Conflict", 500: "Internal Server Error",
+        303: "See Other",
+        400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+        405: "Method Not Allowed", 409: "Conflict",
+        415: "Unsupported Media Type",
+        500: "Internal Server Error",
         503: "Service Unavailable", 504: "Gateway Timeout",
     }.get(status, "OK")

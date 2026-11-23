@@ -203,6 +203,8 @@ class AttachProjectTests(unittest.IsolatedAsyncioTestCase):
                     data=json.dumps({"name": "HTTP 接入",
                                      "path": str(self.external)}).encode())
                 request.add_header("Content-Type", "application/json")
+                request.add_header("X-SFO-Request", "1")
+                request.add_header("Authorization", f"Bearer {server.launch_token}")
                 with urllib.request.urlopen(request, timeout=10) as response:
                     return response.status, json.loads(response.read().decode())
 

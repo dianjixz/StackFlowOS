@@ -256,8 +256,10 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         await self.server.start()
 
         def fetch_state():
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.server.port}/api/state",
-                                        timeout=10) as response:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.server.port}/api/state")
+            req.add_header("Authorization", f"Bearer {self.server.launch_token}")
+            with urllib.request.urlopen(req, timeout=10) as response:
                 return json.loads(response.read().decode())
 
         payload = await asyncio.to_thread(fetch_state)
@@ -269,6 +271,8 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
                 f"http://127.0.0.1:{self.server.port}/api/llm/test",
                 method="POST", data=b"{}")
             req.add_header("Content-Type", "application/json")
+            req.add_header("X-SFO-Request", "1")
+            req.add_header("Authorization", f"Bearer {self.server.launch_token}")
             with urllib.request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read().decode())
 
@@ -277,7 +281,11 @@ class IntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm["data"]["provider"], "mock")
 
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
-        writer.write(b"GET /api/events/stream HTTP/1.1\r\nHost: t\r\n\r\n")
+        writer.write(
+            b"GET /api/events/stream HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{self.server.port}\r\n".encode()
+            + f"Authorization: Bearer {self.server.launch_token}\r\n\r\n".encode()
+        )
         await writer.drain()
         header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
         self.assertIn(b"text/event-stream", header)

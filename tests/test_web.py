@@ -156,8 +156,16 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
     async def aget(self, path: str, method="GET", data=None):
         return await asyncio.to_thread(self.get, path, method, data)
 
+    @property
+    def auth_headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.server.launch_token}"}
+
     def get(self, path: str, method="GET", data=None):
         req = urllib.request.Request(self.url + path, method=method)
+        for key, value in self.auth_headers.items():
+            req.add_header(key, value)
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            req.add_header("X-SFO-Request", "1")
         if data is not None:
             req.add_header("Content-Type", "application/json")
             body = json.dumps(data).encode()
@@ -181,7 +189,10 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_static_files_and_traversal(self):
         def fetch(path):
-            with urllib.request.urlopen(self.url + path, timeout=5) as resp:
+            req = urllib.request.Request(self.url + path)
+            for key, value in self.auth_headers.items():
+                req.add_header(key, value)
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.read()
         self.assertIn(b"<title>SFO</title>", await asyncio.to_thread(fetch, "/"))
         self.assertIn(b"background", await asyncio.to_thread(fetch, "/css/os.css"))
@@ -208,7 +219,10 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         def post_bad():
             req = urllib.request.Request(self.url + "/api/chat", method="POST",
                                          data=b"{not json")
+            for key, value in self.auth_headers.items():
+                req.add_header(key, value)
             req.add_header("Content-Type", "application/json")
+            req.add_header("X-SFO-Request", "1")
             try:
                 urllib.request.urlopen(req, timeout=5)
                 return None
@@ -223,7 +237,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sse_stream(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.server.port)
-        writer.write(b"GET /api/events/stream HTTP/1.1\r\nHost: x\r\n\r\n")
+        writer.write(
+            b"GET /api/events/stream HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{self.server.port}\r\n".encode()
+            + f"Authorization: Bearer {self.server.launch_token}\r\n\r\n".encode()
+        )
         await writer.drain()
         header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
         self.assertIn(b"200 OK", header)

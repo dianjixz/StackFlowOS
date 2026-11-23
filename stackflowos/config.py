@@ -61,6 +61,11 @@ class WebCfg:
     port: int = 17800
     open_browser: bool = False
     sse_heartbeat_s: float = 15.0
+    # Extra exact ``host[:port]`` authorities accepted in the Host header when
+    # the console is bound to a non-loopback interface (H1 admission).
+    trusted_hosts: list[str] = field(default_factory=list)
+    # Lifetime of the HMAC-signed browser session cookie.
+    cookie_ttl_days: int = 7
 
 
 @dataclass
@@ -168,6 +173,12 @@ def resolve_paths(root: Path | None = None, state_dir: Path | None = None) -> Pa
 
 def _coerce(section: str, key: str, value: Any, expected: Any) -> Any:
     origin = get_origin(expected)
+    if origin is list:
+        if not isinstance(value, list):
+            raise ConfigError(f"{section}.{key} must be a list")
+        args = get_args(expected)
+        item_type = args[0] if args else Any
+        return [_coerce(section, key, item, item_type) for item in value]
     if origin is not None:
         # Optional[T] / T | None
         args = [a for a in get_args(expected) if a is not type(None)]
@@ -221,6 +232,10 @@ def _validate_section(name: str, section: Any) -> None:
     elif name == "web":
         if not (1 <= section.port <= 65535):
             raise ConfigError("web.port out of range")
+        if not (1 <= section.cookie_ttl_days <= 365):
+            raise ConfigError("web.cookie_ttl_days out of range (1..365)")
+        if any(not item.strip() for item in section.trusted_hosts):
+            raise ConfigError("web.trusted_hosts entries must be non-empty strings")
     elif name == "security":
         if section.medium_default not in ("ask", "deny"):
             raise ConfigError("security.medium_default must be ask|deny")

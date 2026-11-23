@@ -26,19 +26,19 @@
 环境：Linux、Python ≥ 3.11、`pynng`（已安装 0.9.0 时无需其他依赖）。
 
 ```bash
-# 1) 启动系统（默认 IPC；浏览器打开 http://127.0.0.1:17800）
+# 1) 启动系统（默认 IPC；终端会打印带 ?token= 的登录 URL）
 python3 -m stackflowos hub
 
 # 2) 一键演示：自动建项目、派 Agent、真实写文件、跑自检
 python3 -m stackflowos demo --until-done
-#    不带 --until-done 时 hub 会保持运行，方便打开 http://127.0.0.1:17800 看界面
+#    不带 --until-done 时 hub 会保持运行，打开终端打印的登录 URL 即可看界面
 
 # 3) 换 TCP 传输（同一套协议，地址从 ipc:// 变成 tcp://）
 python3 -m stackflowos hub --transport tcp
 
 # 4) 环境自检 / 查看正在运行的 hub
 python3 -m stackflowos doctor
-python3 -m stackflowos status
+python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 ```
 
 `demo --until-done` 会真的在 `.stackflowos/projects/<id>/workspace/` 里留下设计文档、
@@ -297,10 +297,16 @@ worker 的新进程会读取新配置；已在跑的 Agent 用 spawn 时的配�
 stackflowos hub      [--transport ipc|tcp] [--port 17800] [--no-web]
 stackflowos demo     [--until-done] [--timeout 240] [--goal ...]
 stackflowos doctor
-stackflowos status   [--url http://127.0.0.1:17800]
+stackflowos status   [--url http://127.0.0.1:17800] [--token <launch token>]
 stackflowos attach   --sys tcp://<hub>:17820 --role coder --project p-1
 stackflowos worker   （内部：由 supervisor 拉起）
 ```
+
+Web 控制台默认要求认证：`stackflowos hub` 在 TTY 上打印本次进程的登录 URL
+（`http://127.0.0.1:17800/?token=...`），token 只存在内存、不写日志也不落盘；
+非 TTY 部署可显式设置 `SFO_WEB_TOKEN`，再用 `stackflowos status --token` 或
+`Authorization: Bearer` 访问。静态资源仍需通过 Host/Origin 准入，所有响应带
+CSP / `X-Frame-Options` 等安全头；跨站写请求会被 403/415 拒绝。
 
 `attach` 让一台设备/一个终端手动接入运行中的 hub：向 hub 申请一个 unit 地址，
 在本机起一个 worker 进程；它是 supervisor 内部拉起工人的同一条路径。
