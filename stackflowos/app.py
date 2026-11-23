@@ -29,7 +29,7 @@ from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler
 from .protocol import PROTOCOL_VERSION
 from .projects import ProjectStore, plan_for
 from .security import (ApprovalBroker, PolicyEngine, Principal,
-                       RpcAuthRegistry)
+                       RpcAuthRegistry, project_workspace)
 from .session.chat import ChatService
 from .session.operator import OperatorTools
 from .transport import AddressAllocator, HubTransport, socket_dir_for
@@ -1741,7 +1741,10 @@ class App:
         if getattr(project, "external", False):
             raise ValidationError("refusing to purge an attached external workspace")
         projects_root = self.paths.projects_dir.resolve()
-        project_dir = (self.paths.projects_dir / project.id).resolve()
+        # M9: validate the record's id (it may come from old/hostile state)
+        # before joining it into the projects root, then keep the explicit
+        # containment check on the directory we are about to delete.
+        project_dir = project_workspace(projects_root, project.id).parent
         if project_dir == projects_root or project_dir.parent != projects_root:
             raise ValidationError(
                 "refusing to purge outside the projects directory",

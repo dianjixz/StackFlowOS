@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from ..errors import BadRequest
+from ..errors import BadRequest, ValidationError
 from ..util.net import is_private_host
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -107,6 +107,49 @@ DANGEROUS_PATTERNS: tuple[re.Pattern, ...] = (
     # system power / reboot
     re.compile(r"\b(?:shutdown|reboot|poweroff|halt)\b", re.IGNORECASE),
 )
+
+
+#: A project id is one path segment: it is joined as
+#: ``<projects_root>/<project_id>/workspace``, so it must never be able to
+#: carry ``/``, ``\\``, ``..``, NUL or whitespace into that join.
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_project_id(project_id: object) -> str:
+    """Return ``project_id`` when it is a safe single path segment.
+
+    Project ids reach the policy layer from rules, RPC scopes and persisted
+    records — input that may be hostile or stale. Reject anything that is not
+    a plain ``[A-Za-z0-9][A-Za-z0-9._-]{0,63}`` string instead of silently
+    normalising it, so a bad id is a 400 (:class:`ValidationError`) rather
+    than a redefined filesystem boundary.
+    """
+    if not isinstance(project_id, str):
+        raise ValidationError("invalid project id",
+                              detail={"project_id": repr(project_id)})
+    if project_id in (".", "..") or not _PROJECT_ID_RE.fullmatch(project_id):
+        raise ValidationError("invalid project id",
+                              detail={"project_id": project_id})
+    return project_id
+
+
+def project_workspace(projects_root: str | Path, project_id: str) -> Path:
+    """Resolve ``<projects_root>/<project_id>/workspace`` safely.
+
+    The id is validated first, then both paths are resolved and the result is
+    checked to stay inside ``projects_root`` (symlink-safe via
+    :func:`is_within`). The directory does not need to exist: callers such as
+    :func:`risk_of` only need the boundary, not the files.
+    """
+    pid = validate_project_id(project_id)
+    root = Path(projects_root).resolve()
+    workspace = (root / pid / "workspace").resolve()
+    if not is_within(workspace, root):
+        raise ValidationError(
+            "invalid project id",
+            detail={"project_id": pid,
+                    "reason": "workspace escapes projects root"})
+    return workspace
 
 
 def is_within(path: str | Path, root: str | Path) -> bool:
@@ -199,5 +242,7 @@ __all__ = [
     "is_private_host",
     "is_within",
     "normalize_path",
+    "project_workspace",
     "risk_of",
+    "validate_project_id",
 ]

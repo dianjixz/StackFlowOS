@@ -40,6 +40,7 @@ from .capabilities import (
     is_within,
     get_capability,
     normalize_path,
+    project_workspace,
     risk_of,
 )
 
@@ -286,11 +287,16 @@ class PolicyEngine:
         return self._default(risk)
 
     def risk(self, capability: str, scope: dict) -> str:
-        """Dynamic risk for a capability under the configured project root."""
+        """Dynamic risk for a capability under the configured project root.
+
+        ``scope["project_id"]`` is validated before the workspace join (M9):
+        a hostile id such as ``../../etc`` must raise :class:`ValidationError`
+        instead of silently moving the boundary outside ``projects_root``.
+        """
         workspace = None
         project_id = (scope or {}).get("project_id")
-        if project_id:
-            workspace = self.projects_root / str(project_id) / "workspace"
+        if project_id is not None:
+            workspace = project_workspace(self.projects_root, project_id)
         return risk_of(capability, scope, projects_root=self.projects_root,
                        workspace=workspace)
 

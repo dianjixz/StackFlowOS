@@ -26,7 +26,7 @@ from ..kernel import Context
 from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
 from ..util.jsonio import read_json, write_json
-from .capabilities import risk_of
+from .capabilities import project_workspace, risk_of
 from .policy import Decision, PolicyEngine
 
 _MODE_CHOICES = ("once", "session", "always")
@@ -328,9 +328,14 @@ class ApprovalBroker:
         projects_root = getattr(self.policy, "projects_root", None)
         if not (project_id and projects_root):
             return None
-        workspace = Path(projects_root) / str(project_id) / "workspace"
         try:
-            Path(str(raw)).resolve().relative_to(workspace.resolve())
+            workspace = project_workspace(projects_root, project_id)
+        except ValidationError:
+            # M9: an unusable id must never widen a standing grant; fall back
+            # to the exact path (fail closed) instead.
+            return None
+        try:
+            Path(str(raw)).resolve().relative_to(workspace)
         except (ValueError, OSError):
             return None
         return str(workspace)
@@ -517,11 +522,13 @@ class ApprovalBroker:
 
     def _risk_for(self, capability: str, scope: dict,
                   project_id: str | None) -> str:
-        projects_root = getattr(self.policy, "projects_root", None) or Path.cwd()
+        projects_root = Path(
+            getattr(self.policy, "projects_root", None) or Path.cwd())
         workspace = None
-        if project_id:
-            workspace = Path(projects_root) / str(project_id) / "workspace"
-        return risk_of(capability, scope, projects_root=Path(projects_root),
+        if project_id is not None:
+            # M9: validate the id before joining it into the boundary.
+            workspace = project_workspace(projects_root, project_id)
+        return risk_of(capability, scope, projects_root=projects_root,
                        workspace=workspace)
 
     def _emit_grant_used(self, grant_id: str, rule: Any) -> None:

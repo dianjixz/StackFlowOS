@@ -20,7 +20,9 @@ from .capabilities import (
     get_capability,
     is_within,
     normalize_path,
+    project_workspace,
     risk_of,
+    validate_project_id,
 )
 from .policy import Decision, PolicyEngine, Rule
 from .rpc_auth import Principal, RpcAuthRegistry
@@ -34,6 +36,8 @@ __all__ = [
     "risk_of",
     "is_within",
     "normalize_path",
+    "project_workspace",
+    "validate_project_id",
     "Rule",
     "Decision",
     "PolicyEngine",
