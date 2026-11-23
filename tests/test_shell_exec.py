@@ -1,14 +1,17 @@
-"""H4: shell.exec process-group, timeout and bounded-output hardening."""
+"""H4/L4: shell.exec process-group, timeout, bounded-output and log hardening."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import stat
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from stackflowos.agents.models import Agent
 from stackflowos.agents.tools import (OUTPUT_CAP_BYTES, ToolError,
@@ -233,6 +236,122 @@ class ShellExecHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs), 2)
         for log in logs:
             self.assertTrue(Path(log).exists())
+
+    # -- L4: log file permissions, redaction and size cap -----------------
+    async def test_log_file_is_0600_and_missing_dir_is_created(self) -> None:
+        artifacts = self.ws / ".artifacts"
+        self.assertFalse(artifacts.exists(), "test workspace must start clean")
+        result = await self.executor.run("shell.exec", {"command": "echo hi"})
+        self.assertTrue(result.ok, result.error)
+        path = Path(result.data["log"])
+        self.assertTrue(path.exists())
+        self.assertTrue(path.parent == artifacts)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        # The parent is created 0700; an existing one is never chmodded.
+        self.assertTrue(artifacts.is_dir())
+        self.assertEqual(stat.S_IMODE(artifacts.stat().st_mode) & 0o077, 0)
+
+    async def test_log_redacts_header_stdout_and_stderr(self) -> None:
+        # Tokens are assembled inside the shell so they are absent from the
+        # (redacted) header: only the stream redaction can hide them.
+        command = (
+            "printf 'Authorization: Bearer %s\\n' \"$(printf abc)defgh\"; "
+            "printf 'api_key=sk-%s\\n' 123456; "
+            "printf 'Authorization: Bearer %s\\n' \"$(printf xyz)secret\" >&2"
+        )
+        result = await self.executor.run("shell.exec", {"command": command})
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.data["log"])
+        text = Path(result.data["log"]).read_text(encoding="utf-8")
+        for secret in ("abcdefgh", "sk-123456", "xyzsecret"):
+            self.assertNotIn(secret, text, f"{secret} leaked into the log")
+        self.assertIn("***", text)
+        self.assertIn("Authorization: ***", text)
+
+    async def test_log_header_redacts_command_secrets(self) -> None:
+        result = await self.executor.run("shell.exec", {
+            "command": "true # Authorization: Bearer abcdefghijkl",
+        })
+        self.assertTrue(result.ok, result.error)
+        text = Path(result.data["log"]).read_text(encoding="utf-8")
+        self.assertNotIn("abcdefghijkl", text)
+        self.assertIn("$ true # Authorization: ***", text)
+
+    async def test_log_is_truncated_at_configured_max_bytes(self) -> None:
+        cap = 1024 * 1024
+        executor = self._executor(shell_log_max_bytes=cap)
+        script = "import sys; sys.stdout.write('x' * (3 * 1024 * 1024))"
+        result = await executor.run("shell.exec", {
+            "command": f'{sys.executable} -c "{script}"', "timeout_s": 30,
+        })
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["exit_code"], 0)
+        self.assertFalse(result.data["timed_out"])
+        data = Path(result.data["log"]).read_bytes()
+        marker = f"...[log truncated at {cap} bytes]...".encode("utf-8")
+        self.assertIn(marker, data)
+        # Exactly the cap plus the single marker: no unbounded disk growth.
+        self.assertEqual(len(data), cap + len(b"\n" + marker + b"\n"))
+        # The result's own cap/truncated flag is independent of the log cap.
+        self.assertTrue(result.data["truncated"])
+
+    def test_shell_log_cap_is_sanitized(self) -> None:
+        default = 64 * 1024 * 1024
+        self.assertEqual(self._executor()._shell_log_max_bytes(), default)
+        for bad in (0, -1, "many", None, True):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    self._executor(shell_log_max_bytes=bad)._shell_log_max_bytes(),
+                    default)
+        self.assertEqual(
+            self._executor(shell_log_max_bytes=10)._shell_log_max_bytes(),
+            1024 * 1024)
+        self.assertEqual(
+            self._executor(shell_log_max_bytes=10 ** 12)._shell_log_max_bytes(),
+            1024 ** 3)
+
+    async def test_unwritable_artifacts_dir_yields_empty_log(self) -> None:
+        directory = self.ws / ".artifacts"
+        directory.mkdir()
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("directory permissions are not enforced here")
+        os.chmod(directory, 0o500)
+        try:
+            result = await self.executor.run("shell.exec",
+                                             {"command": "echo hi"})
+        finally:
+            os.chmod(directory, 0o700)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["stdout"], "hi\n")
+        self.assertEqual(result.data["log"], "")
+
+    async def test_log_write_failure_degrades_to_empty_log(self) -> None:
+        original = ToolExecutor._open_shell_log
+
+        class _BrokenHandle:
+            def __init__(self, real: object) -> None:
+                self.real = real
+
+            def write(self, _data: bytes) -> None:
+                raise OSError("disk full")
+
+            def close(self) -> None:
+                self.real.close()
+
+        def open_with_broken_handle(self_: ToolExecutor, command: str,
+                                    cwd: Path):
+            log = original(self_, command, cwd)
+            if log is not None:
+                log._handle = _BrokenHandle(log._handle)
+            return log
+
+        with mock.patch.object(ToolExecutor, "_open_shell_log",
+                               open_with_broken_handle):
+            result = await self.executor.run("shell.exec",
+                                             {"command": "echo hi"})
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["stdout"], "hi\n")
+        self.assertEqual(result.data["log"], "")
 
     @unittest.skipUnless(IS_LINUX, "requires /proc and POSIX process groups")
     async def test_cancellation_kills_group_and_leaves_no_tasks(self) -> None:

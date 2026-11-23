@@ -85,6 +85,16 @@ _SHELL_CANCEL_TERM_GRACE_S = 0.5
 _SHELL_CANCEL_KILL_GRACE_S = 1.0
 #: Poll interval when waiting for a whole process group to disappear.
 _SHELL_GROUP_POLL_S = 0.05
+#: Fallback cap for a streamed shell log when the config value is unusable (L4).
+_DEFAULT_SHELL_LOG_MAX_BYTES = 64 * 1024 * 1024
+#: Accepted range for ``security.shell_log_max_bytes`` (L4): 1 MiB .. 1 GiB.
+SHELL_LOG_MAX_BYTES_MIN = 1024 * 1024
+SHELL_LOG_MAX_BYTES_MAX = 1024 ** 3
+#: Longest partial line buffered while redacting a stream before it is flushed
+#: to disk, so a command that never emits ``\n`` still cannot grow memory (L4).
+_SHELL_LOG_LINE_BYTES = 64 * 1024
+#: Appended once the log reaches ``security.shell_log_max_bytes`` (L4).
+_SHELL_LOG_TRUNCATION_MARKER = "\n...[log truncated at {cap} bytes]...\n"
 
 _ENV_SECRET = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 
@@ -489,38 +499,108 @@ def _net_preview(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 class _ShellLog:
-    """Best-effort streaming sink for a command's *complete* output.
+    """Best-effort streaming sink for a command's *complete* output (H4/L4).
 
-    Writes are synchronous and never raise: an unwritable workspace or a full
-    disk must not change the tool's result.  Stream sections are inserted
-    lazily so interleaved stdout/stderr chunks stay readable.
+    Security properties (docs/security-fix-plan.md §6.7):
+
+    * the file is created with ``0600`` and its ``.artifacts`` parent with
+      ``0700`` by :meth:`ToolExecutor._open_shell_log`;
+    * the ``$ command`` header and every ``stdout``/``stderr`` line pass through
+      :func:`redact_text` before being written, so an echoed token never
+      persists on disk (chunks are decoded with ``errors="replace"``);
+    * the file stops growing at ``security.shell_log_max_bytes``: the last
+      write is cut to the cap and one truncation marker is appended;
+    * writes are synchronous and never raise - an unwritable workspace or a
+      full disk only makes the executor return ``log=""``.
+
+    Stream sections are inserted lazily so interleaved stdout/stderr chunks
+    stay readable.  Text is redacted line by line (a credential never spans a
+    line in practice); an oversized unterminated line is flushed once it
+    exceeds :data:`_SHELL_LOG_LINE_BYTES` so memory stays bounded.
     """
 
-    def __init__(self, handle: Any, path: Path) -> None:
+    def __init__(self, handle: Any, path: Path, *,
+                 max_bytes: int = _DEFAULT_SHELL_LOG_MAX_BYTES) -> None:
         self._handle = handle
         self.path = path
+        self._max_bytes = max(1, int(max_bytes))
+        self._written = 0
         self._stream: str | None = None
+        self._buffers: dict[str, str] = {}
+        self._finished = False
         self.failed = False
+        self.truncated = False
 
-    def write(self, stream: str, chunk: bytes) -> None:
-        if self.failed or not chunk:
-            return
+    # -- header / stream input -------------------------------------------
+    def header(self, command: str, cwd: Path) -> None:
+        """Write the redacted ``$ command`` header (L4: it can carry a secret)."""
         try:
-            if stream != self._stream:
-                if self._stream is not None:
-                    self._handle.write(b"\n")
-                self._handle.write(f"--- {stream} ---\n".encode("utf-8"))
-                self._stream = stream
-            self._handle.write(chunk)
+            self._emit(redact_text(f"$ {command}\ncwd: {cwd}\n"))
         except (OSError, ValueError):
             self.failed = True
 
+    def write(self, stream: str, chunk: bytes) -> None:
+        if self.failed or self._finished or not chunk:
+            return
+        try:
+            if stream != self._stream:
+                self._flush_partial(self._stream)
+                if self._stream is not None:
+                    self._emit("\n")
+                self._emit(f"--- {stream} ---\n")
+                self._stream = stream
+            buffer = self._buffers.get(stream, "") + chunk.decode(
+                "utf-8", "replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                self._emit(redact_text(line) + "\n")
+                if self._finished:
+                    return
+            if len(buffer) > _SHELL_LOG_LINE_BYTES:
+                self._emit(redact_text(buffer))
+                buffer = ""
+            self._buffers[stream] = buffer
+        except (OSError, ValueError):
+            self.failed = True
+
+    def _flush_partial(self, stream: str | None) -> None:
+        if stream is None:
+            return
+        buffer = self._buffers.pop(stream, "")
+        if buffer:
+            self._emit(redact_text(buffer))
+
+    # -- size-capped output ----------------------------------------------
+    def _emit(self, text: str) -> None:
+        if self.failed or self._finished or not text:
+            return
+        data = text.encode("utf-8", "replace")
+        remaining = self._max_bytes - self._written
+        if len(data) <= remaining:
+            self._handle.write(data)
+            self._written += len(data)
+            return
+        if remaining > 0:
+            self._handle.write(data[:remaining])
+            self._written += remaining
+        self._write_truncation_marker()
+
+    def _write_truncation_marker(self) -> None:
+        if self._finished:
+            return
+        marker = _SHELL_LOG_TRUNCATION_MARKER.format(cap=self._max_bytes)
+        raw = marker.encode("utf-8")
+        self._handle.write(raw)
+        self._written += len(raw)
+        self._finished = True
+        self.truncated = True
+
     def close(self, *, exit_code: int, timed_out: bool) -> None:
         try:
-            if not self.failed:
-                self._handle.write(
-                    f"\n--- end ---\nexit: {exit_code} "
-                    f"timed_out: {timed_out}\n".encode("utf-8"))
+            if not self.failed and not self._finished:
+                self._flush_partial(self._stream)
+                self._emit(f"\n--- end ---\nexit: {exit_code} "
+                           f"timed_out: {timed_out}\n")
         except (OSError, ValueError):
             self.failed = True
         finally:
@@ -1335,26 +1415,62 @@ class ToolExecutor:
             timeout_s = default_timeout
         return min(timeout_s, max_timeout)
 
+    def _shell_log_max_bytes(self) -> int:
+        """Sanitized ``security.shell_log_max_bytes`` (L4).
+
+        Directly-built ``SecurityCfg`` objects (tests, old config dumps) skip
+        config validation, so the executor clamps the value to 1 MiB..1 GiB and
+        falls back to 64 MiB when it is unusable.
+        """
+        raw = self._cfg("shell_log_max_bytes", _DEFAULT_SHELL_LOG_MAX_BYTES)
+        if isinstance(raw, bool):
+            return _DEFAULT_SHELL_LOG_MAX_BYTES
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return _DEFAULT_SHELL_LOG_MAX_BYTES
+        if value <= 0:
+            return _DEFAULT_SHELL_LOG_MAX_BYTES
+        return max(SHELL_LOG_MAX_BYTES_MIN,
+                   min(value, SHELL_LOG_MAX_BYTES_MAX))
+
     def _open_shell_log(self, command: str, cwd: Path) -> _ShellLog | None:
-        """Create a uniquely named log file for streaming the full output.
+        """Create a uniquely named, private log file for the full output.
+
+        H4: nanosecond timestamp + random suffix (``O_EXCL`` so two runs can
+        never share a file).  L4: ``.artifacts`` is created ``0700`` (an
+        existing directory is left alone) and the file is created ``0600``; the
+        header is redacted by :meth:`_ShellLog.header`.
 
         Best effort: when ``.artifacts`` is unwritable the tool still returns
-        its result, just without a ``log`` path.
+        its result, just with ``log=""``.
         """
         directory = self.workspace / ".artifacts"
         try:
-            directory.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             path = directory / f"shell-{time.time_ns()}-{secrets.token_hex(4)}.log"
-            handle = path.open("xb")
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except OSError as exc:
             self.log.warning("cannot create shell log under %s: %s",
                              directory, exc)
             return None
-        log = _ShellLog(handle, path)
         try:
-            handle.write(f"$ {command}\ncwd: {cwd}\n".encode("utf-8", "replace"))
-        except (OSError, ValueError):
-            log.failed = True
+            try:
+                # Be explicit rather than relying on the umask; a permissive
+                # umask must not turn the log into 0666.
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError):
+                pass
+            handle = os.fdopen(fd, "wb")
+        except (OSError, ValueError) as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self.log.warning("cannot open shell log %s: %s", path, exc)
+            return None
+        log = _ShellLog(handle, path, max_bytes=self._shell_log_max_bytes())
+        log.header(command, cwd)
         return log
 
     async def _terminate_group(self, proc: asyncio.subprocess.Process) -> bool:
@@ -1441,7 +1557,10 @@ class ToolExecutor:
             "stderr": err_reader.text(),
             "truncated": out_reader.truncated or err_reader.truncated,
             "timed_out": timed_out,
-            "log": str(log.path) if log is not None else "",
+            # L4: a log that could not be written degrades to "" - the command
+            # result itself never depends on the log.
+            "log": (str(log.path)
+                    if log is not None and not log.failed else ""),
             "cwd": str(cwd),
         }
 

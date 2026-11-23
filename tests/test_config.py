@@ -73,6 +73,18 @@ class ConfigTests(unittest.TestCase):
         changed = cfg.update({"security": {"shell_max_timeout_s": 120}})
         self.assertEqual(changed.security.shell_max_timeout_s, 120)
 
+    def test_shell_log_max_bytes_default_and_bounds(self):
+        cfg = Config.load(self.root)
+        self.assertEqual(cfg.security.shell_log_max_bytes, 64 * 1024 * 1024)
+        for bad in (0, 1024 * 1024 - 1, 1024 ** 3 + 1, -1, 1024.0, True, "1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError):
+                    cfg.update({"security": {"shell_log_max_bytes": bad}})
+        self.assertFalse(cfg.paths.config_file.exists(),
+                         "rejected patches must not be persisted")
+        changed = cfg.update({"security": {"shell_log_max_bytes": 1024 * 1024}})
+        self.assertEqual(changed.security.shell_log_max_bytes, 1024 * 1024)
+
     def test_public_masks_secret(self):
         cfg = Config.load(self.root)
         cfg = cfg.update({"llm": {"api_key": "sk-secret"}})
