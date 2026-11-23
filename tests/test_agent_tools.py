@@ -120,6 +120,15 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sys.actions("approval.use"),
                          [{"grant_id": "grant-9"}])
 
+    async def test_spent_one_shot_grant_is_denied(self) -> None:
+        self.sys.approval = {"id": "apr-1", "status": "approved", "mode": "once",
+                             "risk": "low", "grant_id": "grant-1"}
+        self.sys.responses["approval.use"] = {"ok": False}
+        result = await self.executor.run("fs.list", {"path": "."})
+        self.assertFalse(result.ok)
+        self.assertTrue((result.error or "").startswith("DENIED:"))
+        self.assertIn("tool.denied", self.sys.event_types())
+
     async def test_auto_approval_does_not_use_grant(self) -> None:
         result = await self.executor.run("fs.list", {"path": "."})
         self.assertTrue(result.ok)

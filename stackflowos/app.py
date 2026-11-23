@@ -412,7 +412,8 @@ class App:
             if task is None:
                 data = env.data if isinstance(env.data, dict) else {}
                 task = asyncio.create_task(
-                    self.handle_rpc_action(action, data, src=env.src))
+                    self.handle_rpc_action(action, data, src=env.src,
+                                           external=True))
                 self._rpc_inflight[key] = task
 
                 def _done(t: asyncio.Task, key: str = key) -> None:
@@ -434,13 +435,31 @@ class App:
             return payload
         return handle
 
-    async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0") -> dict:
+    async def handle_rpc_action(self, action: str, data: dict, *, src: str = "sys.0",
+                                external: bool = False) -> dict:
+        """Dispatch one sys action.
+
+        ``external`` marks calls that arrived over the transport: ``src`` is
+        then self-reported by the peer, so it never grants privileges and the
+        caller can only act as the agent bound to its own unit.
+        """
         handler = self._actions.get(action)
         if handler is None:
             raise BadRequest(f"unknown action: {action}")
-        if action in PRIVILEGED_ACTIONS and src not in ("sys.0", "operator", "web"):
+        if action in PRIVILEGED_ACTIONS and (
+                external or src not in ("sys.0", "operator", "web")):
             raise Denied(f"{action} is a privileged action; ask the operator")
-        return await handler(data or {}, src)
+        data = dict(data or {})
+        if external and action == "approval.request":
+            data["principal"] = self._bind_principal(data.get("principal"), src)
+        return await handler(data, src)
+
+    def _bind_principal(self, claimed, src: str) -> str:
+        agent = self._agent_for_unit(src)
+        actual = agent.id if agent is not None else src
+        if claimed and str(claimed) != actual:
+            raise Denied(f"{src} may not request approvals as {claimed!r}")
+        return actual
 
     async def _control_unit(self, work_id: str, action: str, data: dict | None = None):
         return await self.transport.call(work_id, action, data or {}, timeout=3.0)
@@ -706,7 +725,6 @@ class App:
             preview=str(data.get("preview") or "")[: self.config.security.max_preview_chars],
             project_id=data.get("project_id"),
             task_id=data.get("task_id"),
-            risk=data.get("risk"),
             ttl_s=int(data["ttl_s"]) if data.get("ttl_s") else None,
         )
         return request.to_dict()
@@ -1417,6 +1435,9 @@ class App:
         if request.status != "approved":
             why = request.note or request.status
             return {"ok": False, "error": f"审批未通过（{request.status}：{why}）"}
+        if request.mode == "once" and not (
+                request.grant_id and self.approvals.use(request.grant_id)):
+            return {"ok": False, "error": "审批未通过（一次性授权已被使用）"}
         try:
             if tool == "project.create":
                 card = await self.create_project(
@@ -1459,7 +1480,7 @@ class App:
                 return {"ok": False, "error": "unhandled tool"}
         except SfoError as exc:
             return {"ok": False, "error": f"{exc.code}: {exc.message}"}
-        if request.grant_id:
+        if request.mode == "grant" and request.grant_id:
             self.approvals.use(request.grant_id)
         return {"ok": True, "data": result}
 

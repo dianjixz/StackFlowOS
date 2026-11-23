@@ -27,7 +27,7 @@ from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
 from ..util.jsonio import read_json, write_json
 from .capabilities import risk_of
-from .policy import PolicyEngine
+from .policy import Decision, PolicyEngine
 
 _MODE_CHOICES = ("once", "session", "always")
 #: Destructive/targeted capabilities keep their exact scope in standing grants.
@@ -49,6 +49,8 @@ def _host_of(url: str) -> str:
     except ValueError:
         return ""
 _DECISION_CHOICES = ("allow", "deny")
+_KEEP_DECIDED = 200
+_KEEP_AUTO_DECIDED = 50
 
 
 @dataclass
@@ -135,13 +137,17 @@ class ApprovalBroker:
             task_id=task_id,
             created_at=now,
         )
+        if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
+            # A one-shot grant lost the race (or was already spent): a human
+            # has to decide again instead of reusing it.
+            decision = Decision("ask", risk, "one-shot grant already spent")
         if decision.outcome == "deny":
             request.status = "denied"
             request.mode = "auto"
             request.decided_at = now
             request.decided_by = "policy"
             request.note = decision.reason
-            self._store(request)
+            self._store(request, persist=False)
             self._emit("approval.auto", request, decision="deny",
                        rule_id=decision.rule.id if decision.rule else None,
                        policy_reason=decision.reason)
@@ -155,7 +161,7 @@ class ApprovalBroker:
             request.decided_at = now
             request.decided_by = "policy"
             request.note = decision.reason
-            self._store(request)
+            self._store(request, persist=False)
             self._emit("approval.auto", request, decision="allow",
                        rule_id=request.grant_id, mode=request.mode,
                        policy_reason=decision.reason)
@@ -200,27 +206,37 @@ class ApprovalBroker:
         if decision == "allow" and mode not in _MODE_CHOICES:
             raise BadRequest(f"mode must be one of {list(_MODE_CHOICES)}")
         now = _now_ms()
+        expired = False
         with self._lock:
             request = self.get(request_id)
             if request.status != "pending":
                 raise Conflict(
                     f"approval {request_id!r} is already {request.status!r}",
                     detail={"request_id": request_id, "status": request.status})
-        if decision == "deny":
-            request.status = "denied"
-            request.mode = None
-        else:
-            request.status = "approved"
-            request.mode = mode
-            grant = self._materialise_grant(request, mode, by, now)
-            request.grant_id = grant.id
-        request.decided_at = now
-        request.decided_by = str(by or "operator")
-        request.note = str(note or request.note or "")
-        request.expires_at = request.expires_at or now
-        with self._lock:
+            if request.expires_at and now >= request.expires_at:
+                request.status = "expired"
+                request.decided_at = now
+                request.note = request.note or "expired"
+                expired = True
+            elif decision == "deny":
+                request.status = "denied"
+                request.mode = None
+            else:
+                grant = self._materialise_grant(request, mode, by, now)
+                request.status = "approved"
+                request.mode = mode
+                request.grant_id = grant.id
+            if not expired:
+                request.decided_at = now
+                request.decided_by = str(by or "operator")
+                request.note = str(note or request.note or "")
+                request.expires_at = request.expires_at or now
             self._requests[request.id] = request
         self.save()
+        if expired:
+            self._emit("approval.expired", request)
+            raise Conflict(f"approval {request_id!r} has expired",
+                           detail={"request_id": request_id, "status": "expired"})
         self._emit("approval.decided", request, decision=decision,
                    mode=request.mode, by=request.decided_by,
                    grant_id=request.grant_id)
@@ -328,6 +344,8 @@ class ApprovalBroker:
             with self._lock:
                 if request.status != "pending":
                     continue
+                if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
+                    continue
                 rule = decision.rule
                 if decision.outcome == "allow":
                     request.status = "approved"
@@ -401,12 +419,13 @@ class ApprovalBroker:
             pending = [request for request in self._requests.values()
                        if request.status == "pending"]
             decided = [request for request in self._requests.values()
-                       if request.status != "pending"]
+                       if request.status != "pending"
+                       and request.decided_by != "policy"]
         decided.sort(key=lambda request: (request.decided_at or request.created_at,
                                           request.id))
         payload = {
             "version": 1,
-            "requests": [request.to_dict() for request in pending + decided[-200:]],
+            "requests": [request.to_dict() for request in pending + decided[-_KEEP_DECIDED:]],
         }
         write_json(self.approvals_path, payload)
 
@@ -434,10 +453,33 @@ class ApprovalBroker:
             self._requests = requests
 
     # -- internals --------------------------------------------------------
-    def _store(self, request: ApprovalRequest) -> None:
+    def _store(self, request: ApprovalRequest, *, persist: bool = True) -> None:
         with self._lock:
             self._requests[request.id] = request
-        self.save()
+            self._prune()
+        if persist:
+            self.save()
+
+    def _prune(self) -> None:
+        """Bound memory: policy-decided requests are only audit noise (the
+        event log keeps them), so they never push human decisions out."""
+        decided = sorted(
+            (r for r in self._requests.values() if r.status != "pending"),
+            key=lambda r: (r.decided_at or r.created_at, r.id))
+        human = [r for r in decided if r.decided_by != "policy"]
+        auto = [r for r in decided if r.decided_by == "policy"]
+        drop = human[:-_KEEP_DECIDED] + auto[:-_KEEP_AUTO_DECIDED]
+        for request in drop:
+            self._requests.pop(request.id, None)
+
+    def _spend_one_shot(self, rule: Any) -> bool:
+        """Consume a one-shot grant when ``rule`` is one; standing rules pass."""
+        if rule is None or rule.uses_left is None:
+            return True
+        if not self.policy.consume(rule.id):
+            return False
+        self._emit_grant_used(rule.id, rule)
+        return True
 
     def _risk_for(self, capability: str, scope: dict,
                   project_id: str | None) -> str:

@@ -609,9 +609,13 @@ class ApprovalTests(SecurityTestBase):
             "agent.coder.1", "shell.exec",
             {"cwd": str(self.workspace), "command": "make"}, project_id="p-1")
         approved = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "ls"}, project_id="p-1")
+        self.broker.decide(approved.id, decision="allow", mode="once")
+        auto = self.broker.request(
             "agent.coder.1", "fs.read",
             {"path": str(self.workspace / "a.txt")}, project_id="p-1")
-        self.assertEqual(approved.status, "approved")
+        self.assertEqual(auto.status, "approved")
 
         reloaded = ApprovalBroker(
             self.ctx, self.policy, self.log,
@@ -622,6 +626,44 @@ class ApprovalTests(SecurityTestBase):
         self.assertEqual(reloaded.get(approved.id).status, "approved")
         self.assertEqual(len(reloaded.list()), 2)
         self.assertEqual(reloaded.list(status="pending")[0].id, pending.id)
+        # policy-decided requests live in the event log, not approvals.json
+        with self.assertRaises(NotFound):
+            reloaded.get(auto.id)
+
+    def test_one_shot_grant_cannot_be_reused(self):
+        scope = {"cwd": str(self.workspace), "command": "make"}
+        first = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                    project_id="p-1")
+        self.broker.decide(first.id, decision="allow", mode="once")
+        second = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                     project_id="p-1")
+        third = self.broker.request("agent.coder.1", "shell.exec", scope,
+                                    project_id="p-1")
+        self.assertEqual(second.status, "approved")
+        self.assertEqual(third.status, "pending")
+
+    def test_decide_rejects_expired_request(self):
+        request = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "slow"}, project_id="p-1",
+            ttl_s=1)
+        request.expires_at = now_ms() - 1
+        with self.assertRaises(Conflict):
+            self.broker.decide(request.id, decision="allow", mode="always")
+        self.assertEqual(self.broker.get(request.id).status, "expired")
+        self.assertEqual(self.policy.list_rules(), [])
+
+    def test_auto_decisions_do_not_evict_human_history(self):
+        human = self.broker.request(
+            "agent.coder.1", "shell.exec",
+            {"cwd": str(self.workspace), "command": "h"}, project_id="p-1")
+        self.broker.decide(human.id, decision="deny")
+        for i in range(120):
+            self.broker.request("agent.coder.1", "fs.read",
+                                {"path": str(self.workspace / f"{i}.txt")},
+                                project_id="p-1")
+        self.assertEqual(self.broker.get(human.id).status, "denied")
+        self.assertLessEqual(len(self.broker.list(limit=1000)), 52)
 
     def test_request_validation(self):
         with self.assertRaises(BadRequest):
