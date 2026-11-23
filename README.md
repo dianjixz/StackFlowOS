@@ -121,7 +121,7 @@ worker 进程（coder.3 / lead.2 / reviewer.7 ...）
 
 ```python
 transport.mode = "ipc"   # ipc://<state>/run/<work_id>.rpc.sock
-transport.mode = "tcp"   # tcp://127.0.0.1:<port>（advertise_host 可指向远端可达地址）
+transport.mode = "tcp"   # tcp://127.0.0.1:<port>（远程监听需 transport.allow_remote=true）
 ```
 
 IPC 的 socket 路径受 `sockaddr_un`（约 100 字节）限制；状态目录过深时，hub 会自动把 socket
@@ -129,7 +129,9 @@ IPC 的 socket 路径受 `sockaddr_un`（约 100 字节）限制；状态目录�
 
 单元启动时向 sys 要地址（`unit.addresses`），然后绑定自己的 REP/PUB。
 换设备时，把 hub 的 `sys_rpc` 换成 `tcp://<host>:<port>` 即可让那台设备上的
-worker 接进来——语义上它就是同一台机器上的另一个进程。
+worker 接进来——语义上它就是同一台机器上的另一个进程。远程监听默认关闭：
+`transport.host` 必须是 loopback，要绑定具体网卡/通配地址需显式
+`transport.allow_remote = true`（详见下方「配置」）。
 
 ---
 
@@ -251,9 +253,11 @@ Agent 的工具调用一律经过 `ToolExecutor`：
 
 ```json
 {
-  "transport": { "mode": "ipc", "host": "127.0.0.1", "advertise_host": null,
+  "transport": { "mode": "ipc", "host": "127.0.0.1", "allow_remote": false,
+                 "advertise_host": null,
                  "port_pool_start": 17820, "port_pool_end": 17899 },
-  "web": { "host": "127.0.0.1", "port": 17800 },
+  "web": { "host": "127.0.0.1", "port": 17800, "allow_remote": false,
+           "tls_cert": "", "tls_key": "" },
   "security": { "auto_allow_low": true, "medium_default": "ask",
                 "high_default": "ask", "approval_ttl_s": 300,
                 "grant_ttl_s": 3600, "allow_shell": true },
@@ -261,6 +265,13 @@ Agent 的工具调用一律经过 `ToolExecutor`：
   "agents": { "heartbeat_s": 2.0, "offline_after_s": 8.0, "max_workers": 6 }
 }
 ```
+
+`web.host` / `transport.host` 默认 loopback。代码层拒绝 `0.0.0.0`、`::`、`*`、空值
+以及任何非 loopback 地址，除非该段显式开启 `allow_remote`（hub 的 `--allow-remote`
+只放宽 `web`，RPC 监听用 `transport.allow_remote`）。两者互不放行：打开
+`web.allow_remote` 不会让 `transport.host` 变成 `0.0.0.0`，反之亦然。
+`web.tls_cert` / `web.tls_key` 是 Phase 5 TLS 监听的预留配置，当前控制台仍是明文
+HTTP；远程使用时请套 SSH 隧道或 TLS 终止反代，并在启动时留意 plaintext 警告。
 
 环境变量：`SFO_ROOT`、`SFO_STATE_DIR`、`SFO_WEB_PORT`、`SFO_TRANSPORT_MODE`、
 `SFO_LLM_PROVIDER`、`SFO_LLM_BASE_URL`、`SFO_LLM_MODEL`、`SFO_LLM_API_KEY`。
@@ -294,7 +305,7 @@ worker 的新进程会读取新配置；已在跑的 Agent 用 spawn 时的配�
 ## 命令
 
 ```
-stackflowos hub      [--transport ipc|tcp] [--port 17800] [--no-web]
+stackflowos hub      [--transport ipc|tcp] [--host 127.0.0.1] [--allow-remote] [--port 17800] [--no-web]
 stackflowos demo     [--until-done] [--timeout 240] [--goal ...]
 stackflowos doctor
 stackflowos status   [--url http://127.0.0.1:17800] [--token <launch token>]
@@ -335,7 +346,9 @@ python3 -m unittest discover -s tests -t . -v
 3. **worker 可信。** 工具在 worker 本地执行，sys 授权并审计；恶意 worker
    可以绕过本地检查直接改文件。接不可信设备时要把执行搬进 sys 侧沙箱。
 4. **文件沙箱是路径白名单**，不是容器/命名空间；shell 仍拥有进程用户的权限。
-5. **无鉴权。** 默认只绑 `127.0.0.1`；暴露到网络前必须自己加反代/鉴权。
+5. **远程绑定需显式开启。** 默认只绑 `127.0.0.1`；`0.0.0.0`/`::`/具体网卡地址必须
+   配 `allow_remote`。控制台认证（token/cookie）已有，但 TLS 监听是 Phase 5，
+   远程明文暴露前必须自己加 SSH 隧道或 TLS 终止反代。
 6. **mock 大脑不是智能。** 它按角色产出确定性的真实工作，用来验证系统；
    真智能来自外接模型。
 7. **L0 用 pynng，不是 libzmq。** 与 StackFlow 的 ZMQ 不能直连；

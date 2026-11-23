@@ -603,7 +603,14 @@ class Brain(Protocol):
 
 ## 9. Web 与 UI
 
-### 9.1 HTTP API（同源，无鉴权，只绑定 127.0.0.1）
+### 9.1 HTTP API（同源；默认 loopback，远程绑定需显式 allow_remote）
+
+`web.host` 默认 `127.0.0.1`；配置层拒绝 `0.0.0.0`、`::`、`*`、空值以及任何非
+loopback 地址，除非显式设置 `web.allow_remote = true`（CLI 对应
+`--allow-remote`）。`transport.host` 同理，但由独立的 `transport.allow_remote`
+控制，二者互不放行。TLS 监听是 Phase 5，`web.tls_cert`/`web.tls_key` 目前只做
+配对校验；远程明文部署必须置于 SSH 隧道或 TLS 终止反代之后。Host/Origin 白名单
+（§5.1.4）是请求层准入，不能替代监听地址策略。
 
 统一响应：`{"ok": true, "data": ...}` / `{"ok": false, "error": {...}}`。
 
@@ -705,7 +712,8 @@ tests/
 
 * 真正的多设备发现（mDNS/组网）：预留 TCP 地址即可，不实现发现协议。
 * 强沙箱（容器/命名空间）：用路径白名单 + 命令策略，文档写清限制。
-* 多用户与鉴权：默认单机单操作员，绑定 127.0.0.1。
+* 多用户与鉴权：默认单机单操作员，绑定 127.0.0.1；远程监听需显式
+  `allow_remote`（TLS 监听见 Phase 5）。
 * 大规模调度：单 hub，租约语义优先于吞吐。
 
 

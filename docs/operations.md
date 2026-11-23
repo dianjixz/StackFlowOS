@@ -99,6 +99,10 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
 
 1. hub 配置 `transport.mode = "tcp"`，`transport.host` 设为设备可达地址，
    `transport.advertise_host` 设为**远端能拨到的 hub 地址**（例如局域网 IP）。
+   非 loopback 的 `transport.host` 必须同时显式设置
+   `transport.allow_remote = true`；默认只允许 loopback，通配/网卡地址会被配置校验拒绝。
+   Web 控制台若也要远程访问，用 `--host <具体IP> --allow-remote`（即
+   `web.allow_remote = true`），并置于 SSH 隧道或 TLS 终止反代之后（TLS 监听见 Phase 5）。
 2. 放行防火墙上的 sys RPC 端口与单元端口池。
 3. 远端设备安装同一份代码（需要 `pynng`），在本地有自己的 `.stackflowos/`；
    用 attach 接入：

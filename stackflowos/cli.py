@@ -25,7 +25,7 @@ import urllib.request
 from pathlib import Path
 
 from . import __version__
-from .config import Config, ConfigError
+from .config import Config, ConfigError, is_loopback_host
 from .util.logging import get_logger, setup_logging
 
 
@@ -89,7 +89,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-dir", default=None, help="runtime state directory")
     parser.add_argument("--transport", choices=("ipc", "tcp"), default=None)
     parser.add_argument("--port", type=int, default=None, help="web console port")
-    parser.add_argument("--host", default=None, help="web console bind host")
+    parser.add_argument("--host", default=None,
+                        help="web console bind host (loopback by default)")
+    parser.add_argument("--allow-remote", dest="allow_remote", action="store_true",
+                        default=None,
+                        help="allow a non-loopback web console bind "
+                             "(sets web.allow_remote; transport is configured "
+                             "separately via transport.allow_remote)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -112,9 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return _worker_main(worker_args)
     if args.command == "doctor":
-        return _doctor(args)
+        return _run_cli(lambda: _doctor(args))
     if args.command == "status":
-        return _status(args)
+        return _run_cli(lambda: _status(args))
     if args.command == "demo":
         return _run_cli(lambda: asyncio.run(_demo(args)))
     return _run_cli(lambda: _hub(args))
@@ -183,6 +189,10 @@ def _build_config(args, *, for_web: bool = True) -> Config:
         patch.setdefault("web", {})["port"] = args.port
     if getattr(args, "host", None):
         patch.setdefault("web", {})["host"] = args.host
+    if getattr(args, "allow_remote", None):
+        # CLI flag is web-only: ``--host`` also targets the console.  Widening
+        # the RPC listener requires ``transport.allow_remote`` in config.
+        patch.setdefault("web", {})["allow_remote"] = True
     if patch:
         # CLI flags are per-process; only the Settings UI persists changes.
         cfg = cfg.with_overrides(patch)
@@ -207,6 +217,14 @@ def _web_server(app, cfg):
     and only printed on a TTY.  The token is never persisted by us.
     """
     from .web.server import WebServer
+
+    if not is_loopback_host(cfg.web.host):
+        # L8: remote binds are explicit, but the TLS listener is Phase 5.  Be
+        # honest at startup instead of implying the console is protected.
+        print("[warn] web console is bound to a non-loopback address "
+              f"({cfg.web.host}); it speaks plaintext HTTP until the Phase 5 "
+              "TLS listener, so use an SSH tunnel or a TLS-terminating "
+              "reverse proxy", file=sys.stderr)
 
     return WebServer(
         app,

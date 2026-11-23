@@ -10,6 +10,7 @@ written outside the repository unless the operator explicitly points
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import os
 import socket
 from dataclasses import dataclass, field
@@ -53,6 +54,10 @@ class TransportCfg:
     ipc_dir: str | None = None
     rpc_timeout_s: float = 8.0
     sys_rpc_address: str | None = None  # filled at boot, read-only at runtime
+    #: L8: allow ``transport.host`` to be wildcard or non-loopback.  Default
+    #: False keeps the RPC listener on the local machine only; authentication
+    #: (protocol v2) is independent and does not make a public bind safe.
+    allow_remote: bool = False
 
 
 @dataclass
@@ -68,6 +73,15 @@ class WebCfg:
     trusted_hosts: list[str] = field(default_factory=list)
     # Lifetime of the HMAC-signed browser session cookie.
     cookie_ttl_days: int = 7
+    #: L8: allow ``web.host`` to be wildcard or non-loopback.  Default False
+    #: keeps the console on loopback; Host/Origin admission (H1) does not make
+    #: a wildcard listener private.
+    allow_remote: bool = False
+    #: Reserved for the Phase 5 TLS listener.  L8 only records/validates the
+    #: pair; the console still speaks plaintext HTTP, so remote deployments
+    #: must sit behind an SSH tunnel or a TLS-terminating reverse proxy.
+    tls_cert: str = ""
+    tls_key: str = ""
 
 
 @dataclass
@@ -243,8 +257,84 @@ def _build_section(name: str, raw: dict) -> Any:
     return section
 
 
+def normalize_bind_host(host: str) -> str:
+    """Normalise a bind host for policy checks (L8).
+
+    Strips surrounding whitespace and one pair of IPv6 brackets so
+    ``" [::1] "`` and ``"::1"`` are judged identically.  The original
+    spelling (for DNS names) is otherwise preserved.
+    """
+    value = str(host or "").strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1].strip()
+    return value
+
+
+_LOOPBACK_NAMES = frozenset({"localhost"})
+#: Explicit wildcard spellings; IP literals are also checked with
+#: ``ipaddress`` so every textual form of the unspecified address is caught.
+_WILDCARD_HOSTS = frozenset({"", "*", "0.0.0.0", "::", "0:0:0:0:0:0:0:0"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for ``localhost``, ``127.0.0.0/8`` and ``::1`` (L8)."""
+    value = normalize_bind_host(host).lower()
+    if value in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def is_wildcard_host(host: str) -> bool:
+    """True when ``host`` means "bind every interface" (L8)."""
+    value = normalize_bind_host(host).lower()
+    if value in _WILDCARD_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return False
+
+
+def _validate_bind_policy(name: str, section: Any) -> None:
+    """Reject wildcard/non-loopback bind hosts unless the section opts in (L8).
+
+    ``transport.allow_remote`` only governs ``transport.host`` and
+    ``web.allow_remote`` only governs ``web.host``; the two are deliberately
+    independent so allowing the RPC port to the LAN cannot silently expose the
+    browser console (and vice versa).
+    """
+    host = section.host
+    if not isinstance(host, str):
+        raise ConfigError(f"{name}.host must be a string")
+    normalized = normalize_bind_host(host)
+    if normalized != host:
+        section.host = normalized
+    if not isinstance(section.allow_remote, bool):
+        raise ConfigError(f"{name}.allow_remote must be a boolean")
+    if is_loopback_host(normalized):
+        return
+    if section.allow_remote:
+        return
+    if is_wildcard_host(normalized):
+        problem = "binds every network interface"
+    else:
+        problem = "is not a loopback address"
+    hint = f"{name}.allow_remote=true"
+    if name == "web":
+        hint += " (or pass --allow-remote)"
+    raise ConfigError(
+        f"{name}.host {normalized!r} {problem}; remote binds are disabled by "
+        f"default. Set {hint} to allow other machines to connect, and keep the "
+        "listener behind an SSH tunnel or an authenticated TLS reverse proxy"
+    )
+
+
 def _validate_section(name: str, section: Any) -> None:
     if name == "transport":
+        _validate_bind_policy(name, section)
         if section.mode not in ("ipc", "tcp"):
             raise ConfigError("transport.mode must be 'ipc' or 'tcp'")
         if not (1024 <= section.port_pool_start < section.port_pool_end <= 65535):
@@ -252,6 +342,7 @@ def _validate_section(name: str, section: Any) -> None:
         if section.rpc_timeout_s <= 0:
             raise ConfigError("transport.rpc_timeout_s must be positive")
     elif name == "web":
+        _validate_bind_policy(name, section)
         if not (1 <= section.port <= 65535):
             raise ConfigError("web.port out of range")
         if not (1 <= section.cookie_ttl_days <= 365):
@@ -262,6 +353,18 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("web.sse_max_clients out of range (1..256)")
         if any(not item.strip() for item in section.trusted_hosts):
             raise ConfigError("web.trusted_hosts entries must be non-empty strings")
+        # TLS listener is Phase 5; L8 only validates the reserved pair so a
+        # half-configured deployment fails loudly instead of silently serving
+        # plaintext with an unused certificate path.
+        if not isinstance(section.tls_cert, str) or not isinstance(section.tls_key, str):
+            raise ConfigError("web.tls_cert and web.tls_key must be strings")
+        cert = section.tls_cert.strip()
+        key = section.tls_key.strip()
+        if bool(cert) != bool(key):
+            raise ConfigError(
+                "web.tls_cert and web.tls_key must be set together "
+                "(the TLS listener itself is Phase 5; use a TLS-terminating "
+                "reverse proxy in front of the plaintext console for now)")
     elif name == "security":
         if section.medium_default not in ("ask", "deny"):
             raise ConfigError("security.medium_default must be ask|deny")
