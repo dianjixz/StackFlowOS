@@ -344,8 +344,10 @@ class Admission:
 | Content-Type | 非 GET/HEAD 必须是 `application/json`；`text/plain`、`application/x-www-form-urlencoded`、`multipart/form-data` 一律 415。 |
 | CSRF header | 非 GET 必须带 `X-SFO-Request: 1`（自定义头触发 CORS 预检；服务端不回应预检，所以跨站无法发送）。 |
 | `OPTIONS` | 返回 405，不带任何 `Access-Control-*`。 |
-| 认证 | `/api/*`、`/api/events/stream`、`/`、`/index.html` 必须 required；`/css/*`、`/js/*`、`/img/*`、`/favicon.ico` 可 anonymous（不含数据），但**仍过 Host/Origin 检查**。未认证访问 `/` 返回 401 提示页（不渲染应用 shell）。 |
+| 认证 | `/api/*`、`/api/events/stream`、`/`、`/index.html` 必须 required；`/css/*`、`/js/*`、`/img/*`、`/favicon.ico` 与精确路径 `/healthz` 可 anonymous（不含数据），但**仍过 Host/Origin 检查**。未认证访问 `/` 返回 401 提示页（不渲染应用 shell）。 |
 | 错误 | 所有拒绝返回统一的 `{"ok":false,"error":{"code":"UNAUTHORIZED|FORBIDDEN|..."}}`，不泄露内部细节。 |
+
+**部署探针（补充，`f95ba70`）**：systemd 的 `ExecStartPost` 与 health timer 拿不到进程级 launch token；探针打 `/api/health` 会 401，systemd 把启动判失败并触发 `Restart=always` 循环（2026-11-24 实际发生）。因此新增精确匹配的匿名 `/healthz`：只回 `status`/`transport`（transport down → 503），不含项目数据，仍过 Host/Origin 准入；`/api/health` 保持认证。systemd 下另需 `SFO_WEB_TOKEN`（0600 环境文件）才能登录，见 `docs/operations.md` §5。
 
 > 为什么需要“自定义头 + Origin”而不是只靠 SameSite？SameSite=Strict 已经能挡大多数跨站 Cookie，但：(a) 老浏览器/非浏览器客户端；(b) 同站不同源的子域/端口；(c) 未来若加子域。四层叠加，任何一层失效仍有保护。
 
@@ -1713,7 +1715,7 @@ git diff --check                             # OK
 1. **reviewer 角色的 `fs.write`**：`reviewer` 工具表没有 `fs.write`，所以 `_reviewer` 写 `review/<id>-review.md` 会被 runner 的角色工具检查拒绝（S5 未扩大权限）。这是既有功能缺陷，不在原审查清单；建议单独补 `fs.write` 或改为 `task.artifact` 记录评审。
 2. **lease 资源范围**：H3/M5 绑定了 lease holder，但 `lease.acquire` 的 `resource` 仍可填 `project:<别人的项目>:...`；建议后续把 unit 的 lease resource 限制为 own project/task。
 3. **operator 审计 result/error**：M8 只统一了 args/preview 脱敏；`operator._audit` 的 result/error 尚未 redact（M8 报告中已注明）。
-4. **H1 的 launch token**：当前进程生命周期内可重复兑换；方案原意是 `sfo url` 每次新签发、兑换即失效；control socket/`sfo url` 尚未实现，systemd 场景仍需显式 `SFO_WEB_TOKEN`。
+4. **H1 的 launch token**：当前进程生命周期内可重复兑换；方案原意是 `sfo url` 每次新签发、兑换即失效；control socket/`sfo url` 尚未实现，systemd 场景仍需显式 `SFO_WEB_TOKEN`（`docs/operations.md` §5 给出 0600 环境文件写法；探针已改用匿名 `/healthz`，不再依赖该 token）。
 5. **Phase 5**：OS 沙箱（Landlock/bwrap）、独立 worker 用户、TLS/远程模式、TLS 配置接线未做；当前远程部署仍需 SSH 隧道/反代。
 6. **同用户残余风险**：RPC/Web 认证只防“通过 API 的越权”；同用户进程仍可直读/写 `.stackflowos`、向 hub 发信号；README/威胁模型需继续保持这一说明。
 7. **测试临时目录**：L9 只迁移了 `test_address`/`test_transport`；其余大量测试仍使用 `<repo>/.stackflowos/tmp` 的非 socket 状态（socket 已由 `socket_dir_for` 迁移），长路径 CI 仍建议统一迁移。

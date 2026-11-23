@@ -136,8 +136,13 @@ Type=simple
 WorkingDirectory=/path/to/StackFlowOS
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# 非 TTY 部署要显式给一个登录 token（见下面“登录 token”）。文件缺失时
+# systemd 忽略该行（前导 "-"），hub 仍会启动，只是没有可用的网页登录链接。
+EnvironmentFile=-%h/.config/stackflowos/web.env
 ExecStart=/usr/bin/python3 -m stackflowos hub --port 17800
-ExecStartPost=/usr/bin/curl -fsS -o /dev/null --connect-timeout 2 -m 3   --retry 30 --retry-delay 1 --retry-connrefused   http://127.0.0.1:17800/api/health
+# 存活探针用匿名的 /healthz：它不需要登录 token，只报告 status/transport，
+# 所以重启不会因为鉴权而失败（H1 之后 /api/health 需要 token）。
+ExecStartPost=/usr/bin/curl -fsS -o /dev/null --connect-timeout 2 -m 3   --retry 30 --retry-delay 1 --retry-connrefused   http://127.0.0.1:17800/healthz
 Restart=always
 RestartSec=3
 TimeoutStartSec=60
@@ -148,6 +153,21 @@ KillMode=control-group
 WantedBy=default.target
 ```
 
+**登录 token（非 TTY 部署）**：H1 起 Web 控制台要求认证，`stackflowos hub` 只在
+TTY 上打印本次进程的登录 URL；systemd 下没有 TTY，需要显式给一个 token：
+
+```bash
+mkdir -p ~/.config/stackflowos && chmod 700 ~/.config/stackflowos
+python3 -c 'import secrets; print("SFO_WEB_TOKEN="+secrets.token_urlsafe(32))' \
+  > ~/.config/stackflowos/web.env
+chmod 600 ~/.config/stackflowos/web.env
+```
+
+之后用 `http://127.0.0.1:17800/?token=<token>` 登录一次（换成 HttpOnly Cookie），
+或 `stackflowos status --token <token>` / `Authorization: Bearer <token>`。
+注意：token 落盘为 0600，同用户进程可读；这是还没有 `sfo url` 控制套接字之前的
+过渡方案（见 security-fix-plan §5.1.6），威胁模型里归为“同用户残余风险”。
+
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now stackflowos-hub.service
@@ -157,7 +177,15 @@ journalctl --user -u stackflowos-hub -f
 ```
 
 建议再加一个 health timer（每分钟探活，卡死也能重启），或至少监控
-`/api/health` 中的 `transport` 字段：HTTP 线程活着不代表 pynng IPC 活着。
+`/healthz` 中的 `transport` 字段：HTTP 线程活着不代表 pynng IPC 活着。
+`/healthz` 不需要 token（`/api/health` 需要），适合 systemd/监控脚本直接调用：
+
+```bash
+# ~/.local/bin/stackflowos-health.sh
+curl -fsS -m 3 --retry 2 --retry-delay 2 --retry-connrefused \
+     -o /dev/null http://127.0.0.1:17800/healthz \
+  || systemctl --user restart stackflowos-hub.service
+```
 
 ```bash
 systemctl --user stop stackflowos-hub   # 手动 stop 不会被 always 拉起

@@ -316,8 +316,11 @@ stackflowos worker   （内部：由 supervisor 拉起）
 Web 控制台默认要求认证：`stackflowos hub` 在 TTY 上打印本次进程的登录 URL
 （`http://127.0.0.1:17800/?token=...`），token 只存在内存、不写日志也不落盘；
 非 TTY 部署可显式设置 `SFO_WEB_TOKEN`，再用 `stackflowos status --token` 或
-`Authorization: Bearer` 访问。静态资源仍需通过 Host/Origin 准入，所有响应带
-CSP / `X-Frame-Options` 等安全头；跨站写请求会被 403/415 拒绝。
+`Authorization: Bearer` 访问。`/api/*` 一律需要认证；systemd / 监控探活用匿名
+的 `/healthz`（只返回 `status`/`transport`，不含项目数据，仍过 Host/Origin 准入），
+这样重启和探活都不依赖进程级 token，systemd 部署见 `docs/operations.md` §5。
+静态资源仍需通过 Host/Origin 准入，所有响应带 CSP / `X-Frame-Options` 等安全头；
+跨站写请求会被 403/415 拒绝。
 
 `attach` 让一台设备/一个终端手动接入运行中的 hub：向 hub 申请一个 unit 地址，
 在本机起一个 worker 进程；它是 supervisor 内部拉起工人的同一条路径。

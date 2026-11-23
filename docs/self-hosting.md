@@ -211,24 +211,32 @@ python3 -m unittest tests.test_self_hosting_contract.SelfHostingContractTests.te
 python3 -m stackflowos hub --port 17800 &
 ```
 
-冒烟检查：
+冒烟检查（H1 起 `/api/*` 需要认证；`/healthz` 是匿名存活探针）：
 
 ```bash
-curl -sf http://127.0.0.1:17800/api/health && echo OK
-curl -s  http://127.0.0.1:17800/api/projects | jq
+curl -sf http://127.0.0.1:17800/healthz && echo OK
+curl -s -H "Authorization: Bearer $SFO_WEB_TOKEN" \
+     http://127.0.0.1:17800/api/projects | jq
 ```
+
+TTY 启动时用终端打印的登录 token 代替 `$SFO_WEB_TOKEN`；非 TTY（systemd）
+部署参考 `docs/operations.md` §5 的 `SFO_WEB_TOKEN` 环境文件。
 
 接入一个已有目录并验证只读语义（端到端契约）：
 
 ```bash
 # 1) 以只读方式接入（attached-ro：不勾选「允许 Agent 写入」）
 curl -s -X POST http://127.0.0.1:17800/api/projects/attach \
+  -H "Authorization: Bearer $SFO_WEB_TOKEN" \
   -H 'content-type: application/json' \
+  -H 'X-SFO-Request: 1' \
   -d '{"path":"/tmp/demo-repo","name":"demo","allow_writes":false}' | jq
 
 # 2) 让操作员助手读取项目文件（只读模式允许）
 curl -s -X POST http://127.0.0.1:17800/api/chat \
+  -H "Authorization: Bearer $SFO_WEB_TOKEN" \
   -H 'content-type: application/json' \
+  -H 'X-SFO-Request: 1' \
   -d '{"text":"读取 demo 项目的 README.md"}' | jq
 
 # 3) 在 attached-ro 下派工人写文件：worker 侧直接拒绝，不产生审批单
@@ -242,7 +250,9 @@ python3 -m unittest tests.test_self_hosting_contract -v
 验证事件流有记录：
 
 ```bash
-curl -s 'http://127.0.0.1:17800/api/events?since=0&limit=50' | jq '.data.events[].type' | sort | uniq -c
+curl -s -H "Authorization: Bearer $SFO_WEB_TOKEN" \
+  'http://127.0.0.1:17800/api/events?since=0&limit=50' \
+  | jq '.data.events[].type' | sort | uniq -c
 ```
 
 跑完整测试套件 + 类型检查（若已配置）：

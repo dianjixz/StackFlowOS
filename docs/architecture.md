@@ -616,7 +616,8 @@ loopback 地址，除非显式设置 `web.allow_remote = true`（CLI 对应
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 存活 |
+| GET | `/healthz` | 匿名存活探针（systemd/监控用；只返回 status/transport，不含项目数据） |
+| GET | `/api/health` | 存活（需认证；含版本/uptime/unit 统计） |
 | GET | `/api/state` | 快照：sys/units/projects/agents/approvals/rules/events/chat/stats/config |
 | GET | `/api/events/stream?since=<seq>` | SSE，事件流 + 心跳 |
 | POST | `/api/chat` | `{text}` → `{message_id}`，回复走 SSE |
