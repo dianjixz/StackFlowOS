@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from stackflowos.agents import supervisor as supervisor_module
 from stackflowos.agents.supervisor import AgentSupervisor
 from stackflowos.config import AgentsCfg
 from stackflowos.errors import BadRequest, Conflict, NotFound, Unavailable
@@ -16,15 +23,32 @@ from stackflowos.kernel.context import Context
 
 TMP_ROOT = Path(__file__).resolve().parent.parent / ".stackflowos" / "tmp"
 
+# Linux caps pids at 4*1024*1024, so this range can never name a real process:
+# the fake 4000-style pid must not make ``killpg`` hit an unrelated group.
+_FAKE_PID_BASE = 5_000_000
+
 
 class FakeProc:
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, *, exit_on_terminate: bool = True) -> None:
         self.pid = pid
         self.terminated = False
+        self.terminate_calls = 0
+        self.killed = False
+        self.exit_on_terminate = exit_on_terminate
         self.returncode = None
 
     def terminate(self) -> None:
+        self.terminate_calls += 1
         self.terminated = True
+        if self.exit_on_terminate:
+            self.returncode = 0
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def poll(self):
+        return self.returncode
 
 
 class FakeRegistry:
@@ -101,14 +125,18 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     def _make(self, *, config: AgentsCfg | None = None,
               spawn_timeout_s: float = 2.0, control=None,
               token_issuer=None,
-              token_revoker=None) -> AgentSupervisor:
+              token_revoker=None,
+              terminate_grace_s: float = 0.05,
+              kill_grace_s: float = 0.05) -> AgentSupervisor:
         sup = AgentSupervisor(
             Context(), registry=self.registry, allocator=self.allocator,
             eventlog=self.eventlog, config=config or AgentsCfg(),
             sys_rpc="ipc://sys.rpc", state_dir=self.state, root=self.root,
             popen_factory=self._popen,
             spawn_timeout_s=spawn_timeout_s, control=control,
-            token_issuer=token_issuer, token_revoker=token_revoker)
+            token_issuer=token_issuer, token_revoker=token_revoker,
+            terminate_grace_s=terminate_grace_s,
+            kill_grace_s=kill_grace_s)
         supervisors = getattr(self, "_supervisors", [])
         supervisors.append(sup)
         self._supervisors = supervisors
@@ -116,7 +144,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     def _popen(self, command: list[str], kwargs: dict):
         self.popen_calls.append((command, kwargs))
-        proc = FakeProc(pid=4000 + len(self.procs))
+        proc = FakeProc(pid=_FAKE_PID_BASE + len(self.procs))
         self.procs.append(proc)
         return proc
 
@@ -151,7 +179,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sup.get(agent.id), agent)
         self.assertEqual(self.allocator.allocated["coder.0"].rpc,
                          "ipc://coder.0.rpc")
-        self.assertEqual(self.sup._pids["coder.0"], 4000)
+        self.assertEqual(self.sup._pids["coder.0"], _FAKE_PID_BASE)
         self.assertEqual(self.sup.stats()["total"], 1)
 
         command, kwargs = self.popen_calls[0]
@@ -245,12 +273,117 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def test_kill_without_control_terminates_process(self) -> None:
         agent = await self.sup.spawn("coder", "p-1")
         proc = self.procs[0]
+        handle = self.sup._log_handles["coder.0"]
         self.assertTrue(await self.sup.kill(agent.id, reason="test"))
-        self.assertTrue(proc.terminated)
+        # A well-behaved worker gets exactly one SIGTERM and no SIGKILL.
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertFalse(proc.killed)
         self.assertEqual(agent.status, "dead")
         self.assertIn("coder.0", self.allocator.released)
         self.assertIn("agent.terminated", self.eventlog.types())
+        self.assertTrue(handle.closed)
+        self.assertNotIn("coder.0", self.sup._log_handles)
+        self.assertNotIn("coder.0", self.sup._procs)
+        self.assertNotIn("coder.0", self.sup._pids)
         self.assertFalse(await self.sup.kill(agent.id))
+
+    async def test_stubborn_worker_is_escalated_to_sigkill(self) -> None:
+        agent = await self.sup.spawn("coder", "p-1")
+        proc = self.procs[0]
+        proc.exit_on_terminate = False  # pretend SIGTERM is ignored
+        handle = self.sup._log_handles["coder.0"]
+        started = time.monotonic()
+        self.assertTrue(await self.sup.kill(agent.id, reason="stubborn"))
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertTrue(proc.killed)
+        self.assertIsNotNone(proc.poll())
+        self.assertGreaterEqual(elapsed, self.sup.terminate_grace_s)
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(agent.status, "dead")
+        self.assertTrue(handle.closed)
+        self.assertEqual(self.sup._log_handles, {})
+        self.assertEqual(self.sup._procs, {})
+        self.assertEqual(self.sup._pids, {})
+
+    async def test_terminate_without_killpg_falls_back_to_proc_methods(
+            self) -> None:
+        agent = await self.sup.spawn("coder", "p-1")
+        proc = self.procs[0]
+        proc.exit_on_terminate = False
+        with mock.patch.object(supervisor_module.os, "killpg", None,
+                               create=True):
+            self.assertTrue(await self.sup.kill(agent.id, reason="no-killpg"))
+        self.assertEqual(proc.terminate_calls, 1)
+        self.assertTrue(proc.killed)
+        self.assertNotIn("coder.0", self.sup._procs)
+        self.assertNotIn("coder.0", self.sup._pids)
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "killpg"),
+                         "requires POSIX process groups")
+    async def test_terminate_sigkills_real_worker_that_ignores_sigterm(
+            self) -> None:
+        ready = self.tmp / "sigterm-armed"
+        code = (
+            "import pathlib, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pathlib.Path(%r).write_text('ready')\n"
+            "time.sleep(60)\n" % str(ready)
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5.0
+            while not ready.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertTrue(ready.exists(), "worker never armed SIG_IGN")
+            pgid = os.getpgid(proc.pid)
+            self.sup._procs["coder.9"] = proc
+            self.sup._pids["coder.9"] = proc.pid
+            handle = self.sup._open_log("coder.9")
+            self.sup.terminate_grace_s = 0.3
+            self.sup.kill_grace_s = 0.5
+            started = time.monotonic()
+            self.assertTrue(await self.sup._terminate("coder.9"))
+            elapsed = time.monotonic() - started
+            # TERM was ignored, so the grace had to elapse before the whole
+            # group was SIGKILLed: bounded, not the production 3s+2s.
+            self.assertGreaterEqual(elapsed, 0.3)
+            self.assertLess(elapsed, 3.0)
+            self.assertEqual(proc.poll(), -signal.SIGKILL)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(pgid, 0)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(proc.pid, 0)
+            self.assertTrue(handle.closed)
+            self.assertNotIn("coder.9", self.sup._procs)
+            self.assertNotIn("coder.9", self.sup._pids)
+            self.assertNotIn("coder.9", self.sup._log_handles)
+        finally:
+            if proc.poll() is None:  # pragma: no cover - only on failure
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_default_grace_values_are_bounded(self) -> None:
+        sup = AgentSupervisor(
+            Context(), registry=self.registry, allocator=self.allocator,
+            eventlog=self.eventlog, config=AgentsCfg(),
+            sys_rpc="ipc://sys.rpc", state_dir=self.state, root=self.root)
+        self.assertEqual(sup.terminate_grace_s, 3.0)
+        self.assertEqual(sup.kill_grace_s, 2.0)
+
+    async def test_restart_closes_replaced_log_handle(self) -> None:
+        agent = await self.sup.spawn("coder", "p-1")
+        old_handle = self.sup._log_handles["coder.0"]
+        unit = SimpleNamespace(work_id="coder.0", kind="coder",
+                               project_id="p-1")
+        self.assertTrue(await self.sup.restart(unit, 1))
+        self.assertTrue(old_handle.closed)
+        self.assertNotIn("coder.0", self.sup._log_handles)
+        self.assertEqual(agent.unit_id, "coder.1")
+        self.assertIn("coder.1", self.sup._log_handles)
 
     async def test_kill_project_uses_control_and_spares_other_projects(self) -> None:
         calls: list[tuple[str, str, dict]] = []
@@ -269,6 +402,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other.status, "idle")
         self.assertEqual([call[1] for call in calls], ["unit.kill", "unit.kill"])
         self.assertEqual(calls[0][2]["reason"], "project_archived")
+        # Control-path kills release their log handles too; the untouched
+        # project keeps its own.
+        self.assertEqual(set(sup._log_handles), {"coder.1"})
 
     # -- roster helpers ---------------------------------------------------
     async def test_register_update_finish_and_stats(self) -> None:

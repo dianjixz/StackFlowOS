@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -29,6 +30,85 @@ from .models import (AGENT_STATUSES, TERMINAL_AGENT_STATUSES, Agent,
 from .roles import get_role
 
 ControlFn = Callable[[str, str, dict], Awaitable[Any]]
+
+# S3: bounded TERM→KILL escalation.  Tests shorten these through the
+# constructor instead of sleeping for real seconds.
+_TERM_GRACE_S = 3.0
+_KILL_GRACE_S = 2.0
+_EXIT_POLL_S = 0.05
+
+
+def _group_id(pid: int) -> int | None:
+    """Process-group id for a worker ``pid``; ``None`` when unsupported."""
+    if pid <= 0 or not callable(getattr(os, "killpg", None)):
+        return None
+    getpgid = getattr(os, "getpgid", None)
+    if callable(getpgid):
+        try:
+            return int(getpgid(pid))
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Workers are session leaders (``start_new_session=True``), so a group id
+    # never changes: the pid still addresses orphaned grandchildren after the
+    # leader itself was reaped.
+    return pid
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether *pgid* still has members (best effort; assumes alive)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # cannot tell: assume alive so the caller escalates
+    return True
+
+
+def _process_exited(proc: Any) -> bool:
+    """Return True once the child exited, reaping it through ``poll``."""
+    if getattr(proc, "returncode", None) is not None:
+        return True
+    poll = getattr(proc, "poll", None)
+    if not callable(poll):
+        return False
+    try:
+        return poll() is not None
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return False
+
+
+def _signal_process(proc: Any, pgid: int | None, *, kill: bool) -> bool:
+    """Signal the whole group, falling back to the direct child."""
+    sig = getattr(signal, "SIGKILL" if kill else "SIGTERM", None)
+    killpg = getattr(os, "killpg", None)
+    if pgid is not None and sig is not None and callable(killpg):
+        try:
+            killpg(pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    method = getattr(proc, "kill" if kill else "terminate", None)
+    if not callable(method):
+        return False
+    try:
+        method()
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+async def _wait_gone(proc: Any, pgid: int | None, timeout: float) -> bool:
+    """Wait (bounded) until the child is reaped and its group is empty."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        if _process_exited(proc) and (pgid is None or not _group_alive(pgid)):
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0.0:
+            return False
+        await asyncio.sleep(min(_EXIT_POLL_S, remaining))
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -55,7 +135,9 @@ class AgentSupervisor:
                  spawn_timeout_s: float = 15.0, logger: Any = None,
                  control: ControlFn | None = None,
                  token_issuer: Any = None,
-                 token_revoker: Any = None) -> None:
+                 token_revoker: Any = None,
+                 terminate_grace_s: float | None = None,
+                 kill_grace_s: float | None = None) -> None:
         self.ctx = ctx
         self.registry = registry
         self.allocator = allocator
@@ -66,6 +148,12 @@ class AgentSupervisor:
         self.state_dir = Path(state_dir)
         self.root = Path(root)
         self.spawn_timeout_s = float(spawn_timeout_s)
+        # S3: how long a terminating worker gets between SIGTERM and SIGKILL,
+        # and between SIGKILL and giving up on the pid.
+        self.terminate_grace_s = (_TERM_GRACE_S if terminate_grace_s is None
+                                  else max(0.0, float(terminate_grace_s)))
+        self.kill_grace_s = (_KILL_GRACE_S if kill_grace_s is None
+                             else max(0.0, float(kill_grace_s)))
         self.log = logger or get_logger("agents.supervisor")
         self.control = control
         # Protocol v2 credential hooks (H3). ``token_issuer(work_id,
@@ -257,7 +345,7 @@ class AgentSupervisor:
 
         online = await self._wait_online(work_id)
         if not online:
-            self._terminate(work_id)
+            await self._terminate(work_id)
             self._close_log(work_id)
             raise Unavailable(
                 f"worker {work_id} did not come online within "
@@ -300,7 +388,7 @@ class AgentSupervisor:
         if agent is None:
             return False
         self._release(old_work_id)
-        self._terminate(old_work_id)
+        await self._terminate(old_work_id)
         self._close_log(old_work_id)
 
         new_work_id = str(self.allocator.new_work_id(agent.role))
@@ -361,7 +449,7 @@ class AgentSupervisor:
                 self.log.warning("control kill failed for %s", work_id,
                                  exc_info=True)
         if not handled and work_id:
-            self._terminate(work_id)
+            await self._terminate(work_id)
             self._release(work_id)
         if work_id:
             self._close_log(work_id)
@@ -595,17 +683,39 @@ class AgentSupervisor:
         except OSError:  # pragma: no cover
             pass
 
-    def _terminate(self, work_id: str) -> None:
+    async def _terminate(self, work_id: str) -> bool:
+        """Stop a worker's process group with bounded TERM→KILL escalation.
+
+        Workers are spawned with ``start_new_session=True``, so the group is
+        signalled first: a TERM-ignoring child cannot keep the unit (or its
+        pipes) alive.  Both waits are bounded and poll asynchronously, so a
+        stubborn child cannot block the event loop for long.  The pid/proc
+        bookkeeping and the log handle are released on every path.
+        """
         proc = self._procs.pop(work_id, None)
-        if proc is None:
-            return
+        pid = self._pids.pop(work_id, None)
         try:
-            terminate = getattr(proc, "terminate", None)
-            if callable(terminate):
-                terminate()
-        except Exception:  # pragma: no cover - process may already be gone
-            self.log.debug("terminate %s failed", work_id, exc_info=True)
-        self._pids.pop(work_id, None)
+            if proc is None or _process_exited(proc):
+                return True
+            pgid = _group_id(pid or int(getattr(proc, "pid", 0) or 0))
+            _signal_process(proc, pgid, kill=False)
+            if await _wait_gone(proc, pgid, self.terminate_grace_s):
+                return True
+            self.log.warning(
+                "worker %s ignored SIGTERM after %ss; sending SIGKILL to %s",
+                work_id, self.terminate_grace_s, pgid or pid or "-")
+            _signal_process(proc, pgid, kill=True)
+            if await _wait_gone(proc, pgid, self.kill_grace_s):
+                return True
+            self.log.warning(
+                "worker %s kill_failed: survived SIGKILL after %ss; "
+                "dropping pid %s", work_id, self.kill_grace_s, pid or "-")
+            return False
+        finally:
+            # Never leak the pid slot or the log fd, even when the child is
+            # unkillable (kernel D state) or an exception escaped.
+            self._pids.pop(work_id, None)
+            self._close_log(work_id)
 
     def _release(self, work_id: str | None) -> None:
         if not work_id:
