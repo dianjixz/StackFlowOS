@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import math
 import re
 import shlex
 import threading
@@ -45,6 +46,19 @@ from .capabilities import (
 )
 
 
+_LOG = logging.getLogger("sfo.security.policy")
+
+
+class _RuleValidationError(ValidationError, ValueError):
+    """A rule carries invalid data (L3).
+
+    Inheriting both :class:`ValidationError` (a 400-shaped API error) and
+    :class:`ValueError` lets callers of :meth:`PolicyEngine.add_rule` /
+    ``update_rule`` get a 400 while :meth:`PolicyEngine.load` can treat
+    corrupt persisted rows uniformly as skippable bad data.
+    """
+
+
 @dataclass
 class Rule:
     """One allow/deny statement about a capability for a principal."""
@@ -67,21 +81,219 @@ class Rule:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Rule":
-        known = {f.name for f in fields(cls)}
-        data = {k: v for k, v in (d or {}).items() if k in known}
-        rule = cls(**data)
-        if not isinstance(rule.scope, dict):
-            rule.scope = {}
-        return rule
+        """Build a rule from persisted/API data after strict validation.
+
+        Unknown keys are ignored (forward compatibility), but every known
+        field is type-checked: a corrupted ``uses_left="x"`` or ``scope=[]``
+        must fail here instead of raising later inside ``active()``.
+        """
+        return cls(**_normalise_rule_data(d))
 
     def active(self, now_ms: int | None = None) -> bool:
-        """True while the rule is unexpired and still has uses left."""
-        now = now_ms if now_ms is not None else _now_ms()
-        if self.expires_at is not None and now >= int(self.expires_at):
+        """True while the rule is unexpired and still has uses left.
+
+        Corrupt lifetime data (a string, bool, NaN, ...) is treated as
+        inactive instead of raising: a broken rule must never crash the
+        evaluator or match (fail closed).
+        """
+        try:
+            now = _now_ms() if now_ms is None else _coerce_optional_int(
+                now_ms, "now_ms")
+            if now is None:
+                raise _RuleValidationError("now_ms must be an integer")
+            expires_at = _coerce_optional_int(self.expires_at, "expires_at")
+            uses_left = _coerce_optional_int(self.uses_left, "uses_left")
+        except (TypeError, ValueError, OverflowError) as exc:
+            _LOG.warning(
+                "rule %r has invalid lifetime data (%s); treating it as "
+                "inactive (fail closed)", getattr(self, "id", "?"), exc)
             return False
-        if self.uses_left is not None and int(self.uses_left) <= 0:
+        if expires_at is not None and now >= expires_at:
+            return False
+        if uses_left is not None and uses_left <= 0:
             return False
         return True
+
+
+#: Known rule fields that must be strings (``created_at``/counters are ints).
+_RULE_STRING_FIELDS = ("id", "effect", "capability", "principal", "note",
+                       "source", "created_by", "risk_max")
+_RULE_DEFAULTS = {
+    "principal": "*",
+    "scope": {},
+    "risk_max": "high",
+    "expires_at": None,
+    "uses_left": None,
+    "note": "",
+    "source": "rule",
+    "created_by": "operator",
+    "created_at": 0,
+}
+
+
+def _coerce_optional_int(value: Any, name: str, *,
+                         minimum: int | None = None,
+                         allow_float: bool = False) -> int | None:
+    """Return an int (or ``None``) or raise ``_RuleValidationError``.
+
+    ``bool`` is rejected even though it subclasses ``int``: ``True`` is not a
+    meaningful counter/expiry.  Floats are rejected by default; the sole
+    exception is ``expires_at``, where an integral float (a JSON round-trip
+    may render whole numbers as ``1.0``) is accepted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise _RuleValidationError(
+            f"{name} must be an integer or null", detail={"field": name})
+    if isinstance(value, int):
+        result = value
+    elif (allow_float and isinstance(value, float)
+          and math.isfinite(value) and value.is_integer()):
+        result = int(value)
+    else:
+        raise _RuleValidationError(
+            f"{name} must be an integer or null", detail={"field": name})
+    if minimum is not None and result < minimum:
+        raise _RuleValidationError(
+            f"{name} must be >= {minimum}", detail={"field": name})
+    return result
+
+
+def _normalise_rule_data(row: Any) -> dict:
+    """Strictly validate a rule object and return normalised keyword data."""
+    if not isinstance(row, dict):
+        raise _RuleValidationError("rule must be an object")
+    known = {f.name for f in fields(Rule)}
+    data = {key: value for key, value in row.items() if key in known}
+    for key, default in _RULE_DEFAULTS.items():
+        data.setdefault(key, default)
+
+    for key in _RULE_STRING_FIELDS:
+        if not isinstance(data.get(key), str):
+            raise _RuleValidationError(
+                f"{key} must be a string", detail={"field": key})
+    for key in ("id", "capability", "principal"):
+        if not data[key]:
+            raise _RuleValidationError(
+                f"{key} must be a non-empty string", detail={"field": key})
+    if data["effect"] not in ("allow", "deny"):
+        raise _RuleValidationError(
+            f"invalid rule effect: {data['effect']!r}",
+            detail={"field": "effect", "allowed": ["allow", "deny"]})
+    if data["capability"] != "*" and data["capability"] not in CAPABILITIES:
+        raise _RuleValidationError(
+            f"unknown capability: {data['capability']!r}",
+            detail={"field": "capability"})
+    if data["risk_max"] not in RISK_ORDER:
+        raise _RuleValidationError(
+            f"invalid risk_max: {data['risk_max']!r}",
+            detail={"field": "risk_max", "allowed": sorted(RISK_ORDER)})
+
+    scope = data.get("scope")
+    if scope is None:
+        scope = {}
+    if not isinstance(scope, dict):
+        raise _RuleValidationError(
+            "scope must be an object or null", detail={"field": "scope"})
+    data["scope"] = dict(scope)
+
+    data["expires_at"] = _coerce_optional_int(data.get("expires_at"),
+                                              "expires_at", allow_float=True)
+    data["uses_left"] = _coerce_optional_int(data.get("uses_left"),
+                                             "uses_left", minimum=0)
+    created_at = _coerce_optional_int(data.get("created_at"), "created_at")
+    data["created_at"] = 0 if created_at is None else created_at
+    return data
+
+
+def _validate_scope_matchers(scope: dict) -> None:
+    """Compile-check scope patterns before a rule is stored or trusted.
+
+    A rule whose ``command_regex``/``path_glob`` can never compile is dead
+    weight that only warns at match time; reject it at the write boundary
+    (400) and skip it at load time instead.
+    """
+    if not isinstance(scope, dict):
+        raise _RuleValidationError(
+            "scope must be an object or null", detail={"field": "scope"})
+    command_regex = scope.get("command_regex")
+    if command_regex is not None:
+        if not isinstance(command_regex, str):
+            raise _RuleValidationError(
+                "scope.command_regex must be a string",
+                detail={"field": "command_regex"})
+        try:
+            re.compile(command_regex)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise _RuleValidationError(
+                f"invalid command_regex: {command_regex!r}: {exc}",
+                detail={"field": "command_regex"}) from None
+    path_glob = scope.get("path_glob")
+    if path_glob is not None:
+        _validate_path_glob(path_glob)
+    url_prefix = scope.get("url_prefix")
+    if url_prefix is not None:
+        _validate_url_prefix(url_prefix)
+
+
+def _validate_path_glob(pattern: Any) -> None:
+    if not isinstance(pattern, str) or not pattern:
+        raise _RuleValidationError(
+            "scope.path_glob must be a non-empty string",
+            detail={"field": "path_glob"})
+    if "\x00" in pattern or len(pattern) > _MAX_PATH_CHARS:
+        raise _RuleValidationError(
+            "scope.path_glob is too long or contains NUL",
+            detail={"field": "path_glob"})
+    if not pattern.startswith("/") or ".." in pattern.split("/"):
+        raise _RuleValidationError(
+            f"scope.path_glob must be an absolute path without '..': "
+            f"{pattern!r}", detail={"field": "path_glob"})
+    if _compile_path_glob(pattern) is None:
+        raise _RuleValidationError(
+            f"invalid path_glob: {pattern!r}", detail={"field": "path_glob"})
+
+
+def _validate_url_prefix(value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise _RuleValidationError(
+            "scope.url_prefix must be a non-empty string",
+            detail={"field": "url_prefix"})
+    try:
+        parts = urlsplit(value)
+    except (TypeError, ValueError) as exc:
+        raise _RuleValidationError(
+            f"invalid url_prefix: {value!r}: {exc}",
+            detail={"field": "url_prefix"}) from None
+    if not parts.scheme or not parts.hostname:
+        raise _RuleValidationError(
+            f"invalid url_prefix: {value!r}", detail={"field": "url_prefix"})
+    if parts.username or parts.password:
+        raise _RuleValidationError(
+            "scope.url_prefix must not contain userinfo",
+            detail={"field": "url_prefix"})
+    try:
+        parts.port
+    except ValueError:
+        raise _RuleValidationError(
+            f"invalid url_prefix port: {value!r}",
+            detail={"field": "url_prefix"}) from None
+    # The structural matcher must accept a URL below the prefix and must
+    # never raise on the pattern (M1 semantics are not changed here).
+    prefix_path = parts.path or "/"
+    if not prefix_path.endswith("/"):
+        prefix_path += "/"
+    token_url = f"{parts.scheme}://{parts.netloc}{prefix_path}__sfo_validate__"
+    try:
+        matched = _url_prefix_match(token_url, value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _RuleValidationError(
+            f"invalid url_prefix: {value!r}: {exc}",
+            detail={"field": "url_prefix"}) from None
+    if not matched:
+        raise _RuleValidationError(
+            f"invalid url_prefix: {value!r}", detail={"field": "url_prefix"})
 
 
 @dataclass
@@ -116,6 +328,10 @@ class PolicyEngine:
         self._rules: dict[str, Rule] = {}
         self._lock = threading.RLock()
         self._warned: set[tuple] = set()
+        #: Number of persisted rows skipped by the most recent ``load()``.
+        self.rejected = 0
+        #: Detail records (``{"rule_id", "reason"}``) for those skipped rows.
+        self.rejected_rules: list[dict] = []
         self.load()
 
     # -- rule management --------------------------------------------------
@@ -124,23 +340,29 @@ class PolicyEngine:
                  expires_at: int | None = None, uses_left: int | None = None,
                  note: str = "", created_by: str = "operator",
                  source: str = "rule", rule_id: str | None = None) -> Rule:
-        """Create and persist a rule, emitting ``rule.created``."""
+        """Create and persist a rule, emitting ``rule.created``.
+
+        Validation (types, enums, scope matcher compilation) happens before
+        the rule is inserted or written, so a rejected rule leaves memory and
+        disk untouched.
+        """
         self._validate(effect=effect, capability=capability, risk_max=risk_max,
                        uses_left=uses_left)
-        rule = Rule(
-            id=rule_id or new_id("grant" if source == "grant" else "rule"),
-            effect=str(effect),
-            capability=str(capability),
-            principal=str(principal or "*"),
-            scope=dict(scope or {}),
-            risk_max=str(risk_max),
-            expires_at=None if expires_at is None else int(expires_at),
-            uses_left=None if uses_left is None else int(uses_left),
-            note=str(note or ""),
-            source=str(source),
-            created_by=str(created_by or "operator"),
-            created_at=_now_ms(),
-        )
+        rule = Rule.from_dict({
+            "id": rule_id or new_id("grant" if source == "grant" else "rule"),
+            "effect": effect,
+            "capability": capability,
+            "principal": principal,
+            "scope": scope,
+            "risk_max": risk_max,
+            "expires_at": expires_at,
+            "uses_left": uses_left,
+            "note": note,
+            "source": source,
+            "created_by": created_by,
+            "created_at": _now_ms(),
+        })
+        _validate_scope_matchers(rule.scope)
         with self._lock:
             if rule.id in self._rules:
                 raise ValidationError(f"rule {rule.id!r} already exists")
@@ -151,7 +373,12 @@ class PolicyEngine:
         return rule
 
     def update_rule(self, rule_id: str, patch: dict) -> Rule:
-        """Apply a validated patch to an existing rule."""
+        """Apply a validated patch to an existing rule.
+
+        The candidate is built and fully validated (including matcher
+        compilation) before the in-memory rule is replaced; a bad patch
+        raises a 400 and changes neither memory nor ``rules_path``.
+        """
         if not isinstance(patch, dict) or not patch:
             raise BadRequest("rule patch must be a non-empty object")
         allowed = {"effect", "capability", "principal", "scope", "risk_max",
@@ -163,10 +390,7 @@ class PolicyEngine:
         with self._lock:
             rule = self._get_locked(rule_id)
             candidate = Rule.from_dict({**rule.to_dict(), **patch})
-        self._validate(effect=candidate.effect, capability=candidate.capability,
-                       risk_max=candidate.risk_max, uses_left=candidate.uses_left)
-        candidate.scope = dict(candidate.scope or {})
-        with self._lock:
+            _validate_scope_matchers(candidate.scope)
             self._rules[rule_id] = candidate
         self.save()
         self._warn_legacy_command_regex(candidate)
@@ -355,7 +579,17 @@ class PolicyEngine:
         write_json(self.rules_path, payload)
 
     def load(self) -> None:
-        """Load rules from disk; a missing/corrupt file means an empty set."""
+        """Load rules from disk, skipping (and counting) invalid rows.
+
+        A missing file means an empty set; a corrupt/unreadable file keeps the
+        previous behaviour (warn and leave the current rules alone).  Bad
+        individual rules are isolated instead of blocking startup: each one is
+        skipped, warned about and announced as a ``rule.rejected`` event so the
+        UI can show "N rules quarantined".  No rule data is ever executed at
+        load time -- matchers are only compile-checked.
+        """
+        self.rejected = 0
+        self.rejected_rules = []
         try:
             raw = read_json(self.rules_path, default=None)
         except ValueError:
@@ -366,16 +600,34 @@ class PolicyEngine:
             return
         rules: dict[str, Rule] = {}
         for row in rows:
-            if not isinstance(row, dict):
-                continue
             try:
+                if not isinstance(row, dict):
+                    raise _RuleValidationError("rule must be a JSON object")
                 rule = Rule.from_dict(row)
-            except (TypeError, ValueError):
+                _validate_scope_matchers(rule.scope)
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._reject_rule(row, exc)
                 continue
             rules[rule.id] = rule
             self._warn_legacy_command_regex(rule)
         with self._lock:
             self._rules = rules
+
+    def _reject_rule(self, row: Any, exc: Exception) -> None:
+        """Record one skipped rule without letting it block startup."""
+        rule_id = row.get("id") if isinstance(row, dict) else None
+        reason = str(getattr(exc, "message", None) or exc)
+        entry = {"rule_id": rule_id if isinstance(rule_id, str) else None,
+                 "reason": reason}
+        self.rejected += 1
+        self.rejected_rules.append(entry)
+        self.log.warning("rejecting invalid rule %r: %s",
+                         entry["rule_id"], reason)
+        try:
+            emit_both(self.ctx, self.eventlog, "rule.rejected", entry)
+        except Exception:  # never let an event failure block startup
+            self.log.warning("could not emit rule.rejected for %r",
+                             entry["rule_id"], exc_info=True)
 
     # -- internals --------------------------------------------------------
     def _matching(self, principal: str, capability: str, scope: dict,
@@ -447,18 +699,25 @@ class PolicyEngine:
                            detail={"rule_id": rule_id})
         return rule
 
-    def _validate(self, *, effect: str, capability: str, risk_max: str,
-                  uses_left: int | None) -> None:
-        if effect not in ("allow", "deny"):
+    def _validate(self, *, effect: Any, capability: Any, risk_max: Any,
+                  uses_left: Any) -> None:
+        """Cheap enum validation used by ``add_rule`` (type checks follow).
+
+        Kept separate from :func:`_normalise_rule_data` so the historical
+        error shapes stay stable (unknown capability is a ``BadRequest``).
+        Never calls ``int()`` on caller data: a non-numeric ``uses_left`` must
+        be a 400, not a ``TypeError``/500.
+        """
+        if not isinstance(effect, str) or effect not in ("allow", "deny"):
             raise ValidationError(f"invalid rule effect: {effect!r}",
                                   detail={"allowed": ["allow", "deny"]})
-        if capability != "*" and capability not in CAPABILITIES:
+        if not isinstance(capability, str) or (
+                capability != "*" and capability not in CAPABILITIES):
             raise BadRequest(f"unknown capability: {capability!r}")
-        if risk_max not in RISK_ORDER:
+        if not isinstance(risk_max, str) or risk_max not in RISK_ORDER:
             raise ValidationError(f"invalid risk_max: {risk_max!r}",
                                   detail={"allowed": sorted(RISK_ORDER)})
-        if uses_left is not None and int(uses_left) < 0:
-            raise ValidationError("uses_left must be >= 0")
+        _coerce_optional_int(uses_left, "uses_left", minimum=0)
 
     def _emit(self, type: str, rule: Rule, **extra: Any) -> EventRecord:
         data = {"rule_id": rule.id, "effect": rule.effect,
