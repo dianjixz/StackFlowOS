@@ -14,6 +14,7 @@ so a local bug cannot widen permissions.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -25,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import (
     HTTPRedirectHandler,
     Request,
@@ -37,6 +38,7 @@ from ..util.logging import get_logger
 from ..util.net import (
     PRIVATE_NETWORK_ERROR,
     InvalidTarget,
+    is_private_host,
     validate_fetch_url,
 )
 from ..util.redact import is_secret_key, redact_text
@@ -342,6 +344,126 @@ def _redact(text: str) -> str:
     return redact_text(text)
 
 
+#: Lines shown from each edge of a large ``fs.write`` payload (M7).
+_WRITE_EDGE_LINES = 20
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _shell_chain_operators(command: str) -> list[str]:
+    """Chained operators in ``command``, ignoring quoted/escaped copies.
+
+    The approval reviewer must see that ``rm -rf x && curl …`` is a chain,
+    even though the shell itself is what finally parses it.  This is a small
+    scanner rather than a full shell parser: it only needs to avoid false
+    positives from quoted arguments.
+    """
+    operators: list[str] = []
+    index, length = 0, len(command)
+    while index < length:
+        char = command[index]
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            while index < length:
+                if command[index] == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if command[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        pair = command[index:index + 2]
+        if pair in ("&&", "||"):
+            if pair not in operators:
+                operators.append(pair)
+            index += 2
+            continue
+        if char in (";", "|", "&"):
+            if char not in operators:
+                operators.append(char)
+        index += 1
+    return operators
+
+
+def _write_preview(path: Path, content: str, store_limit: int) -> str:
+    """Full approval preview for ``fs.write`` (M7).
+
+    Includes the destination, byte count, content hash and a head/tail view so
+    the reviewer can see what actually lands on disk.  The redacted content is
+    kept after the summary (bounded by ``store_limit``); the broker stores at
+    most ``security.preview_store_chars`` and flags ``preview_truncated``.
+    """
+    raw = content.encode("utf-8")
+    redacted = _redact(content)
+    header = [f"写入 {path}", f"bytes: {len(raw)} · sha256: {_sha256_hex(raw)}"]
+    try:
+        if path.exists():
+            old = path.stat().st_size if path.is_file() else None
+            header[1] += (" · mode: overwrite"
+                          + (f" (old {old} bytes)" if old is not None else ""))
+        else:
+            header[1] += " · mode: new"
+    except OSError:
+        header[1] += " · mode: unknown"
+    lines = redacted.splitlines()
+    if len(lines) <= _WRITE_EDGE_LINES * 2:
+        # Small payload: show it in full, no omission marker.
+        return "\n".join(header + ["---", redacted])
+    head = "\n".join(lines[:_WRITE_EDGE_LINES])
+    tail = "\n".join(lines[-_WRITE_EDGE_LINES:])
+    omitted = lines[_WRITE_EDGE_LINES:-_WRITE_EDGE_LINES]
+    omitted_bytes = len("\n".join(omitted).encode("utf-8"))
+    summary = "\n".join([
+        f"--- 前 {_WRITE_EDGE_LINES} 行 ---", head,
+        f"…（已省略 {len(omitted)} 行 / {omitted_bytes} 字节）…",
+        f"--- 后 {_WRITE_EDGE_LINES} 行 ---", tail,
+        "--- 内容 ---",
+    ])
+    # Leave room for the redacted body within the store bound; the header and
+    # summary stay intact so the display (truncated to max_preview_chars)
+    # still shows both edges of the payload.
+    budget = max(0, int(store_limit) - len(summary) - 1)
+    body = redacted[:budget] if len(redacted) > budget else redacted
+    return "\n".join(header) + "\n" + summary + "\n" + body
+
+
+def _shell_preview(command: str, cwd: Path) -> str:
+    """Full approval preview for ``shell.exec`` (M7)."""
+    redacted = _redact(command)
+    operators = _shell_chain_operators(command)
+    return "\n".join([
+        f"$ {redacted}",
+        f"(cwd: {cwd})",
+        "链式操作符: " + (" ".join(operators) if operators else "无"),
+    ])
+
+
+def _net_preview(url: str) -> str:
+    """Full approval preview for ``net.fetch`` (M7)."""
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    target = f"{(parsed.scheme or '').lower()}://{host}"
+    if parsed.port is not None:
+        target += f":{parsed.port}"
+    target += parsed.path or "/"
+    private = is_private_host(host)
+    lines = [
+        f"url: {_redact(url)}",
+        f"目标: {target}",
+        f"私网: {'是' if private else '否'}",
+    ]
+    if private:
+        lines.append("（security.allow_private_network 允许私网目标）")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # shell process-group / bounded-output helpers
 # ---------------------------------------------------------------------------
@@ -587,6 +709,9 @@ class ToolExecutor:
         self.log = logger or get_logger("agents.tools")
         self.source = event_source or str(getattr(agent, "id", "agent"))
         self.max_preview = int(self._cfg("max_preview_chars", 4000))
+        #: Bound for the full preview sent to the broker (M7).
+        self.max_preview_store = max(
+            1, int(self._cfg("preview_store_chars", 65536)))
         #: Every invoked tool name, useful for tests and diagnostics.
         self.calls: list[str] = []
 
@@ -654,24 +779,30 @@ class ToolExecutor:
         self.calls.append(spec.name)
 
         try:
-            scope, reason, preview = self._prepare(spec.name, args)
+            scope, reason, preview_full = self._prepare(spec.name, args)
         except ToolError as exc:
             # Invalid invocation: nothing was requested from sys and no side
             # effect happened, so report locally without any RPC.
             return ToolResult(ok=False, error=str(exc), preview="")
 
+        # M7: the broker/audit log keeps a bounded full preview; everything
+        # human-facing on the hot path (events, tool result) stays display
+        # sized so one approval cannot bloat the event log.
+        display = _truncate(preview_full, self.max_preview)
+
         await self._emit("tool.invoked", {
             "tool": spec.name,
             "capability": spec.capability,
             "args": self._safe_args(args),
-            "preview": preview,
+            "preview": display,
         })
 
         ttl = int(self._cfg("approval_ttl_s", 300))
         try:
             approval = await request_permission(
                 self.sys, principal=self.agent_id, capability=spec.capability,
-                scope=scope, reason=reason, preview=preview,
+                scope=scope, reason=reason, preview=display,
+                preview_full=preview_full,
                 project_id=self.project_id, task_id=self.task_id, ttl_s=ttl)
         except Denied as exc:
             detail = getattr(exc, "detail", None)
@@ -684,17 +815,17 @@ class ToolExecutor:
                 "capability": spec.capability,
                 "request_id": request_id,
                 "reason": exc.message,
-                "preview": preview,
+                "preview": display,
             })
             return ToolResult(ok=False, error=f"DENIED: {exc.message}",
-                              preview=preview)
+                              preview=display)
         except SfoError as exc:
             return await self._fail(
-                spec, f"{exc.code}: {exc.message}", preview=preview)
+                spec, f"{exc.code}: {exc.message}", preview=display)
         except Exception as exc:  # noqa: BLE001 - sys unavailable must not crash
             self.log.exception("approval request failed for %s", spec.name)
             return await self._fail(
-                spec, f"{type(exc).__name__}: {exc}", preview=preview)
+                spec, f"{type(exc).__name__}: {exc}", preview=display)
 
         if not await self._spend_once_grant(approval):
             reason = "one-shot approval was already used"
@@ -703,14 +834,14 @@ class ToolExecutor:
                 "capability": spec.capability,
                 "request_id": str(approval.get("id") or ""),
                 "reason": reason,
-                "preview": preview,
+                "preview": display,
             })
-            return ToolResult(ok=False, error=f"DENIED: {reason}", preview=preview)
+            return ToolResult(ok=False, error=f"DENIED: {reason}", preview=display)
 
         handler = self._handlers().get(spec.name)
         if handler is None:  # pragma: no cover - registry/handler mismatch
             return await self._fail(spec, f"no executor for tool {spec.name!r}",
-                                    preview=preview)
+                                    preview=display)
         try:
             data = await handler(args, scope)
             if data is None:
@@ -718,23 +849,23 @@ class ToolExecutor:
             if not isinstance(data, dict):
                 data = {"value": data}
         except ToolError as exc:
-            return await self._fail(spec, str(exc), preview=preview)
+            return await self._fail(spec, str(exc), preview=display)
         except SfoError as exc:
             return await self._fail(spec, f"{exc.code}: {exc.message}",
-                                    preview=preview)
+                                    preview=display)
         except Exception as exc:  # noqa: BLE001 - tool bugs are data, not crashes
             self.log.exception("tool %s failed", spec.name)
             return await self._fail(
-                spec, f"{type(exc).__name__}: {exc}", preview=preview)
+                spec, f"{type(exc).__name__}: {exc}", preview=display)
 
         await self._use_grant(approval)
         await self._emit("tool.result", {
             "tool": spec.name,
             "ok": True,
             "summary": self._summarize(data),
-            "preview": _truncate(preview, 400),
+            "preview": _truncate(display, 400),
         })
-        return ToolResult(ok=True, data=data, preview=preview)
+        return ToolResult(ok=True, data=data, preview=display)
 
     # -- orchestration helpers -------------------------------------------
     async def _fail(self, spec: ToolSpec, error: str, *, preview: str) -> ToolResult:
@@ -814,7 +945,9 @@ class ToolExecutor:
 
     # -- scope / reason / preview (runs before any RPC) -------------------
     def _prepare(self, name: str, args: dict) -> tuple[dict, str, str]:
-        limit = self.max_preview
+        # ``preview`` here is the full (redacted, bounded) preview; the caller
+        # derives the display text with ``max_preview_chars`` (M7).
+        limit = self.max_preview_store
         if self.read_only and name in ("fs.write", "fs.delete", "shell.exec"):
             raise ToolError(
                 "project workspace is attached read-only (attached-ro); "
@@ -838,9 +971,9 @@ class ToolExecutor:
             content = args.get("content")
             if not isinstance(content, str):
                 raise ToolError("argument 'content' must be a string")
-            scope = {**base_scope, "path": str(path),
-                     "bytes": len(content.encode("utf-8"))}
-            preview = _truncate(_redact(f"写入 {path}\n---\n{content}"), limit)
+            raw = content.encode("utf-8")
+            scope = {**base_scope, "path": str(path), "bytes": len(raw)}
+            preview = _write_preview(path, content, limit)
             return scope, "写入文件", preview
 
         if name == "fs.delete":
@@ -856,14 +989,14 @@ class ToolExecutor:
             if not cwd.is_dir():
                 raise ToolError(f"cwd is not a directory: {cwd}")
             scope = {**base_scope, "cwd": str(cwd), "command": command}
-            preview = _truncate(_redact(f"$ {command}\n(cwd: {cwd})"), limit)
-            return scope, "执行命令", preview
+            return scope, "执行命令", _truncate(
+                _shell_preview(command, cwd), limit)
 
         if name == "net.fetch":
             url = _arg_str(args, "url", required=True)
             self._validate_url(url)
             scope = {**base_scope, "url": url}
-            return scope, "抓取网页", _truncate(_redact(url), limit)
+            return scope, "抓取网页", _truncate(_net_preview(url), limit)
 
         if name == "task.update":
             task_id = self._task_id_arg(args)

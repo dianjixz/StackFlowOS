@@ -1415,6 +1415,49 @@ function renderApprovalsApp() {
   return wrap;
 }
 
+function openApprovalPreview(approval) {
+  const body = el('pre', { class: 'preview-full' }, '加载中…');
+  const onKey = (event) => {
+    if (event.key === 'Escape') close();
+  };
+  const close = () => {
+    document.removeEventListener('keydown', onKey);
+    overlay.remove();
+  };
+  const overlay = el('div', {
+    class: 'preview-overlay',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': `审批 ${approval.id} 的完整预览`,
+  });
+  const dialog = el('div', { class: 'preview-dialog' },
+    el('div', { class: 'preview-head' },
+      el('div', { class: 'preview-title' },
+        el('span', { class: 'mono' }, approval.id),
+        el('span', { class: 'preview-sub' },
+          `完整内容 ${approval.preview_bytes || 0} 字节`
+          + (approval.preview_sha256 ? ` · sha256 ${approval.preview_sha256.slice(0, 16)}…` : '')),
+      ),
+      el('button', { class: 'btn btn-sm', type: 'button', onclick: close }, '关闭'),
+    ),
+    body,
+  );
+  overlay.append(dialog);
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close();
+  });
+  document.addEventListener('keydown', onKey);
+  document.body.append(overlay);
+  // Full content is rendered with textContent only, never as markup.
+  api.getApproval(approval.id)
+    .then((data) => {
+      body.textContent = data.preview_full || approval.preview || '（没有预览内容）';
+    })
+    .catch((error) => {
+      body.textContent = `无法加载完整内容：${error.message || error}`;
+    });
+}
+
 function renderApprovalCard(approval) {
   const ttl = el('span', {
     class: 'ac-ttl',
@@ -1485,7 +1528,20 @@ function renderApprovalCard(approval) {
     ),
     approval.reason ? el('p', { class: 'ac-reason' }, approval.reason) : null,
     scope,
-    approval.preview ? el('pre', { class: 'approval-preview' }, approval.preview) : null,
+    approval.preview
+      ? el('div', { class: 'ac-preview' },
+        el('div', { class: 'ac-preview-bar' },
+          el('span', { class: 'ac-preview-badge', dataset: { truncated: String(Boolean(approval.preview_truncated)) } },
+            approval.preview_truncated ? `已截断 · ${approval.preview_bytes || 0} 字节` : '完整预览'),
+          el('button', {
+            class: 'btn btn-xs',
+            type: 'button',
+            onclick: () => openApprovalPreview(approval),
+          }, '查看完整内容'),
+        ),
+        el('pre', { class: 'approval-preview' }, approval.preview),
+      )
+      : null,
     actions,
   );
   return card;
@@ -1964,6 +2020,7 @@ function renderSettingsApp() {
       cfgField('Shell 超时（秒）', 'security.shell_timeout_s', 'int'),
       cfgField('允许 Shell', 'security.allow_shell', 'bool'),
       cfgField('预览最大字符', 'security.max_preview_chars', 'int'),
+      cfgField('完整预览保存字符', 'security.preview_store_chars', 'int'),
     )),
     appNote('自动放行规则在审批应用的「新增规则」中维护。', { iconName: 'settings' }),
   );

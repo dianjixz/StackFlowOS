@@ -93,6 +93,7 @@ class WebAPI:
         r("POST", r"/api/tasks/([^/]+)/check", self.task_check)
 
         r("GET", r"/api/approvals", self.approvals_list)
+        r("GET", r"/api/approvals/([^/]+)", self.approval_get)
         r("POST", r"/api/approvals/([^/]+)/decide", self.approval_decide)
         r("GET", r"/api/rules", self.rules_list)
         r("POST", r"/api/rules", self.rules_create)
@@ -274,7 +275,13 @@ class WebAPI:
         items = self.app.approvals.list(status=status,
                                         project_id=query.get("project_id") or None,
                                         limit=min(int(query.get("limit") or 200), 500))
-        return _ok({"approvals": [a.to_dict() for a in items]})
+        # Lists must stay small: only the truncated preview plus its digest.
+        return _ok({"approvals": [a.to_public_dict() for a in items]})
+
+    async def approval_get(self, match, query, body):
+        # Authenticated detail view: includes the bounded full preview (M7).
+        request = self.app.approvals.get(match.group(1))
+        return _ok(request.to_public_dict(include_full=True))
 
     async def approval_decide(self, match, query, body):
         decision = str(body.get("decision") or "").strip()

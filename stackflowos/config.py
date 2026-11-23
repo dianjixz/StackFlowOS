@@ -82,7 +82,11 @@ class SecurityCfg:
     #: ``net.fetch`` may reach loopback/RFC1918/link-local targets (SSRF, M4).
     #: Off by default; when on, private targets stay high risk.
     allow_private_network: bool = False
+    #: Chars of an approval preview shown by default (UI/events, M7).
     max_preview_chars: int = 4000
+    #: Bounded storage for the redacted full preview behind the details
+    #: endpoint (M7).  ``max_preview_chars`` still controls what is shown.
+    preview_store_chars: int = 65536
 
 
 @dataclass
@@ -256,6 +260,11 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("security.grant_ttl_s out of range")
         if not isinstance(section.allow_private_network, bool):
             raise ConfigError("security.allow_private_network must be a boolean")
+        if section.max_preview_chars < 100:
+            raise ConfigError("security.max_preview_chars must be >= 100")
+        if not (1024 <= section.preview_store_chars <= 262144):
+            raise ConfigError(
+                "security.preview_store_chars out of range (1024..262144)")
     elif name == "llm":
         if section.provider not in ("mock", "openai"):
             raise ConfigError("llm.provider must be mock|openai")

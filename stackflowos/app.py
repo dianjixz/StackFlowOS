@@ -203,6 +203,7 @@ class App:
             approvals_path=self.paths.state_dir / "state" / "approvals.json",
             approval_ttl_s=cfg.security.approval_ttl_s,
             grant_ttl_s=cfg.security.grant_ttl_s,
+            preview_store_chars=cfg.security.preview_store_chars,
         )
         self.memory = MemoryStore(self.paths.state_dir / "state" / "memory.json")
         self.scheduler = Scheduler(self.registry)
@@ -1148,7 +1149,11 @@ class App:
             capability=str(data.get("capability") or ""),
             scope=dict(data.get("scope") or {}),
             reason=str(data.get("reason") or ""),
+            # ``preview`` stays the already-truncated display text; the full
+            # redacted preview is bounded by the broker, not by the UI cap
+            # (M7).
             preview=str(data.get("preview") or "")[: self.config.security.max_preview_chars],
+            preview_full=str(data.get("preview_full") or ""),
             project_id=data.get("project_id"),
             task_id=data.get("task_id"),
             ttl_s=int(data["ttl_s"]) if data.get("ttl_s") else None,
@@ -1159,7 +1164,8 @@ class App:
         request = self.approvals.poll(
             str(data.get("request_id") or ""),
             principal=self._owner_principal(principal))
-        return request.to_dict()
+        # Polled every 0.5s while waiting: never ship the stored full preview.
+        return request.to_public_dict()
 
     async def _approval_use(self, data, src, principal=None):
         ok = self.approvals.use(
@@ -1171,7 +1177,7 @@ class App:
         items = self.approvals.list(status=data.get("status"),
                                      project_id=data.get("project_id"),
                                      limit=int(data.get("limit") or 200))
-        return {"approvals": [a.to_dict() for a in items]}
+        return {"approvals": [a.to_public_dict() for a in items]}
 
     async def _approval_decide(self, data, src):
         request = self.approvals.decide(
@@ -2249,7 +2255,10 @@ class App:
             projects = []
         agents = [a.to_dict() for a in self.supervisor.list()]
         units = self.unit_cards()
-        approvals = [a.to_dict() for a in self.approvals.list(status="pending", limit=100)]
+        # ``/api/state`` is polled constantly: keep the truncated preview and
+        # hash only; the full text comes from ``GET /api/approvals/{id}``.
+        approvals = [a.to_public_dict()
+                     for a in self.approvals.list(status="pending", limit=100)]
         rules = [r.to_dict() for r in self.policy.list_rules(active_only=True)
                  if r.source == "rule"]
         events = [r.to_dict() for r in self.eventlog.tail(80)]

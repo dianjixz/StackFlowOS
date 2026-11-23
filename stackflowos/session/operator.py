@@ -527,7 +527,9 @@ class OperatorTools:
         items = self.app.approvals.list(
             status=args.get("status") or None,
             project_id=args.get("project_id") or None, limit=200)
-        return {"approvals": [a.to_dict() for a in items]}
+        # Lists carry the truncated preview only; the full text is available
+        # from the approval detail view.
+        return {"approvals": [a.to_public_dict() for a in items]}
 
     async def _approval_decide(self, args: dict) -> dict:
         request_id = _request_id(args)

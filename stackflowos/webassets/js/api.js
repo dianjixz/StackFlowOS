@@ -127,6 +127,7 @@ export const api = {
 
   /* ---- approvals & rules ---- */
   getApprovals: (status = 'pending') => requestJson('/api/approvals' + qs({ status })),
+  getApproval: (id) => requestJson(`/api/approvals/${enc(id)}`),
   decideApproval: (id, decision, mode = 'once', note = '') =>
     requestJson(`/api/approvals/${enc(id)}/decide`, { method: 'POST', body: { decision, mode, note } }),
   getRules: () => requestJson('/api/rules'),

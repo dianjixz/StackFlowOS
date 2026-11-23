@@ -14,6 +14,7 @@ and the last 200 decided ones are persisted atomically.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -65,6 +66,8 @@ def _host_of(url: str) -> str:
 _DECISION_CHOICES = ("allow", "deny")
 _KEEP_DECIDED = 200
 _KEEP_AUTO_DECIDED = 50
+#: Hard ceiling for a stored full preview (chars); config is validated to it.
+_MAX_PREVIEW_STORE_CHARS = 262144
 
 
 @dataclass
@@ -78,6 +81,15 @@ class ApprovalRequest:
     risk: str
     reason: str = ""
     preview: str = ""
+    #: M7: redacted full preview, bounded by ``security.preview_store_chars``.
+    #: Persisted for the detail endpoint but never put into the event log.
+    preview_full: str = ""
+    #: sha256 of ``preview_full`` (empty when there is no preview).
+    preview_sha256: str = ""
+    #: True when the original preview was longer than the storage bound.
+    preview_truncated: bool = False
+    #: Byte length of the original (untruncated) preview text.
+    preview_bytes: int = 0
     project_id: str | None = None
     task_id: str | None = None
     status: str = "pending"    # pending|approved|denied|expired|canceled
@@ -92,6 +104,19 @@ class ApprovalRequest:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def to_public_dict(self, *, include_full: bool = False) -> dict:
+        """Audit/UI shape: the truncated preview plus its hash by default.
+
+        ``preview_full`` is only returned by the authenticated detail endpoint
+        (``include_full=True``); event payloads and list responses must stay
+        small and never carry up to ``preview_store_chars`` of content.
+        """
+        data = self.to_dict()
+        full = data.pop("preview_full", "")
+        if include_full:
+            data["preview_full"] = full
+        return data
+
     @classmethod
     def from_dict(cls, d: dict) -> "ApprovalRequest":
         known = {f.name for f in fields(cls)}
@@ -99,6 +124,14 @@ class ApprovalRequest:
         request = cls(**data)
         if not isinstance(request.scope, dict):
             request.scope = {}
+        # Compatibility: approvals persisted before M7 only carry ``preview``.
+        if not request.preview_full and request.preview:
+            request.preview_full = request.preview
+        if request.preview_full and not request.preview_sha256:
+            request.preview_sha256 = hashlib.sha256(
+                request.preview_full.encode("utf-8")).hexdigest()
+        if request.preview_full and not request.preview_bytes:
+            request.preview_bytes = len(request.preview_full.encode("utf-8"))
         return request
 
 
@@ -108,6 +141,7 @@ class ApprovalBroker:
     def __init__(self, ctx: Context, policy: PolicyEngine, eventlog: EventLog, *,
                  approvals_path: Path, approval_ttl_s: int = 300,
                  grant_ttl_s: int = 3600,
+                 preview_store_chars: int = 65536,
                  logger: logging.Logger | None = None) -> None:
         self.ctx = ctx
         self.policy = policy
@@ -115,6 +149,8 @@ class ApprovalBroker:
         self.approvals_path = Path(approvals_path)
         self.approval_ttl_s = int(approval_ttl_s)
         self.grant_ttl_s = int(grant_ttl_s)
+        self.preview_store_chars = max(
+            1, min(int(preview_store_chars), _MAX_PREVIEW_STORE_CHARS))
         self.log = logger or getattr(ctx, "log",
                                      logging.getLogger("sfo.security.approvals"))
         self._requests: dict[str, ApprovalRequest] = {}
@@ -124,10 +160,17 @@ class ApprovalBroker:
     # -- request ----------------------------------------------------------
     def request(self, principal: str, capability: str, scope: dict, *,
                 reason: str = "", preview: str = "",
+                preview_full: str = "",
                 project_id: str | None = None, task_id: str | None = None,
                 risk: str | None = None,
                 ttl_s: int | None = None) -> ApprovalRequest:
-        """Evaluate a capability request, auto-resolving or parking it."""
+        """Evaluate a capability request, auto-resolving or parking it.
+
+        ``preview`` is the already-truncated display text; ``preview_full`` is
+        the redacted full version kept (bounded) for the approval detail view.
+        When the caller only sends one of them, ``preview`` is used as the
+        full source so old call sites keep working.
+        """
         if not principal:
             raise BadRequest("approval principal is required")
         if ttl_s is not None and int(ttl_s) <= 0:
@@ -139,6 +182,8 @@ class ApprovalBroker:
             risk = self._risk_for(capability, scope, effective_project)
         decision = self.policy.evaluate(principal, capability, scope,
                                         risk=risk, now_ms=now)
+        original_full = str(preview_full or preview or "")
+        stored_full = original_full[: self.preview_store_chars]
         request = ApprovalRequest(
             id=new_id("apr"),
             principal=str(principal),
@@ -147,6 +192,11 @@ class ApprovalBroker:
             risk=risk,
             reason=str(reason or ""),
             preview=str(preview or ""),
+            preview_full=stored_full,
+            preview_sha256=(hashlib.sha256(stored_full.encode("utf-8")).hexdigest()
+                            if stored_full else ""),
+            preview_truncated=len(original_full) > self.preview_store_chars,
+            preview_bytes=len(original_full.encode("utf-8")),
             project_id=project_id,
             task_id=task_id,
             created_at=now,
@@ -549,7 +599,9 @@ class ApprovalBroker:
             "risk": request.risk,
             "mode": request.mode,
             "grant_id": request.grant_id,
-            "request": request.to_dict(),
+            # Never write up to ``preview_store_chars`` of content into the
+            # append-only event log; the detail endpoint serves it on demand.
+            "request": request.to_public_dict(include_full=False),
         }
         data.update(extra)
         emit_both(self.ctx, self.eventlog, type, data, request.project_id)

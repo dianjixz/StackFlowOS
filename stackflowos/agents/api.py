@@ -72,11 +72,14 @@ async def poll_approval(sys: SysAPI, request_id: str, *, timeout_s: float = 300,
 
 async def request_permission(sys: SysAPI, *, principal: str, capability: str,
                              scope: dict, reason: str, preview: str,
+                             preview_full: str = "",
                              project_id: str | None = None,
                              task_id: str | None = None,
                              ttl_s: int | None = None) -> dict:
     """Ask sys for a capability and block until it is approved or refused.
 
+    ``preview`` is the truncated display text; ``preview_full`` (M7) is the
+    redacted full preview that sys stores (bounded) for the detail view.
     Returns the approved :class:`ApprovalRequest`-shaped dict.  Raises
     :class:`Denied` for denied/expired requests and :class:`Timeout` when the
     approval did not arrive in time.
@@ -88,6 +91,8 @@ async def request_permission(sys: SysAPI, *, principal: str, capability: str,
         "reason": reason,
         "preview": preview or "",
     }
+    if preview_full:
+        payload["preview_full"] = preview_full
     if project_id is not None:
         payload["project_id"] = project_id
     if task_id is not None:
