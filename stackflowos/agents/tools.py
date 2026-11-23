@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
+import secrets
 import shutil
+import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +43,20 @@ MAX_READ_BYTES = 2_000_000
 NET_TIMEOUT_S = 15.0
 #: Longest single ``wait`` tool call (seconds).
 MAX_WAIT_S = 60.0
+
+#: Bytes read from a child stream per pump iteration; keeps memory flat.
+_SHELL_CHUNK_BYTES = 64 * 1024
+#: Grace period between SIGTERM and SIGKILL for a timed-out process group (H4).
+_SHELL_TERM_GRACE_S = 3.0
+#: Grace period to reap a SIGKILLed process group before abandoning the pipes.
+_SHELL_KILL_GRACE_S = 5.0
+#: Bound on the post-EOF ``proc.wait()`` of an otherwise finished command.
+_SHELL_EXIT_GRACE_S = 5.0
+#: Cancellation path: keep shutdown short so callers are not delayed.
+_SHELL_CANCEL_TERM_GRACE_S = 0.5
+_SHELL_CANCEL_KILL_GRACE_S = 1.0
+#: Poll interval when waiting for a whole process group to disappear.
+_SHELL_GROUP_POLL_S = 0.05
 
 _ENV_SECRET = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 _SECRET_TEXT = re.compile(
@@ -228,6 +245,234 @@ def _truncate(text: str, limit: int) -> str:
 def _redact(text: str) -> str:
     """Best-effort removal of inline credentials from human previews."""
     return _SECRET_TEXT.sub(lambda match: f"{match.group(1)}{match.group(2)}***", text)
+
+
+# ---------------------------------------------------------------------------
+# shell process-group / bounded-output helpers
+# ---------------------------------------------------------------------------
+
+class _ShellLog:
+    """Best-effort streaming sink for a command's *complete* output.
+
+    Writes are synchronous and never raise: an unwritable workspace or a full
+    disk must not change the tool's result.  Stream sections are inserted
+    lazily so interleaved stdout/stderr chunks stay readable.
+    """
+
+    def __init__(self, handle: Any, path: Path) -> None:
+        self._handle = handle
+        self.path = path
+        self._stream: str | None = None
+        self.failed = False
+
+    def write(self, stream: str, chunk: bytes) -> None:
+        if self.failed or not chunk:
+            return
+        try:
+            if stream != self._stream:
+                if self._stream is not None:
+                    self._handle.write(b"\n")
+                self._handle.write(f"--- {stream} ---\n".encode("utf-8"))
+                self._stream = stream
+            self._handle.write(chunk)
+        except (OSError, ValueError):
+            self.failed = True
+
+    def close(self, *, exit_code: int, timed_out: bool) -> None:
+        try:
+            if not self.failed:
+                self._handle.write(
+                    f"\n--- end ---\nexit: {exit_code} "
+                    f"timed_out: {timed_out}\n".encode("utf-8"))
+        except (OSError, ValueError):
+            self.failed = True
+        finally:
+            try:
+                self._handle.close()
+            except (OSError, ValueError):
+                pass
+
+
+class _CappedStream:
+    """Drain one child stream without buffering it in full.
+
+    Memory stays bounded by ``cap``: the first ``cap`` bytes are kept so short
+    output is returned verbatim, and after an overflow a rolling tail of the
+    last ``cap`` bytes is retained (the middle is dropped).  Every chunk is
+    also forwarded to the optional log sink, so the complete output is
+    persisted on disk instead of in memory.
+    """
+
+    def __init__(self, stream: Any, *, cap: int = OUTPUT_CAP_BYTES,
+                 log: _ShellLog | None = None, name: str = "stdout",
+                 logger: Any = None) -> None:
+        self._stream = stream
+        self._cap = max(1, int(cap))
+        self._log = log
+        self._name = name
+        self._logger = logger
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._total = 0
+        self.error: BaseException | None = None
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total
+
+    @property
+    def truncated(self) -> bool:
+        return self._total > self._cap
+
+    async def pump(self) -> None:
+        """Read to EOF, forwarding whole chunks to the log as they arrive."""
+        stream = self._stream
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = await stream.read(_SHELL_CHUNK_BYTES)
+                if not chunk:
+                    return
+                self._feed(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - caller cleans the process up
+            self.error = exc
+            if self._logger is not None:
+                self._logger.warning("shell %s capture failed: %s",
+                                     self._name, exc)
+
+    def _feed(self, chunk: bytes) -> None:
+        self._total += len(chunk)
+        if self._log is not None:
+            self._log.write(self._name, chunk)
+        room = self._cap - len(self._head)
+        if room > 0:
+            self._head.extend(chunk[:room])
+            chunk = chunk[room:]
+        if chunk:
+            self._tail.extend(chunk)
+            overflow = len(self._tail) - self._cap
+            if overflow > 0:
+                del self._tail[:overflow]
+
+    def render(self) -> bytes:
+        if self._total <= self._cap:
+            return bytes(self._head)
+        marker = b"\n... [truncated] ...\n"
+        budget = self._cap - len(marker)
+        if budget <= 0:
+            return marker[: self._cap]
+        head_n = budget // 2
+        tail_n = budget - head_n
+        return bytes(self._head[:head_n]) + marker + bytes(self._tail[-tail_n:])
+
+    def text(self) -> str:
+        return self.render().decode("utf-8", "replace")
+
+
+def _group_id(proc: asyncio.subprocess.Process) -> int | None:
+    """Process-group id of *proc*; ``start_new_session`` makes it the leader."""
+    if not hasattr(os, "killpg"):
+        return None  # non-POSIX: fall back to signalling the direct child
+    try:
+        return os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        # The leader may already be reaped while its group still has members;
+        # a session leader's pgid never changes, so its pid is the group id.
+        return proc.pid
+
+
+def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> bool:
+    """Signal the whole process group, falling back to the direct child."""
+    pgid = _group_id(proc)
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        if sig == getattr(signal, "SIGKILL", None):
+            proc.kill()
+        else:
+            proc.terminate()
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True  # cannot tell: assume alive so the caller escalates
+    return True
+
+
+def _abandon_process(proc: asyncio.subprocess.Process) -> None:
+    """Close the subprocess transport (pipe fds + child) as a last resort.
+
+    This is what makes the "unkillable child" path safe: even if a signal did
+    not take effect, closing the transport releases our pipe fds instead of
+    leaving the worker waiting for EOF forever.
+    """
+    transport = getattr(proc, "_transport", None)
+    if transport is None:  # pragma: no cover - asyncio always sets it
+        return
+    try:
+        transport.close()
+    except Exception:  # noqa: BLE001 - teardown is best effort
+        pass
+
+
+async def _wait_process(proc: asyncio.subprocess.Process, timeout: float) -> bool:
+    """Await child exit with a hard bound; never blocks forever."""
+    if proc.returncode is not None:
+        return True
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=max(0.0, timeout))
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def _wait_group_gone(proc: asyncio.subprocess.Process,
+                           pgid: int | None, timeout: float) -> bool:
+    """Wait (bounded) until the child is reaped and its process group is empty."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        if proc.returncode is None:
+            remaining = deadline - loop.time()
+            try:
+                await asyncio.wait_for(
+                    proc.wait(), timeout=min(_SHELL_GROUP_POLL_S,
+                                             max(0.0, remaining)))
+            except asyncio.TimeoutError:
+                pass
+        if proc.returncode is not None and (
+                pgid is None or not _group_alive(pgid)):
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0.0:
+            return False
+        await asyncio.sleep(min(_SHELL_GROUP_POLL_S, remaining))
+
+
+async def _settle_pumps(tasks: list[asyncio.Task], *, timeout: float = 1.0) -> None:
+    """Give capture tasks a moment to finish, then cancel the stragglers."""
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    _, pending = await asyncio.wait(pending, timeout=max(0.0, timeout))
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.wait(pending, timeout=1.0)
 
 
 class ToolExecutor:
@@ -776,6 +1021,50 @@ class ToolExecutor:
             env[key] = value
         return env
 
+    def _default_shell_timeout(self) -> float:
+        """Configured shell timeout, sanitized so it can never hang a worker."""
+        try:
+            value = float(self._cfg("shell_timeout_s", 60))
+        except (TypeError, ValueError):
+            return 60.0
+        if not math.isfinite(value) or value <= 0:
+            return 60.0
+        return value
+
+    def _open_shell_log(self, command: str, cwd: Path) -> _ShellLog | None:
+        """Create a uniquely named log file for streaming the full output.
+
+        Best effort: when ``.artifacts`` is unwritable the tool still returns
+        its result, just without a ``log`` path.
+        """
+        directory = self.workspace / ".artifacts"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"shell-{time.time_ns()}-{secrets.token_hex(4)}.log"
+            handle = path.open("xb")
+        except OSError as exc:
+            self.log.warning("cannot create shell log under %s: %s",
+                             directory, exc)
+            return None
+        log = _ShellLog(handle, path)
+        try:
+            handle.write(f"$ {command}\ncwd: {cwd}\n".encode("utf-8", "replace"))
+        except (OSError, ValueError):
+            log.failed = True
+        return log
+
+    async def _terminate_group(self, proc: asyncio.subprocess.Process) -> bool:
+        """SIGTERM the whole group, then SIGKILL it; bounded at every step."""
+        pgid = _group_id(proc)
+        _signal_group(proc, signal.SIGTERM)
+        if await _wait_group_gone(proc, pgid, _SHELL_TERM_GRACE_S):
+            return True
+        _signal_group(proc, signal.SIGKILL)
+        if await _wait_group_gone(proc, pgid, _SHELL_KILL_GRACE_S):
+            return True
+        self.log.warning("shell process group %s survived SIGKILL", pgid)
+        return False
+
     async def _shell_exec(self, args: dict, scope: dict) -> dict:
         if not bool(self._cfg("allow_shell", True)):
             raise ToolError("shell execution is disabled by security config")
@@ -783,10 +1072,12 @@ class ToolExecutor:
         cwd = self.check_path(_arg_str(args, "cwd", "."), must_exist=True)
         if not cwd.is_dir():
             raise ToolError(f"cwd is not a directory: {cwd}")
-        timeout_s = _arg_float(args, "timeout_s",
-                               float(self._cfg("shell_timeout_s", 60)))
-        if timeout_s <= 0:
-            timeout_s = float(self._cfg("shell_timeout_s", 60))
+        default_timeout = self._default_shell_timeout()
+        timeout_s = _arg_float(args, "timeout_s", default_timeout)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            # H4 only needs to stay hang-free; strict 400s (and the upper
+            # bound) are handled by the later timeout-validation item.
+            timeout_s = default_timeout
 
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -795,56 +1086,63 @@ class ToolExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._shell_env(),
+            start_new_session=True,  # setsid: a timeout can kill the whole group
         )
+        log = self._open_shell_log(command, cwd)
+        out_reader = _CappedStream(proc.stdout, log=log, name="stdout",
+                                   logger=self.log)
+        err_reader = _CappedStream(proc.stderr, log=log, name="stderr",
+                                   logger=self.log)
+        pumps = [
+            asyncio.create_task(out_reader.pump(), name="shell-stdout"),
+            asyncio.create_task(err_reader.pump(), name="shell-stderr"),
+        ]
         timed_out = False
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(),
-                                                    timeout=timeout_s)
-        except asyncio.TimeoutError:
-            timed_out = True
             try:
-                proc.kill()
-            except ProcessLookupError:  # pragma: no cover - race
-                pass
-            stdout, stderr = await proc.communicate()
-        except asyncio.CancelledError:  # pragma: no cover - cancellation path
+                _, pending = await asyncio.wait(pumps, timeout=timeout_s)
+                if pending:
+                    # The command, or a descendant still holding its pipes, is
+                    # running past the deadline: kill the process group.
+                    timed_out = True
+                    await self._terminate_group(proc)
+                elif not await _wait_process(proc, _SHELL_EXIT_GRACE_S):
+                    timed_out = True
+                    await self._terminate_group(proc)
+                elif out_reader.error is not None or err_reader.error is not None:
+                    # A capture failure must not leave the child running.
+                    await self._terminate_group(proc)
+            except asyncio.CancelledError:
+                # Cancellation gets the same process-group cleanup (bounded),
+                # then the cancellation is allowed to propagate to the caller.
+                pgid = _group_id(proc)
+                _signal_group(proc, signal.SIGTERM)
+                if not await _wait_group_gone(
+                        proc, pgid, _SHELL_CANCEL_TERM_GRACE_S):
+                    _signal_group(proc, signal.SIGKILL)
+                    await _wait_group_gone(proc, pgid,
+                                           _SHELL_CANCEL_KILL_GRACE_S)
+                raise
+        finally:
+            exit_code = proc.returncode if proc.returncode is not None else -1
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            raise
+                # Release pipe fds even if a signal did not take effect; the
+                # pumps below then see EOF instead of blocking forever.
+                _abandon_process(proc)
+                await _settle_pumps(pumps)
+            finally:
+                if log is not None:
+                    log.close(exit_code=exit_code, timed_out=timed_out)
 
-        exit_code = proc.returncode if proc.returncode is not None else -1
-        out_capped = stdout[:OUTPUT_CAP_BYTES].decode("utf-8", "replace")
-        err_capped = stderr[:OUTPUT_CAP_BYTES].decode("utf-8", "replace")
-        truncated = len(stdout) > OUTPUT_CAP_BYTES or len(stderr) > OUTPUT_CAP_BYTES
-        log_path = self._write_shell_log(command, cwd, exit_code, timed_out,
-                                         stdout, stderr)
         return {
             "exit_code": exit_code,
-            "stdout": out_capped,
-            "stderr": err_capped,
-            "truncated": truncated,
+            "stdout": out_reader.text(),
+            "stderr": err_reader.text(),
+            "truncated": out_reader.truncated or err_reader.truncated,
             "timed_out": timed_out,
-            "log": str(log_path) if log_path else "",
+            "log": str(log.path) if log is not None else "",
             "cwd": str(cwd),
         }
-
-    def _write_shell_log(self, command: str, cwd: Path, exit_code: int,
-                         timed_out: bool, stdout: bytes,
-                         stderr: bytes) -> Path | None:
-        """Persist the full (uncapped) output under ``<workspace>/.artifacts``."""
-        log_path = self.workspace / ".artifacts" / f"shell-{int(time.time() * 1000)}.log"
-        header = (f"$ {command}\ncwd: {cwd}\nexit: {exit_code} "
-                  f"timed_out: {timed_out}\n--- stdout ---\n").encode("utf-8")
-        body = header + stdout + b"\n--- stderr ---\n" + stderr + b"\n"
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(body)
-        except OSError:
-            self.log.warning("cannot write shell log %s", log_path, exc_info=True)
-            return None
-        return log_path
 
     async def _net_fetch(self, args: dict, scope: dict) -> dict:
         url = _arg_str(args, "url", required=True)
