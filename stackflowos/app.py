@@ -71,7 +71,7 @@ UNIT_PROJECT_PATCH_FIELDS = frozenset({"brief"})
 PRINCIPAL_ACTIONS = frozenset({
     "unit.addresses", "unit.register", "unit.heartbeat", "unit.release",
     "lease.acquire", "lease.renew", "lease.release", "lease.list",
-    "approval.status", "approval.use",
+    "approval.status", "approval.use", "approval.claim",
     # ``event.append`` binds the audit provenance to the authenticated unit
     # itself (X2): a caller-supplied ``source`` is never persisted.
     "event.append",
@@ -453,6 +453,7 @@ class App:
             "approval.request": self._approval_request,
             "approval.status": self._approval_status,
             "approval.use": self._approval_use,
+            "approval.claim": self._approval_claim,
             "approval.list": self._approval_list,
             "approval.decide": self._approval_decide,
             "rule.list": self._rule_list,
@@ -1172,6 +1173,14 @@ class App:
             str(data.get("grant_id") or ""),
             principal=self._owner_principal(principal))
         return {"ok": ok}
+
+    async def _approval_claim(self, data, src, principal=None):
+        # M10: only the request owner (or an operator) may claim the single
+        # execution slot; the broker re-checks state/grant under its lock.
+        claim_id = self.approvals.claim(
+            str(data.get("request_id") or data.get("id") or ""),
+            principal=self._owner_principal(principal))
+        return {"claim_id": claim_id}
 
     async def _approval_list(self, data, src):
         items = self.approvals.list(status=data.get("status"),

@@ -54,6 +54,8 @@ class FakeSysAPI:
             return dict(self.approval)
         if action == "approval.use":
             return {"ok": True}
+        if action == "approval.claim":
+            return {"claim_id": "clm-default"}
         return {}
 
     def actions(self, name: str) -> list[dict]:
@@ -108,7 +110,7 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool.denied", self.sys.event_types())
         self.assertIn("tool.invoked", self.sys.event_types())
 
-    async def test_pending_approval_polls_and_uses_grant(self) -> None:
+    async def test_pending_approval_polls_and_claims_once(self) -> None:
         self.sys.responses["approval.request"] = {
             "id": "apr-9", "status": "pending", "mode": None, "risk": "low"}
         self.sys.responses["approval.status"] = lambda data: {
@@ -117,17 +119,22 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         result = await self.executor.run("fs.list", {"path": "."})
         self.assertTrue(result.ok)
         self.assertEqual(len(self.sys.actions("approval.status")), 1)
-        self.assertEqual(self.sys.actions("approval.use"),
-                         [{"grant_id": "grant-9"}])
+        # M10: a human one-shot is claimed before execution, not used.
+        self.assertEqual(self.sys.actions("approval.claim"),
+                         [{"request_id": "apr-9"}])
+        self.assertEqual(self.sys.actions("approval.use"), [])
 
-    async def test_spent_one_shot_grant_is_denied(self) -> None:
+    async def test_claimed_one_shot_grant_is_denied(self) -> None:
         self.sys.approval = {"id": "apr-1", "status": "approved", "mode": "once",
                              "risk": "low", "grant_id": "grant-1"}
-        self.sys.responses["approval.use"] = {"ok": False}
+        self.sys.responses["approval.claim"] = {"ok": False}
         result = await self.executor.run("fs.list", {"path": "."})
         self.assertFalse(result.ok)
         self.assertTrue((result.error or "").startswith("DENIED:"))
+        self.assertIn("already claimed", result.error or "")
         self.assertIn("tool.denied", self.sys.event_types())
+        # A failed claim must never reach the handler (no fs.list RPC/result).
+        self.assertNotIn("tool.result", self.sys.event_types())
 
     async def test_auto_approval_does_not_use_grant(self) -> None:
         result = await self.executor.run("fs.list", {"path": "."})

@@ -271,20 +271,45 @@ class PolicyEngine:
         now = now_ms if now_ms is not None else _now_ms()
         if risk is None:
             risk = self.risk(capability, scope)
-        matching = self._matching(principal, capability, scope, now)
-        for rule in matching:
-            if rule.effect == "deny":
-                return Decision("deny", risk,
-                                f"denied by rule {rule.id}: {rule.note or 'deny'}",
-                                rule)
-        for rule in matching:
-            if rule.effect != "allow":
-                continue
-            if RISK_ORDER.get(risk, 2) <= _risk_index(rule.risk_max):
-                return Decision("allow", risk,
-                                f"allowed by rule {rule.id} "
-                                f"({rule.source}) risk<={rule.risk_max}", rule)
-        return self._default(risk)
+        with self._lock:
+            matching = self._matching_locked(principal, capability, scope, now)
+        decision = _decide(matching, risk)
+        return decision if decision is not None else self._default(risk)
+
+    def evaluate_and_consume(self, principal: str, capability: str, scope: dict,
+                             *, risk: str | None = None,
+                             now_ms: int | None = None) -> Decision:
+        """Atomically evaluate and, for a one-shot allow, spend the grant (M10).
+
+        ``evaluate`` + ``consume`` used to be two separate lock acquisitions:
+        two concurrent requests could both observe the same one-shot grant as
+        ``allow`` and the loser only found out afterwards (a fail-closed but
+        confusing round trip).  Here the winning rule lookup and the use
+        deduction happen under one hold of ``self._lock``, so a one-shot grant
+        can be handed to exactly one caller.
+
+        When the matched allow rule is a one-shot grant that cannot be spent
+        (already consumed, expired, or raced away) the result is ``ask``
+        instead of a stale ``allow`` -- never an ``allow`` whose grant is
+        already gone.
+        """
+        get_capability(capability)  # unknown capabilities are a bad request
+        now = now_ms if now_ms is not None else _now_ms()
+        if risk is None:
+            risk = self.risk(capability, scope)
+        with self._lock:
+            matching = self._matching_locked(principal, capability, scope, now)
+            decision = _decide(matching, risk)
+            if decision is None:
+                return self._default(risk)
+            rule = decision.rule
+            if (decision.outcome != "allow" or rule is None
+                    or rule.uses_left is None):
+                return decision
+            if not self.consume(rule.id, now_ms=now):
+                return Decision("ask", decision.risk,
+                                "one-shot grant already spent", rule)
+            return decision
 
     def risk(self, capability: str, scope: dict) -> str:
         """Dynamic risk for a capability under the configured project root.
@@ -300,20 +325,18 @@ class PolicyEngine:
         return risk_of(capability, scope, projects_root=self.projects_root,
                        workspace=workspace)
 
-    def consume(self, rule_id: str) -> bool:
+    def consume(self, rule_id: str, *, now_ms: int | None = None) -> bool:
         """Spend one use of a grant; standing rules pass without changes."""
         with self._lock:
             rule = self._rules.get(rule_id)
-            if rule is None or not rule.active():
+            if rule is None or not rule.active(now_ms):
                 return False
             if rule.uses_left is None:
                 return True
             rule.uses_left = int(rule.uses_left) - 1
-            if rule.uses_left <= 0:
+            deleted = rule.uses_left <= 0
+            if deleted:
                 del self._rules[rule_id]
-                deleted = True
-            else:
-                deleted = False
         self.save()
         if deleted:
             self._emit("rule.deleted", rule, reason="uses_exhausted")
@@ -358,7 +381,12 @@ class PolicyEngine:
     def _matching(self, principal: str, capability: str, scope: dict,
                   now: int) -> list[Rule]:
         with self._lock:
-            rules = list(self._rules.values())
+            return self._matching_locked(principal, capability, scope, now)
+
+    def _matching_locked(self, principal: str, capability: str, scope: dict,
+                         now: int) -> list[Rule]:
+        """Matching rules; the caller must already hold ``self._lock``."""
+        rules = list(self._rules.values())
         result = []
         for rule in sorted(rules, key=lambda r: (r.created_at, r.id)):
             if not rule.active(now):
@@ -441,6 +469,27 @@ class PolicyEngine:
         project_id = rule.scope.get("project_id") if isinstance(rule.scope, dict) else None
         return emit_both(self.ctx, self.eventlog, type, data,
                          str(project_id) if project_id else None)
+
+
+def _decide(matching: list[Rule], risk: str) -> Decision | None:
+    """Apply deny-wins ordering to already matched rules (pure).
+
+    ``None`` means "no rule decided", so the caller applies the configured
+    default (which lives on the engine, not on this helper).
+    """
+    for rule in matching:
+        if rule.effect == "deny":
+            return Decision("deny", risk,
+                            f"denied by rule {rule.id}: {rule.note or 'deny'}",
+                            rule)
+    for rule in matching:
+        if rule.effect != "allow":
+            continue
+        if RISK_ORDER.get(risk, 2) <= _risk_index(rule.risk_max):
+            return Decision("allow", risk,
+                            f"allowed by rule {rule.id} "
+                            f"({rule.source}) risk<={rule.risk_max}", rule)
+    return None
 
 
 def _risk_index(risk: str) -> int:

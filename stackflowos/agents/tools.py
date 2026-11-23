@@ -2,8 +2,8 @@
 
 Design contract (docs/architecture.md §6.4):
 
-    resolve scope -> risk -> sys.approval.request -> poll -> verify grant
-    -> execute (re-check path/cwd) -> approval.use -> tool.result event
+    resolve scope -> risk -> sys.approval.request -> poll -> claim one-shot
+    -> execute (re-check path/cwd) -> approval.use (auto grants) -> tool.result
 
 The executor runs *inside the worker process*; sys only grants capabilities and
 audits.  It never imports ``security``/``l2``/``projects``: the security config
@@ -827,8 +827,8 @@ class ToolExecutor:
             return await self._fail(
                 spec, f"{type(exc).__name__}: {exc}", preview=display)
 
-        if not await self._spend_once_grant(approval):
-            reason = "one-shot approval was already used"
+        if not await self._claim_once(approval):
+            reason = "one-shot approval already claimed"
             await self._emit("tool.denied", {
                 "tool": spec.name,
                 "capability": spec.capability,
@@ -877,21 +877,28 @@ class ToolExecutor:
         })
         return ToolResult(ok=False, error=error, preview=preview)
 
-    async def _spend_once_grant(self, approval: dict) -> bool:
-        """Spend a human one-shot grant *before* acting; fail closed."""
+    async def _claim_once(self, approval: dict) -> bool:
+        """Claim a human one-shot approval *before* acting; fail closed.
+
+        M10: the execution slot is bound by ``approval.claim`` -- exactly one
+        caller can claim an approved ``once`` request (the broker spends the
+        grant under its lock and returns a ``claim_id``); everyone else gets a
+        conflict and must not execute.  Auto grants (``mode == "grant"``)
+        keep their existing post-execution ``approval.use`` audit path.
+        """
         if str(approval.get("mode") or "") != "once":
             return True
-        grant_id = approval.get("grant_id")
-        if not grant_id:
+        request_id = approval.get("id")
+        if not request_id:
             return False
         try:
-            result = await call_ok(self.sys, "approval.use",
-                                   {"grant_id": str(grant_id)})
-        except Exception:  # noqa: BLE001 - cannot prove the grant: refuse
-            self.log.debug("approval.use failed for grant %s", grant_id,
+            result = await call_ok(self.sys, "approval.claim",
+                                   {"request_id": str(request_id)})
+        except Exception:  # noqa: BLE001 - cannot prove the claim: refuse
+            self.log.debug("approval.claim failed for request %s", request_id,
                            exc_info=True)
             return False
-        return bool(result.get("ok"))
+        return bool(result.get("claim_id"))
 
     async def _use_grant(self, approval: dict) -> None:
         grant_id = approval.get("grant_id") if isinstance(approval, dict) else None

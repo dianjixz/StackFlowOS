@@ -7,9 +7,12 @@ a human decides or the TTL expires. **Fail closed**: a pending request never
 auto-approves, and an expired request means the action is refused.
 
 Approving creates a grant rule (once/session) or a standing rule (always);
-``use`` spends one-shot grants. Every request/decision/use is written to the
-event log, so the audit page is just a filtered event stream. Pending requests
-and the last 200 decided ones are persisted atomically.
+one-shot grants are bound to execution through :meth:`ApprovalBroker.claim`
+(M10: the single winner gets a ``claim_id``, later claims conflict) while
+``use`` remains for legacy callers and never deducts a claimed grant twice.
+Every request/decision/claim/use is written to the event log, so the audit
+page is just a filtered event stream. Pending requests and the last 200
+decided ones are persisted atomically.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
 from ..util.jsonio import read_json, write_json
 from .capabilities import project_workspace, risk_of
-from .policy import Decision, PolicyEngine
+from .policy import PolicyEngine
 
 _MODE_CHOICES = ("once", "session", "always")
 #: Destructive/targeted capabilities keep their exact scope in standing grants.
@@ -95,6 +98,10 @@ class ApprovalRequest:
     status: str = "pending"    # pending|approved|denied|expired|canceled
     mode: str | None = None    # rule|grant|auto|once|session|always
     grant_id: str | None = None
+    #: M10: id of the single claim that may execute this one-shot approval.
+    #: Set once under the broker lock; a second claim is a conflict.
+    claim_id: str | None = None
+    claimed_at: int | None = None
     created_at: int = 0
     expires_at: int = 0
     decided_at: int | None = None
@@ -180,8 +187,13 @@ class ApprovalBroker:
         effective_project = project_id or scope.get("project_id")
         if risk is None:
             risk = self._risk_for(capability, scope, effective_project)
-        decision = self.policy.evaluate(principal, capability, scope,
-                                        risk=risk, now_ms=now)
+        decision = self.policy.evaluate_and_consume(
+            principal, capability, scope, risk=risk, now_ms=now)
+        if (decision.outcome == "allow" and decision.rule is not None
+                and decision.rule.uses_left is not None):
+            # evaluate_and_consume already spent this one-shot grant; keep the
+            # request-time ``approval.used`` audit record the old spend emitted.
+            self._emit_grant_used(decision.rule.id, decision.rule)
         original_full = str(preview_full or preview or "")
         stored_full = original_full[: self.preview_store_chars]
         request = ApprovalRequest(
@@ -201,10 +213,6 @@ class ApprovalBroker:
             task_id=task_id,
             created_at=now,
         )
-        if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
-            # A one-shot grant lost the race (or was already spent): a human
-            # has to decide again instead of reusing it.
-            decision = Decision("ask", risk, "one-shot grant already spent")
         if decision.outcome == "deny":
             request.status = "denied"
             request.mode = "auto"
@@ -395,27 +403,34 @@ class ApprovalBroker:
 
         Called after a rule is created so already-waiting requests (several
         workers often ask for the same thing) do not each need a click.
+
+        M10: each request is re-evaluated with
+        :meth:`PolicyEngine.evaluate_and_consume`, and the broker lock is held
+        across the re-check and the status change so a concurrent
+        ``decide()``/``claim()`` cannot interleave; a one-shot grant is spent
+        for at most one sibling.
         """
         now = _now_ms()
         resolved: list[ApprovalRequest] = []
         with self._lock:
             pending = [r for r in self._requests.values()
                        if r.status == "pending"]
-        for request in pending:
-            try:
-                decision = self.policy.evaluate(
-                    request.principal, request.capability, request.scope,
-                    risk=request.risk, now_ms=now)
-            except Exception:  # noqa: BLE001 - stale request must not block others
-                continue
-            if decision.outcome not in ("allow", "deny"):
-                continue
-            with self._lock:
+            for request in pending:
                 if request.status != "pending":
                     continue
-                if decision.outcome == "allow" and not self._spend_one_shot(decision.rule):
+                try:
+                    decision = self.policy.evaluate_and_consume(
+                        request.principal, request.capability, request.scope,
+                        risk=request.risk, now_ms=now)
+                except Exception:  # noqa: BLE001 - stale request must not block others
+                    continue
+                if decision.outcome not in ("allow", "deny"):
                     continue
                 rule = decision.rule
+                if (decision.outcome == "allow" and rule is not None
+                        and rule.uses_left is not None):
+                    # Parity with the old resolve-time spend audit.
+                    self._emit_grant_used(rule.id, rule)
                 if decision.outcome == "allow":
                     request.status = "approved"
                     request.mode = ("rule" if rule is not None
@@ -427,10 +442,10 @@ class ApprovalBroker:
                 request.decided_at = now
                 request.decided_by = by
                 request.note = decision.reason
-            resolved.append(request)
-            self._emit("approval.auto", request, decision=decision.outcome,
-                       rule_id=request.grant_id, mode=request.mode,
-                       policy_reason=decision.reason)
+                resolved.append(request)
+                self._emit("approval.auto", request, decision=decision.outcome,
+                           rule_id=request.grant_id, mode=request.mode,
+                           policy_reason=decision.reason)
         if resolved:
             self.save()
         return resolved
@@ -463,7 +478,9 @@ class ApprovalBroker:
         """Spend one use of a grant; emits ``approval.used`` when allowed.
 
         ``principal`` (H3) enforces that only the grant's owner may spend it;
-        operators pass ``None`` and keep the global view.
+        operators pass ``None`` and keep the global view.  M10: once the
+        one-shot approval has been claimed (``claim`` already spent the
+        grant), ``use`` returns ``False`` instead of deducting a second time.
         """
         rule = self.policy.get_rule(grant_id)
         if principal is not None:
@@ -472,10 +489,65 @@ class ApprovalBroker:
                 raise Denied(
                     f"{principal} may not use grant {grant_id!r}",
                     detail={"grant_id": grant_id, "principal": owner})
-        allowed = self.policy.consume(grant_id)
+        with self._lock:
+            if self._grant_is_claimed(grant_id):
+                self.log.debug("grant %s was already spent by a claim", grant_id)
+                return False
+            allowed = self.policy.consume(grant_id)
         if allowed:
             self._emit_grant_used(grant_id, rule)
         return allowed
+
+    def claim(self, request_id: str, *, principal: str | None = None) -> str:
+        """Claim the single execution of an approved one-shot request (M10).
+
+        The approval status, the owner, the grant's remaining uses and the
+        claim marker are all checked and updated under the broker lock, so two
+        callers racing for the same request cannot both execute it: the first
+        gets a fresh ``claim_id`` (and the grant is spent exactly once), every
+        later call raises :class:`Conflict`.  ``principal`` (H3) restricts the
+        call to the request owner; operators pass ``None``.
+
+        ``use`` is kept for legacy callers, but a claimed grant is never
+        deducted twice.
+        """
+        now = _now_ms()
+        with self._lock:
+            request = self.get(request_id)
+            if principal is not None and not _principal_owns(
+                    request.principal, principal):
+                raise Denied(
+                    f"{principal} may not claim approval {request_id!r}",
+                    detail={"request_id": request_id,
+                            "principal": request.principal})
+            if request.claim_id:
+                raise Conflict(
+                    f"approval {request_id!r} has already been claimed",
+                    detail={"request_id": request_id,
+                            "claim_id": request.claim_id})
+            if request.status != "approved":
+                raise Conflict(
+                    f"approval {request_id!r} is {request.status!r}, not approved",
+                    detail={"request_id": request_id,
+                            "status": request.status})
+            if request.mode != "once":
+                raise Conflict(
+                    f"approval {request_id!r} is not a one-shot approval",
+                    detail={"request_id": request_id, "mode": request.mode})
+            grant_id = str(request.grant_id or "")
+            if not grant_id or not self.policy.consume(grant_id, now_ms=now):
+                raise Conflict(
+                    f"one-shot grant for approval {request_id!r} is no longer "
+                    "available",
+                    detail={"request_id": request_id,
+                            "grant_id": grant_id or None})
+            claim_id = new_id("clm")
+            request.claim_id = claim_id
+            request.claimed_at = now
+            self._requests[request.id] = request
+        self.save()
+        self._emit_claimed(request, claim_id)
+        return claim_id
 
     def sweep(self, now_ms: int | None = None) -> list[ApprovalRequest]:
         """Expire every pending request past its deadline (fail closed)."""
@@ -561,14 +633,15 @@ class ApprovalBroker:
         for request in drop:
             self._requests.pop(request.id, None)
 
-    def _spend_one_shot(self, rule: Any) -> bool:
-        """Consume a one-shot grant when ``rule`` is one; standing rules pass."""
-        if rule is None or rule.uses_left is None:
-            return True
-        if not self.policy.consume(rule.id):
-            return False
-        self._emit_grant_used(rule.id, rule)
-        return True
+    def _grant_is_claimed(self, grant_id: str) -> bool:
+        """True when some approval already claimed (spent) ``grant_id``.
+
+        The caller must hold ``self._lock``.  Used by :meth:`use` so a legacy
+        ``approval.use`` after a claim cannot deduct the grant a second time.
+        """
+        grant_id = str(grant_id or "")
+        return any(request.claim_id and str(request.grant_id or "") == grant_id
+                   for request in self._requests.values())
 
     def _risk_for(self, capability: str, scope: dict,
                   project_id: str | None) -> str:
@@ -588,6 +661,19 @@ class ApprovalBroker:
                          "principal": rule.principal,
                          "effect": rule.effect})
         emit_both(self.ctx, self.eventlog, "approval.used", data)
+
+    def _emit_claimed(self, request: ApprovalRequest, claim_id: str) -> None:
+        """Audit one claim without echoing request scope/preview content."""
+        emit_both(self.ctx, self.eventlog, "approval.claimed", {
+            "request_id": request.id,
+            "claim_id": claim_id,
+            "principal": request.principal,
+            "capability": request.capability,
+            "risk": request.risk,
+            "mode": request.mode,
+            "grant_id": request.grant_id,
+            "claimed_at": request.claimed_at,
+        }, request.project_id)
 
     def _emit(self, type: str, request: ApprovalRequest, **extra: Any) -> None:
         data = {
