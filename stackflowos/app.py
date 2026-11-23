@@ -27,6 +27,7 @@ from .errors import (BadRequest, Conflict, Denied, NotFound, SfoError,
                      Unauthorized, Unavailable, ValidationError)
 from .kernel import Context
 from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler, UnitInfo, UnitRegistry
+from .memory import MemoryStore
 from .protocol import PROTOCOL_VERSION
 from .projects import ProjectStore, plan_for
 from .security import (ApprovalBroker, PolicyEngine, Principal,
@@ -34,7 +35,6 @@ from .security import (ApprovalBroker, PolicyEngine, Principal,
 from .session.chat import ChatService
 from .session.operator import OperatorTools
 from .transport import AddressAllocator, HubTransport, socket_dir_for
-from .util.jsonio import read_json, write_json
 from .util.logging import get_logger, setup_logging
 
 VERSION = "0.1.0"
@@ -117,26 +117,6 @@ def _lease_project_id(lease: Any) -> str | None:
         if isinstance(project_id, str) and project_id:
             return project_id
     return None
-
-
-class MemoryStore:
-    """Per-project key/value memory for agents (small, JSON persisted)."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
-        data = read_json(self.path, default={}) or {}
-        self.data: dict[str, dict] = data if isinstance(data, dict) else {}
-
-    def get(self, project_id: str, key: str) -> Any:
-        return (self.data.get(project_id) or {}).get(key)
-
-    def set(self, project_id: str, key: str, value: Any) -> Any:
-        self.data.setdefault(project_id, {})[key] = value
-        write_json(self.path, self.data)
-        return value
-
-    def all(self, project_id: str) -> dict:
-        return dict(self.data.get(project_id) or {})
 
 
 class App:
@@ -225,7 +205,19 @@ class App:
             grant_ttl_s=cfg.security.grant_ttl_s,
             preview_store_chars=cfg.security.preview_store_chars,
         )
-        self.memory = MemoryStore(self.paths.state_dir / "state" / "memory.json")
+        self.memory = MemoryStore(
+            self.paths.state_dir / "state" / "memory",
+            max_project_bytes=cfg.security.memory_max_bytes,
+            max_total_bytes=cfg.security.memory_max_total_bytes,
+            max_projects=cfg.security.memory_max_projects,
+            logger=get_logger("memory"),
+        )
+        # A corrupt project file (or the legacy memory.json) is quarantined by
+        # the store instead of aborting startup; surface it as an audit event.
+        for report in self.memory.drain_corruptions():
+            self.eventlog.append(
+                "memory.corrupt", dict(report), source="sys",
+                project_id=report.get("project_id"))
         self.scheduler = Scheduler(self.registry)
         if hasattr(self.scheduler, "bind_leases"):
             self.scheduler.bind_leases(self.leases)
@@ -1693,10 +1685,9 @@ class App:
         canceled = self._cancel_project_approvals(project_id, "project deleted")
         leases = self._release_project_leases(project_id)
         record = self.projects.delete(project_id)
-        self.memory.data.pop(project_id, None)
         try:
-            write_json(self.paths.state_dir / "state" / "memory.json", self.memory.data)
-        except Exception:
+            self.memory.delete(project_id)
+        except (ValidationError, OSError):
             self.log.debug("memory cleanup failed", exc_info=True)
         purged = False
         purge_error: str | None = None

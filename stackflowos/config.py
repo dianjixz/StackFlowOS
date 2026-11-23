@@ -93,6 +93,13 @@ class SecurityCfg:
     #: Bounded storage for the redacted full preview behind the details
     #: endpoint (M7).  ``max_preview_chars`` still controls what is shown.
     preview_store_chars: int = 65536
+    #: Per-project agent memory cap (L6): a ``memory.set`` whose JSON encoding
+    #: of that project's data exceeds this is rejected with a 400.
+    memory_max_bytes: int = 256 * 1024
+    #: Cap for the whole per-project memory store (L6), across every file.
+    memory_max_total_bytes: int = 4 * 1024 * 1024
+    #: Number of project memory files allowed (L6).
+    memory_max_projects: int = 1000
 
 
 @dataclass
@@ -277,6 +284,18 @@ def _validate_section(name: str, section: Any) -> None:
         if not (1024 <= section.preview_store_chars <= 262144):
             raise ConfigError(
                 "security.preview_store_chars out of range (1024..262144)")
+        if not (1024 <= section.memory_max_bytes <= 4 * 1024 * 1024):
+            raise ConfigError(
+                "security.memory_max_bytes out of range (1024..4194304)")
+        if not (1024 <= section.memory_max_total_bytes <= 256 * 1024 * 1024):
+            raise ConfigError(
+                "security.memory_max_total_bytes out of range (1024..268435456)")
+        if section.memory_max_total_bytes < section.memory_max_bytes:
+            raise ConfigError(
+                "security.memory_max_total_bytes must be >= security.memory_max_bytes")
+        if not (1 <= section.memory_max_projects <= 100000):
+            raise ConfigError(
+                "security.memory_max_projects out of range (1..100000)")
     elif name == "llm":
         if section.provider not in ("mock", "openai"):
             raise ConfigError("llm.provider must be mock|openai")
