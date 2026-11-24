@@ -234,10 +234,16 @@ class LLMBrain:
     """
 
     def __init__(self, provider: Any, role: str, *,
-                 max_steps: int = 16) -> None:
+                 max_steps: int = 16,
+                 skill_renderer: Any = None) -> None:
         self.provider = provider
         self.role = str(role)
         self.max_steps = int(max_steps)
+        #: Optional ``(project_id, role, prompt) -> str`` hook.  Workers pass a
+        #: filesystem-backed renderer so enabled skills reach the system prompt
+        #: without the worker needing the hub's SkillRegistry object.
+        self.skill_renderer = skill_renderer
+        self._skills_cache: tuple[tuple, str] | None = None
         self._history: list[dict] = []
         self._pending: Any = None
         self._pending_call_id: str | None = None
@@ -249,12 +255,41 @@ class LLMBrain:
         return await self.provider.chat(messages)
 
     # -- conversation memory ---------------------------------------------
-    def _system(self) -> str:
+    def _skills(self, view: Any) -> str:
+        if self.skill_renderer is None:
+            return ""
+        task = getattr(view, "task", None) or {}
+        if not isinstance(task, dict):
+            task = {}
+        project = getattr(view, "project", None) or {}
+        if not isinstance(project, dict):
+            project = {}
+        prompt = " ".join(
+            str(part) for part in (task.get("title"), task.get("description"),
+                                   getattr(view, "prompt", ""))
+            if part)
+        project_id = project.get("id") or getattr(
+            getattr(view, "agent", None), "project_id", None)
+        signature = (project_id, self.role, prompt)
+        if self._skills_cache is not None and self._skills_cache[0] == signature:
+            return self._skills_cache[1]
+        try:
+            text = str(self.skill_renderer(project_id, self.role, prompt) or "")
+        except Exception:  # noqa: BLE001 - skills must never break a run
+            _log.debug("skill injection failed", exc_info=True)
+            text = ""
+        self._skills_cache = (signature, text)
+        return text
+
+    def _system(self, view: Any = None) -> str:
         text = "\n\n".join((SYSTEM_PROMPT_OS, role_prompt(self.role),
                              tool_call_protocol(self.role)))
         if supports_native_tools(self.provider):
             text += ("\n\n本模型支持原生工具调用：优先直接调用提供的工具；"
                      "如果无法使用原生调用，再按上面的 JSON 协议输出。")
+        skills = self._skills(view) if view is not None else ""
+        if skills:
+            text += "\n\n" + skills
         return text
 
     def observe(self, action: Any, result: Any) -> None:

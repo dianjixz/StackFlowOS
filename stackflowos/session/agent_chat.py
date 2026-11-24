@@ -854,7 +854,7 @@ class AgentChatService:
 
     def _prompt_messages(self, agent: Agent, project: Any, tools: list[Any],
                          user_text: str) -> list[dict]:
-        system = self._system_prompt(agent, project, tools)
+        system = self._system_prompt(agent, project, tools, user_text)
         thread = self._thread(agent.id)
         history: list[dict] = []
         for message in thread:
@@ -896,8 +896,18 @@ class AgentChatService:
         return selected
 
     def _system_prompt(self, agent: Agent, project: Any,
-                       tools: list[Any]) -> str:
+                       tools: list[Any], user_text: str = "") -> str:
         context = self._context(agent, project)
+        skills_text = ""
+        registry = getattr(self.app, "skills", None)
+        render = getattr(registry, "render_injection", None)
+        if callable(render) and agent.project_id:
+            try:
+                skills_text = str(render(
+                    project_id=agent.project_id, role=agent.role,
+                    prompt=user_text) or "")
+            except Exception:  # noqa: BLE001 - optional prompt context
+                self.log.debug("skill injection failed", exc_info=True)
         if project is None:
             tool_text = ("你没有绑定项目，因此没有文件/命令工具；"
                          "只回答问题、给出建议，不要声称执行过工作。")
@@ -938,6 +948,8 @@ class AgentChatService:
             "- 如果超出你的角色/工具范围，说明限制并给出最接近的可执行选项。\n"
             + read_only_note,
             tool_text,
+            ("启用的技能（按触发条件注入，遵守其中的步骤与约束）：\n" + skills_text)
+            if skills_text else "",
             "实时上下文（JSON，只包含本次对话需要的摘要）：\n"
             + json.dumps(context, ensure_ascii=False, default=str),
         ))

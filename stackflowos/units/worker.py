@@ -21,6 +21,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from ..agents import Agent, AgentRunner, MockBrain, ToolExecutor
 from ..agents.api import SysAPI
@@ -340,12 +341,62 @@ async def run_worker(args: argparse.Namespace) -> int:
         log.info("worker exit: %s", work_id)
 
 
+def _make_skill_renderer(cfg: Config):
+    """Build a worker-local skill prompt renderer.
+
+    The hub owns the live SkillRegistry, but a worker is a separate process
+    (and may run on a remote machine) so it re-scans the same state directory
+    and skill roots instead of asking the hub on every step.  The scan is
+    cached briefly; enable/disable changes reach the next task.
+    """
+    from ..skills import SkillRegistry
+
+    class _Paths:
+        def __init__(self, state_dir: Path) -> None:
+            self.state_dir = state_dir
+
+    class _SkillApp:
+        def __init__(self, config: Config) -> None:
+            self.config = config
+            self.paths = _Paths(config.paths.state_dir)
+            self.ctx = None
+            self.eventlog = None
+            self.log = get_logger("skills.worker")
+
+    cache: dict[str, Any] = {"registry": None, "at": 0.0}
+
+    def render(project_id: str | None, role: str | None,
+               prompt: str | None) -> str:
+        now = time.monotonic()
+        registry = cache.get("registry")
+        if registry is None or now - float(cache.get("at") or 0.0) > 15.0:
+            registry = SkillRegistry(_SkillApp(cfg))
+            try:
+                registry.scan()
+            except Exception:  # noqa: BLE001 - skills are optional context
+                get_logger("worker").debug("skill scan failed", exc_info=True)
+                registry = None
+            cache["registry"] = registry
+            cache["at"] = now
+        if registry is None:
+            return ""
+        try:
+            return registry.render_injection(
+                project_id=project_id, role=role, prompt=prompt)
+        except Exception:  # noqa: BLE001
+            get_logger("worker").debug("skill render failed", exc_info=True)
+            return ""
+
+    return render
+
+
 def _make_brain(role: str, cfg: Config):
     if cfg.llm.provider != "mock":
         try:
             from ..ai.llm import LLMBrain
             provider = make_provider(cfg.llm)
-            return LLMBrain(provider, role, max_steps=cfg.agents.max_steps)
+            return LLMBrain(provider, role, max_steps=cfg.agents.max_steps,
+                            skill_renderer=_make_skill_renderer(cfg))
         except Exception:
             get_logger("worker").exception("LLM brain unavailable; falling back to mock")
     return MockBrain(role, max_steps=cfg.agents.max_steps)

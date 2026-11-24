@@ -1629,6 +1629,32 @@ class ToolExecutor:
 
     def _http_get(self, url: str, max_bytes: int) -> tuple[int, str, str, bytes]:
         self._validate_url(url)
+        # Default path: resolve once inside the connection and connect to the
+        # validated IP, so a DNS rebinding answer between the pre-flight check
+        # and the socket cannot redirect the request (security.net_pin_dns).
+        if bool(self._cfg("net_pin_dns", True)):
+            from ..util.net import fetch_url
+
+            try:
+                result = fetch_url(
+                    url,
+                    allow_private_network=self._allow_private_network(),
+                    pin_dns=True, timeout=NET_TIMEOUT_S,
+                    max_bytes=max_bytes + 1,
+                    headers=dict(_SAFE_FETCH_HEADERS))
+            except ToolError:
+                raise
+            except Exception as exc:  # InvalidTarget / HTTPError / URL errors
+                text = str(exc)
+                if "Redirection to url" in text:
+                    raise ToolError(
+                        "redirect target must be http/https") from exc
+                if "infinite loop" in text or "too many redirects" in text:
+                    raise ToolError("too many redirects") from exc
+                raise ToolError(
+                    f"fetch failed: {type(exc).__name__}: {exc}") from exc
+            return (int(result.status), str(result.url),
+                    str(result.content_type), bytes(result.body))
         handler = _GuardedRedirectHandler(self._validate_url)
         opener = build_opener(handler)
         # Explicit allowlist: no Cookie/Authorization is ever attached, and no

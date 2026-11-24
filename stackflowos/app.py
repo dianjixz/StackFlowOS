@@ -296,6 +296,11 @@ class App:
         self._start_maintenance_loop()
 
         self.provider = make_provider(cfg.llm)
+        # Token/cost accounting is process-wide: attach the hub's state dir and
+        # event sink so usage survives provider rebuilds and config patches.
+        from .ai.llm import attach_runtime
+
+        attach_runtime(self.provider, self)
         self.chat = ChatService(
             self.ctx, self.eventlog, app=self,
             provider=self.provider,
@@ -423,6 +428,12 @@ class App:
                     await self.supervisor.kill(agent.id, reason="hub_shutdown")
         except Exception:
             self.log.exception("failed to stop agents")
+        close_supervisor = getattr(self.supervisor, "close", None)
+        if callable(close_supervisor):
+            try:
+                await maybe_await(close_supervisor())
+            except Exception:
+                self.log.exception("agent supervisor close failed")
         try:
             await self.failure.stop()
         except Exception:
@@ -1051,7 +1062,9 @@ class App:
             call = getattr(extension, "call_capability", None)
             if call is None:
                 continue
-            result = await maybe_await(call(name, args, project_id, principal))
+            result = await maybe_await(call(
+                name, args, project_id, principal,
+                approval_id=data.get("approval_id")))
             if result is not None:
                 return result
         raise NotFound(f"unknown capability: {name!r}")
@@ -2084,6 +2097,9 @@ class App:
         # Chat sessions hold a provider instance; rebuild it so a model
         # switch takes effect on the next message instead of on hub restart.
         self.provider = new_provider
+        from .ai.llm import attach_runtime
+
+        attach_runtime(new_provider, self)
         if getattr(self, "chat", None) is not None:
             self.chat.provider = new_provider
         if getattr(self, "agent_chat", None) is not None:

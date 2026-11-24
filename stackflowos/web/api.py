@@ -438,7 +438,18 @@ class WebAPI:
             and (project_id is None or unit.get("project_id") == project_id)
             and (status is None or unit.get("status") == status)
         ]
-        return _ok({"units": units})
+        payload: dict[str, Any] = {"units": units}
+        # The unit-control extension keeps hysteresis/dependency state; expose
+        # its summary here so `/api/units` matches the documented contract
+        # while remaining backwards compatible when the extension is absent.
+        controller = getattr(self.app, "unit_control", None)
+        summary = getattr(controller, "summary", None)
+        if callable(summary):
+            try:
+                payload["summary"] = summary()
+            except Exception:  # noqa: BLE001 - summary is advisory
+                self.log.debug("unit summary failed", exc_info=True)
+        return _ok(payload)
 
     async def unit_kill(self, match, query, body):
         return _ok(await self.app.kill_unit(match.group(1)))
