@@ -357,7 +357,7 @@ class Admission:
 
 | 头 | 值 | 目的 |
 |---|---|---|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'` | XSS 兜底 + 禁止被 iframe |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'` | XSS 兜底 + 禁止被 iframe；样式内联是 Astryx 运行时的要求（见 §14.2） |
 | `X-Frame-Options` | `DENY` | 老浏览器点击劫持 |
 | `X-Content-Type-Options` | `nosniff` | MIME 混淆 |
 | `Referrer-Policy` | `no-referrer` | 防止 URL/token 泄漏到外部 |
@@ -366,7 +366,7 @@ class Admission:
 | `Cache-Control` | API/SSE `no-store`；静态 `no-cache` | 不缓存敏感响应 |
 | `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | 最小能力 |
 
-> 前端当前 `index.html` 只有一个 `<script type="module" src="/js/main.js">`，没有 inline script；CSS 外链。上述 CSP 不需要 `unsafe-inline`。若后续加入 inline JSON，必须用 `<script type="application/json">` + 转义 `<`→`\u003c`，不能用字符串拼 `<script>`（DSH 的 `injections.ts` 也做 `\u003c` 转义）。
+> 历史说明：旧控制台（原生 JS）只有一个 module 脚本、没有 inline script。2026-11-24 起控制台改为 React 19 + Astryx，Astryx 运行时注入一段 position-try 样式表并用内联 CSS 变量传尺寸，因此 `style-src` 允许内联；`script-src` 仍为 `'self'`，见 §14.2。若后续加入 inline JSON，必须用 `<script type="application/json">` + 转义 `<`→`\u003c`，不能用字符串拼 `<script>`（DSH 的 `injections.ts` 也做 `\u003c` 转义）。
 
 #### 5.1.6 CLI 与本地控制面（Pi 的“零端口”思路）
 
@@ -1739,3 +1739,13 @@ git diff --check                             # OK
 | 租约作用域/fencing | `l2/leases.py` token/verify/scope；`app._lease_acquire/renew/release` 接线 | `tests/test_dist_leases.py`、`tests/test_leases.py` |
 
 **剩余残余风险**：同 uid 进程边界、Bearer 长期 secret（SFO_WEB_TOKEN）、会话表在内存（hub 重启需重新登录）、Landlock 不覆盖 UDP/信号/`/proc`、bwrap 依赖非特权 user namespace。以上已在 `docs/team/sec.md` §9 与本文 §14 第 5/6 条写明。
+
+### 14.2 控制台改为 Astryx 后的 CSP 调整（2026-11-24）
+
+- 旧值：`style-src 'self'`；新值：`style-src 'self' 'unsafe-inline'`。
+- 原因：设计系统运行时注入一段 anchored-overlay 的 `@position-try` 样式表（`<style>`），
+  并给组件写内联 CSS 变量（尺寸/定位）。严格 `style-src` 会把两者都拦掉，overlay
+  （tooltip / dialog / bottom sheet）会静默错位。
+- 风险边界：内联 CSS 不能执行脚本；`script-src 'self'` 不变，前端所有服务端文本
+  都走 React 文本节点（无 `innerHTML`），XSS 可执行面没有扩大。CSS 注入的残余风险
+  （属性选择器把敏感值带出）前提是页面已有 HTML 注入，而当前没有这种入口。

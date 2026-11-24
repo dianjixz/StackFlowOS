@@ -6,8 +6,7 @@
  * automatically.  That keeps parallel screen work conflict-free.
  */
 
-export const extra = {
-  zh: {
+export const zh: Record<string, string> = {
     /* navigation */
     'nav.workspace': '工作区',
     'nav.platform': '平台',
@@ -78,13 +77,25 @@ export const extra = {
     'login.retry': '我已登录，重试',
     'login.blocked': '未认证',
 
+    'event.thinking': '助手正在思考',
+    'event.tool': '工具',
+    'event.agent_busy': 'Agent 开始回复',
+    'event.agent_idle': 'Agent 回复结束',
+    'event.agent_thinking': 'Agent 正在思考',
+    'event.thread_cleared': '对话已清空',
+    'event.by': '由 {who}',
+    'event.risk': '风险 {risk}',
+    'event.allowed': '已允许',
+    'event.denied': '已拒绝',
+
     /* app routing */
     'route.unknown': '页面不存在',
     'route.unknown_text': '这个地址没有对应的应用。',
     'route.home': '返回对话',
     'app.title': 'StackFlow OS · 操作台',
-  },
-  en: {
+};
+
+export const en: Record<string, string> = {
     /* navigation */
     'nav.workspace': 'Workspace',
     'nav.platform': 'Platform',
@@ -155,10 +166,20 @@ export const extra = {
     'login.retry': 'I have signed in — retry',
     'login.blocked': 'Unauthenticated',
 
+    'event.thinking': 'assistant is thinking',
+    'event.tool': 'tool',
+    'event.agent_busy': 'agent started replying',
+    'event.agent_idle': 'agent finished replying',
+    'event.agent_thinking': 'agent is thinking',
+    'event.thread_cleared': 'conversation cleared',
+    'event.by': 'by {who}',
+    'event.risk': 'risk {risk}',
+    'event.allowed': 'allowed',
+    'event.denied': 'denied',
+
     /* app routing */
     'route.unknown': 'Page not found',
     'route.unknown_text': 'No application lives at this address.',
     'route.home': 'Back to chat',
     'app.title': 'StackFlow OS · Console',
-  },
 };

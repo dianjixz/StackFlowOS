@@ -155,3 +155,21 @@
 - 团队：5 个 teammate 认领 task-1…task-5 并行重写其余屏幕（写作用域互斥：
   `webui/src/screens/<x>/**` + `webui/src/i18n/keys/<x>.ts`），约定不 commit、
   共享层改动先报 lead。
+
+### 15:05–15:35 集成：构建产物替换、门禁重写与截图
+- 五个屏幕（项目 / Agent / 单元+事件 / 审批+自治 / 设置）全部回收；全仓
+  `tsc --noEmit` 通过后执行 `scripts/build_webui.sh`：`stackflowos/webassets`
+  只剩 `index.html + assets/`（含 Figtree 字体、按屏懒加载 chunk），旧
+  `webassets/{css,js}` 删除；hub 静态托管路径与 SPA 回退不变。
+- 集成修复：任务看板空状态组收成一行、进度头两端对齐；`LayerProvider`（toast
+  视口不再告警）；Astryx `InternationalizationProvider` 接入随界面语言切换的
+  zh-CN/en 组件文案；data-URI favicon 消除 404。
+- CSP：`style-src 'self' 'unsafe-inline'`（Astryx 运行时注入 position-try 样式表 +
+  内联 CSS 变量），`script-src` 仍 `'self'`；生产 CSP 头下浏览器复检 0 violation。
+- 测试重写：新增 `tests/_frontend.py`（解析 TS 源码），`test_web_assets.py` 改查
+  构建产物/哈希/无外部资源/API 契约/设计系统约束，`test_front_{i18n,units,
+  session_llm,autonomy}.py` 改查屏幕能力面与字典完整性；全量
+  **1290 passed, 2 skipped, 680 subtests passed**（前端门禁 43 个）。
+- 截图全部更新：`docs/img/{home,projects,project,agents,agent-chat,units,approvals,
+  events,autonomy,settings,mobile,agent-chat-mobile}.png`。
+- 运行注意：live hub 需要重启一次才会下发新的 CSP 头（静态文件已即时生效）。

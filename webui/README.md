@@ -60,5 +60,7 @@ Rules that keep the tree reviewable:
   `Card`, `Section`, `List`, `Table`, `Dialog`, …). No raw `<div>` for layout,
   no hard-coded hex colors or px radii — use theme tokens (`var(--color-*)`,
   `var(--spacing-*)`, `var(--radius-*)`).
-* No inline `style` attributes where a token class will do: the hub serves a
-  strict CSP (`style-src 'self'`).
+* Prefer tokens/classes over inline styles. The hub's CSP allows inline
+  *styles* (`style-src 'self' 'unsafe-inline'`) because the Astryx runtime
+  injects one stylesheet and sets CSS variables for size/position props;
+  scripts stay same-origin only (`script-src 'self'`).

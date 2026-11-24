@@ -168,6 +168,12 @@ class Fixture:
             ),
         ]
         self.units = self._seed_units()
+        for unit in self.units:
+            unit.setdefault("tier", "worker" if unit.get("kind") == "agent" else "service")
+            unit.setdefault("state", unit.get("status"))
+            unit.setdefault("health", {"ok": unit.get("status") == "online",
+                                       "last_latency_ms": 12})
+            unit.setdefault("actions", ["probe", "restart", "disable", "drain"])
         self.agents = self._seed_agents()
         self.tasks = self._seed_tasks()
         self.projects = self._seed_projects()
@@ -1839,8 +1845,18 @@ class Fixture:
                           for item in requires] + [
                     {"from": unit_id, "to": item, "kind": "wants"} for item in wants],
             },
-            "events": copy.deepcopy(self.events[-8:]),
+            "events": self._unit_events(unit_id),
         }
+
+    def _unit_events(self, unit_id: str) -> list[dict]:
+        import json as _json
+        with self.lock:
+            rows = [copy.deepcopy(item) for item in self.events[-120:]
+                    if unit_id in _json.dumps(item, ensure_ascii=False)]
+        if not rows:
+            with self.lock:
+                rows = copy.deepcopy(self.events[-5:])
+        return rows[-10:]
 
     def unit_probe(self, unit_id: str) -> dict:
         detail = self.unit_detail(unit_id)

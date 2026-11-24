@@ -57,34 +57,60 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 
 ## 界面
 
-首屏是**对话框**，旁边是**工作面板**（项目卡片 / 进度环 / 当前任务 / 在岗 Agent / 实时事件）。
-底部 Dock 打开六个"App"：
+控制台是 **React 19 + [Astryx](https://github.com/meta/astryx) 设计系统** 的单页应用
+（源码在 `webui/`，构建产物由 hub 直接托管）。首屏是**对话框**，右侧是**现场面板**
+（项目进度 / 在岗 Agent / 实时事件），左侧导航打开八个屏：
 
-| App | 内容 |
+| 屏幕 | 内容 |
 |---|---|
-| 项目 | 项目列表与创建；**接入已有目录**；项目详情（任务看板、产物、Agent、里程碑）；归档 / 永久删除（输入项目名二次确认） |
-| Agent | 花名册、按角色派工、终止；**点成员进入对话**（角色工具 + 项目现场 + 流式工具卡片） |
-| 单元 | 进程表：work_id、地址、状态、能力、心跳 |
-| 审批 | 待审批队列（风险 / 范围 / 预览 / TTL）、放行规则编辑器、审计 |
-| 自治 | 巡检发现、自主派工记录、代理审批理由；开关 / 模式 / 配额 / 能力白名单 |
-| 事件 | 全量事件流（可过滤、可展开原始 JSON） |
-| 设置 | 常规 / 网络 / AI / 安全 / 存储 / 关于 |
+| 对话 | 系统助手对话（流式回答、工具调用、快捷建议）+ 现场面板；高风险动作仍需人工审批 |
+| 项目 | 项目列表（状态 / 进度 / 任务计数）；创建与**接入已有目录**；详情含任务看板、依赖图、Git 面板、健康检查、归档 / 永久删除（输入项目名二次确认） |
+| Agent | 花名册（按项目分组、角色 / 状态过滤、派工、终止）；点成员进入**该 Agent 的独立对话**（角色工具 + 项目现场 + 流式工具卡片） |
+| 单元 | 按层（system / service / worker）的进程表：状态、能力、运行时、心跳；抽屉里看 descriptor、requires/wants 依赖图、最近事件与探测 / 重启 / 摘除 / 终止 |
+| 审批 | 待审批队列（风险 / 范围 / 预览 / TTL）、放行规则编辑器、已决定审计 |
+| 事件 | 实时事件流：类型 / 项目 / 搜索过滤，暂停跟随，行内展开原始 JSON |
+| 自治 | 巡检发现、自主派工、代理审批理由；开关 / 模式 / 配额 / 能力白名单；一键巡检与急停 |
+| 设置 | 常规 / 安全（会话撤销、轮换、登出）/ AI（用量、预算、路由、JSON 编辑）/ 能力（Skills、Plugins、MCP） |
+
+界面支持中文 / English、浅色 / 深色 / 跟随系统，以及窄屏单列布局；`#agent/<id>`、
+`#/projects/<id>` 等深链保持可用。
+
+### 前端构建
+
+运行时不需要 Node：`python3 -m stackflowos hub` 直接托管
+`stackflowos/webassets` 里的构建产物。只有改界面时才需要 Node（≥ 20）：
+
+```bash
+cd webui && npm install
+npm run dev            # http://127.0.0.1:5180，/api 代理到 scripts/ui_mock.py
+./scripts/build_webui.sh   # tsc 类型检查 + 构建到 stackflowos/webassets
+```
+
+设计系统版本、屏幕/字典/共享层契约见 [`webui/README.md`](webui/README.md)。
 
 ### 截图（真实运行中的 hub）
 
-![对话与工作面板](docs/img/home.png)
+![对话与现场面板](docs/img/home.png)
 
-| 审批口（风险 / 范围 / 预览 / TTL） | 项目详情（任务看板 / 产物 / Agent） |
+| 审批口（风险 / 范围 / 预览 / TTL） | 项目详情（任务 / 依赖 / Git） |
 |---|---|
 | ![审批](docs/img/approvals.png) | ![项目](docs/img/project.png) |
+
+| 单元（分层进程表 + 依赖图） | 自治（巡检 / 派工 / 代理审批） |
+|---|---|
+| ![单元](docs/img/units.png) | ![自治](docs/img/autonomy.png) |
 
 | 手机宽度 | 设置 |
 |---|---|
 | ![移动端](docs/img/mobile.png) | ![设置](docs/img/settings.png) |
 
+| 项目列表 | Agent 花名册 | 事件控制台 |
+|---|---|---|
+| ![项目列表](docs/img/projects.png) | ![Agent 花名册](docs/img/agents.png) | ![事件](docs/img/events.png) |
+
 ### Agent 对话
 
-「Agent」应用里的每一行都是入口：点进去会打开这个 Agent 的独立对话。
+导航里的「Agent」每一行都是入口：点进去是这个 Agent 的独立对话与现场。
 
 - **用它的身份工作**：system prompt 是该角色的职责与工具集，工具在项目 workspace 内执行；
   文件/命令/任务动作仍走同一套能力审批，审批提醒会直接出现在对话上方。
@@ -102,14 +128,13 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 
 ![Agent 对话（手机）](docs/img/agent-chat-mobile.png)
 
-
 ---
 
 ## 架构
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ 对话 + 工作面板（Web / SSE / 原生 JS，无构建步骤）              │
+│ 对话 + 工作面板（Web / SSE / React 19 + Astryx，预构建资源）    │
 ├──────────────────────────────────────────────────────────────┤
 │ L2 sys 单元                                                   │
 │   能力目录  Registry · 租约 Lease · 失败域 Failure             │

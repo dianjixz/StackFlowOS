@@ -1,0 +1,31 @@
+/* Projects screen — only the layout Astryx primitives cannot express.
+   Colours, spacing and radii come from the theme tokens. */
+
+/* The dependency graph keeps its natural drawing size and scrolls sideways
+   on a narrow viewport instead of shrinking its labels into illegibility. */
+.prj-dep-graph-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.prj-dep-graph {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.prj-dep-node {
+  cursor: pointer;
+  outline: none;
+}
+
+.prj-dep-node:focus-visible rect {
+  stroke: var(--color-accent);
+  stroke-width: 2;
+}
+
+/* Node corner radius comes from the theme token (the rx attribute above is the
+   fallback for engines without SVG geometry properties in CSS). */
+.prj-dep-node-box {
+  rx: var(--radius-element);
+}

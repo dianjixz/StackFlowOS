@@ -7,6 +7,10 @@
 
 import { useSyncExternalStore, type ReactNode } from 'react';
 import { Theme } from '@astryxdesign/core/theme';
+import { InternationalizationProvider } from '@astryxdesign/core/i18n';
+import { LayerProvider } from '@astryxdesign/core/Layer';
+import zhCN from '@astryxdesign/core/locales/zh-CN.generated.js';
+import { useLang } from '../i18n';
 import { themes, defaultThemeSlug } from '../astryx-themes';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
@@ -60,13 +64,23 @@ function systemMode(): ResolvedMode {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
-/** Theme provider: wires the Astryx theme and the selected color mode. */
+/**
+ * Theme provider: wires the Astryx theme, the selected color mode and the
+ * component locale (so built-in strings such as "Show more" or a tool-call
+ * status follow the console language instead of staying English).
+ */
 export function AppTheme({ children }: { children: ReactNode }): ReactNode {
   const selected = useThemeMode();
+  const lang = useLang();
   const resolved = selected === 'system' ? systemMode() : selected;
   return (
     <Theme theme={themes[defaultThemeSlug]} mode={resolved}>
-      {children}
+      <InternationalizationProvider
+        locale={lang === 'en' ? 'en' : 'zh-CN'}
+        messages={{ 'zh-CN': zhCN }}
+      >
+        <LayerProvider>{children}</LayerProvider>
+      </InternationalizationProvider>
     </Theme>
   );
 }

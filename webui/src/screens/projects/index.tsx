@@ -1,23 +1,19 @@
 /**
- * Projects screen — placeholder until this wave lands.
+ * Projects screen — the project list (`#/projects`) and one project's board
+ * (`#/projects/:id`), rewritten with the Astryx design system.
  *
- * Contract: default export a component that takes `ScreenProps` ({id, query})
- * and renders inside the AppShell content area.  Keep every string in
- * `src/i18n/keys/projects.ts` (zh + en) and every write action behind
- * `useCanWrite()`.
+ * This folder owns every component, helper and string the screen needs; the
+ * shell only mounts the default export and hands it the route id.
  */
 
 import type { ReactNode } from 'react';
-import { t } from '../../i18n';
-import { Placeholder } from '../../ui/Placeholder';
+import { useT } from '../../i18n';
 import type { ScreenProps } from '../types';
+import { ProjectDetail } from './ProjectDetail';
+import { ProjectList } from './ProjectList';
+import './projects.css';
 
 export default function ProjectsScreen({ id }: ScreenProps): ReactNode {
-  return (
-    <Placeholder
-      title={t('app.projects')}
-      description={t('app.sub.projects')}
-      detail={t('app.projects') + ' · ' + (id || '')}
-    />
-  );
+  useT(); // re-render the screen when the language switches
+  return id ? <ProjectDetail id={id} /> : <ProjectList />;
 }

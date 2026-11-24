@@ -800,7 +800,7 @@ stackflowos/
   session/         chat.py（系统助手对话、流式）                      [lead]
   session/         agent_chat.py（每个 Agent 的对话与工具轮）          [lead]
   web/             server.py api.py            [D/lead]
-  webassets/       index.html css/ js/         [D]
+  webassets/       index.html assets/          [D] 构建产物（hub 直接托管）
   extensions.py    optional subsystem loader (build/start/stop/units/routes)
   capabilities.py  unified capability catalogue
   skills/          SkillRegistry + manifest validation + injection
@@ -811,6 +811,7 @@ stackflowos/
   storage/         JSON/SQLite backends + migration
   transport/       discovery.py (mDNS) / zmq_bridge.py (optional pyzmq)
   deploy/          Dockerfile, systemd user unit, deploy README
+webui/             React 19 + Astryx 控制台源码（Vite，构建到 webassets）
 tests/
 ```
 

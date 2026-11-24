@@ -13,7 +13,7 @@
 
 import { useCallback, useSyncExternalStore } from 'react';
 import dict from './dict.json';
-import { extra } from './extra';
+import { en as extraEn, zh as extraZh } from './extra';
 
 export type Lang = 'zh' | 'en';
 export type Dict = Record<string, string>;
@@ -39,7 +39,7 @@ function merge(base: DictPair, ...layers: DictPair[]): DictPair {
   return { zh, en };
 }
 
-const extraPairs: DictPair[] = [extra as DictPair];
+const extraPairs: DictPair[] = [{ zh: extraZh, en: extraEn }];
 const screenPairs: DictPair[] = Object.values(modules)
   .map((mod) => ({ zh: mod.zh ?? {}, en: mod.en ?? {} }));
 

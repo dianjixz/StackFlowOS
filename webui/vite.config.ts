@@ -11,6 +11,12 @@ export default defineConfig({
     emptyOutDir: true,
     chunkSizeWarningLimit: 1600,
   },
+  preview: {
+    port: 5190,
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:17877', changeOrigin: true, ws: false },
+    },
+  },
   server: {
     port: 5180,
     strictPort: false,
