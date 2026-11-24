@@ -148,3 +148,91 @@
 - 本前端没有新增任何后端依赖；`tests/test_web_assets.py` 的扩展路由扫描已由 Lead 更新，当前 59 个前端相关测试全绿。
 - 本轮无 Python 文件改动、无 git 写操作；工作树中的 `stackflowos/webassets/js/agentchat.js` 早期改动属于 agent-chat/llm 工作流，不在本说明的交付范围内。
 - 建议后续：后端补 `/api/whoami` 或 sessions 的 `current_session_id`；把扩展的 operator 拒绝统一为 403；若需要全站英文，再按第 3 节清单续翻。
+
+
+---
+
+## task-4 — 控制台「自治」应用交接（2026-11-24）
+
+日期：2026-11-24 · 所有者：front · 任务：`task-4`（revision 2 → complete）
+范围：只改 `stackflowos/webassets/**` 与 `tests/test_front_autonomy.py`；未改后端 Python / config / 他人测试；未执行任何 git 写操作。
+
+## 1. 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `stackflowos/webassets/js/autonomy.js` | **新增**（约 700 行）。导出 `mount()/unmount()/isMounted()/render(options)/tick(root)`；渲染顶部状态卡、巡检发现、自主派工、代理审批、策略表单，并实现局部 policy patch 收集与前端围栏提示。 |
+| `stackflowos/webassets/js/apps.js` | `APP_META` 增加 `autonomy`；`renderSheet` 增加 `case 'autonomy'`；`showApp` 在 `name === 'autonomy'` 时 `autonomy.mount()` 且首次 `loadAutonomyStatus()`；`on('event')` 对 `autonomy.*` 做 500ms debounce 刷新；`hideSheet`/离开应用清 `autonomyTimer` 并 `autonomy.unmount()`；新增 `renderAutonomyApp/loadAutonomyStatus/runAutonomyPatrol/saveAutonomyPolicy/scheduleAutonomyReload`；`tickCountdowns` 每秒驱动 `autonomy.tick`；findings 的 task 链接通过 `view.pendingTaskId` 打开项目看板并选中任务。 |
+| `stackflowos/webassets/js/api.js` | 新增 `getAutonomy()`（GET `/api/autonomy/status`）、`runAutonomyPatrol(dryRun=false)`（POST `/api/autonomy/patrol`）、`patchAutonomyPolicy(patch)`（PATCH `/api/autonomy/policy`，body 即 patch）。 |
+| `stackflowos/webassets/index.html` | Dock 在「审批」「事件」之间新增自治按钮（`data-open-app="autonomy"`、`aria-label`、`data-i18n-aria-label="dock.aria.autonomy"`、`data-i18n="dock.autonomy"`）；新增 SVG symbol `#i-autonomy`（24×24、脉冲线 + 圆环、`stroke="currentColor"`）。 |
+| `stackflowos/webassets/js/i18n.js` | zh/en 双字典新增 `app.autonomy`、`app.sub.autonomy`、`dock.autonomy`、`dock.aria.autonomy` 及约 80 个 `autonomy.*` 键（模式、风险、能力、空态、错误、viewer、配额、校验提示、trigger）。 |
+| `stackflowos/webassets/css/os.css` | 追加第 16 节自治样式：hero/指标/计数/列表/能力网格/policy 块/焦点样式；`.pill[data-severity]`、`.pill[data-status=disabled]`；760px/430px 响应式（hero 单列、能力单列、metrics 两列、counts 两列）。 |
+| `tests/test_front_autonomy.py` | **新增**，13 个 unittest 静态用例（模块/端点/注册/首载/事件刷新/i18n 键完整性/无 innerHTML/CSS 响应式/局部 patch/viewer 只读/Dock 顺序与 symbol）。 |
+| `docs/img/autonomy.png` | **新增**截图（临时 hub，见 §4）。 |
+| `docs/team/front.md` | 本文件。 |
+
+## 2. UI 结构（`#autonomy`）
+
+1. **工具栏**：`N 轮巡检 · M 个错误`、刷新按钮（`onRefresh` → GET status）。
+2. **顶部状态卡**（`.autonomy-hero`）
+   - 标题「自治中枢」+ enabled 徽标（`已开启`/`已停用`）+ running 徽标（`巡检中`）；
+   - headline（report.headline，空则「还没有巡检记录」）；
+   - 指标：上次巡检（相对时间 + trigger）、下轮巡检（实时倒计时，`data-autonomy-next`，由 apps 的 1s interval 驱动；disabled 显示「未开启」）、累计巡检；
+   - 计数：critical / warn / info / total（`.autonomy-counts`）；
+   - 右侧：启用开关（PATCH `{enabled}`）、「立即巡一遍」按钮（POST；请求中按钮变「巡检中…」并 disabled；viewer/running 时 disabled 且 title/hint 说明）、只读提示。
+3. **巡检发现**：severity pill（`.pill[data-severity]`）、check、title、dispatchable tag、project/task 链接、agent/unit、时间、detail、`建议：fix`；空态「系统健康 / 本轮巡检没有发现需要处理的问题」。
+4. **自主派工**：action tag（建任务 / 派 Agent）、status pill（成功/跳过/失败）、fingerprint、role/project/task/agent/时间、reason；空态说明开启派工模式后会发生什么；hint 显示当前 mode 与条数。
+5. **代理审批**：decision pill（允许/观察/跳过，`observe` 额外显示「仅建议」tag）、capability、risk pill、principal/request/project/时间、reason；空态说明 observe/enforce 与人类优先。
+6. **自治策略**（`form-card`）：enabled、dispatch_mode（off/tasks/agents）、approve_mode（off/observe/enforce）、approve_risk_max（low/medium/high）；能力多选 `fs.read/fs.list/fs.write/shell.exec/net.fetch/llm.chat/task.manage/agent.spawn/data.read/data.write`；shell/net 额外条件文字提示 + `approve_domains`（逗号分隔）、`approve_shell`、`approve_shell_patterns`（每行一条）；配额 `dispatch_max_agents / dispatch_max_tasks_per_hour / dispatch_max_spawns_per_hour / approve_max_per_hour`；保存按钮。viewer：所有控件 + 保存 disabled，底部提示只读，提交前仍二次检查 `canWrite()`。
+
+复用现有 `app-toolbar/card/form-grid/form-card/field/section-head/app-note/pill/risk-pill/tag/btn/empty-state`；未引入任何 npm 或外部资源。
+
+## 3. 行为 / 安全 / 刷新生命周期
+
+- **首载**：`showApp('autonomy')` → `autonomy.mount()` + `loadAutonomyStatus()`（token 防竞态；失败保留错误并渲染“接口未启用/加载失败”说明，不刷错误 toast 循环，404/405/501 视为未启用）。
+- **刷新**：`on('event')` 中 `current.name === 'autonomy'` 且 `type.startsWith('autonomy.')` → `scheduleAutonomyReload()`（500ms debounce）。表单聚焦时跳过自动刷新，避免吞掉半编辑的策略；手动刷新/保存会重新同步。
+- **关闭**：`hideSheet` 清 `autonomyTimer` + `autonomy.unmount()`；切到其它 app 在 `showApp` 中同样清理。`autonomy.js` 内部不创建任何 timer（`setInterval` 仅由 apps 既有全局 interval 通过 `tick()` 使用），关闭后不再发请求。
+- **安全**：所有动态文本经 `el()`/`textContent`/属性设置，模块内无 `innerHTML/insertAdjacentHTML/outerHTML/document.write`（测试断言）。
+- **局部 patch**：`collectPolicyPatch` 只比较 `[data-autonomy-policy]` 控件与 `status.policy` 对应字段，并单独收集能力复选框；提交体仅含变化字段（数组按内容比较），绝不回传整个 config。前端会先拦截 shell.exec/net.fetch 的非法组合，服务端仍是最终权威。
+- **viewer**：`canWrite()` 来自 session；开关、保存、巡检均不可用；服务端 403 仍会以 toast 呈现（服务端权威）。
+- **task 链接**：findings/派工记录中的 task 号 → 打开所属项目看板并选中/滚动到该任务（`view.pendingTaskId` 一次性消费）；任务不存在时 `loadTasks` 会清空选中。
+
+## 4. 测试与自验
+
+命令与结果：
+
+```
+cd /home/nihao/work/workspace/StackFlowOS
+/tmp/sfo-venv/bin/python -m pytest -q tests/test_front_autonomy.py tests/test_front_i18n.py tests/test_web_assets.py --basetemp=/tmp/pytest-front
+# 29 passed in 0.08s
+```
+
+顺手跑全量前端静态（含既有 units/session_llm）：
+
+```
+/tmp/sfo-venv/bin/python -m pytest -q tests/test_front_*.py tests/test_web_assets.py --basetemp=/tmp/pytest-front
+# 71 passed in 0.10s
+```
+
+其中 `tests/test_front_autonomy.py`：13 passed（模块导出、三端点、APP_META/case/showApp 首载、事件刷新与关闭清 timer、Dock 顺序与 i18n 属性、`i-autonomy` symbol、双字典键（含 t() 静态键全覆盖）、无 HTML 注入、viewer 只读、局部 patch、CSS 响应式）。
+
+运行时自验（未触碰 17800 真实 hub）：
+
+- 临时 hub：`/tmp/sfo-front-state`，端口 `18765`（已停止；`17800` 的状态未被修改）。
+- 用 9230 上 headless Chrome 新建独立 tab，经 `sfo url` 新 token 登录后打开 `#autonomy`：
+  - `document.querySelector('.autonomy-app')` 存在，sheet 标题「自治」，`errors: []`；
+  - 通过 UI 同源 fetch 执行 PATCH `{enabled:true,dispatch_mode:'tasks',approve_mode:'observe'}` + POST patrol → 均 `ok`，页面刷新后 headline「系统正常」、enabled=true、倒计时递减；
+  - 用合成 status 直接 `render()`：4 条记录（2 findings + 1 dispatch + 1 approval）、severity/decision/observe「仅建议」/project+task 链接点击、`collectPolicyPatch` 提交 → 仅 `{"dispatch_mode":"agents"}`；
+  - 390×844 移动端：hero 单列（324px）、能力网格单列、metrics 两列、`scrollWidth === 390` 无横向溢出。
+- 截图：`docs/img/autonomy.png`（1440×1100，临时 hub，enabled + 2 轮巡检数据）。
+
+## 5. 残余风险 / 需 lead 注意
+
+1. **API 契约依赖**：写作时 `stackflowos/autonomy/api.py` 已落地并与本前端一致——GET `/api/autonomy/status` 返回 `status()`；POST `/api/autonomy/patrol` 返回 report；PATCH `/api/autonomy/policy` 的 body 是**局部 patch 本身**，响应 `data` 是完整 status（含 `policy`）。若路径/返回形状变动，需要同步改 `api.js` 与 `apps.js` 的 `saveAutonomyPolicy`（现在以 `'policy' in data` 判断，否则回退重新 GET）。
+2. **`autonomy` 未加入 `main.js` 的 `APP_SHORTCUTS`**：Alt+1..6 仍是原有六个应用；自治通过 Dock 按钮或 `#autonomy` 直达。若希望 Alt+7，需要在 `main.js` 增加一项（本次未改，避免超范围）。
+3. **策略表单额外字段**：为满足后端校验，UI 除契约字段外还提供 `approve_domains/approve_shell/approve_shell_patterns`（都属 autonomy 局部配置，仍只 PATCH 变化字段）。前端校验与后端一致，但以后端为准。
+4. **自动刷新暂停条件**：策略表单或任意 input/select/textarea 聚焦时，`autonomy.*` 事件触发的刷新被跳过；用户手动刷新/保存即可同步。避免编辑中重渲染丢输入，属于有意取舍。
+5. **viewer 身份到达前**：`canWrite()` 在 `/api/sessions` 返回前默认允许（既有全局行为）；此时写请求由服务端 403 拒绝并显示 toast，不会越权。
+6. **倒计时精度**：下轮倒计时由 `next_run_in_s` 在渲染时换算为绝对时间，秒级递减；实际定时以服务端为准，状态事件/手动刷新会校正。
+7. **截图数据**：`docs/img/autonomy.png` 来自临时 state（enabled、1 轮巡检、空发现），不是真实运行数据；`docs/img/` 为新增目录，不影响静态测试。
+8. 未提供 dry-run UI；`api.runAutonomyPatrol(dryRun)` 已支持，如需“演练”按钮可后续加。

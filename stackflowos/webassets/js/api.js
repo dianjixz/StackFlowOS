@@ -169,6 +169,16 @@ export const api = {
   createRule: (rule) => requestJson('/api/rules', { method: 'POST', body: rule }),
   deleteRule: (id) => requestJson(`/api/rules/${enc(id)}`, { method: 'DELETE' }),
 
+  /* ---- autonomy loop ---- */
+  getAutonomy: () => requestJson('/api/autonomy/status'),
+  runAutonomyPatrol: (dryRun = false) =>
+    requestJson('/api/autonomy/patrol', {
+      method: 'POST',
+      body: { dry_run: Boolean(dryRun) },
+    }),
+  patchAutonomyPolicy: (patch) =>
+    requestJson('/api/autonomy/policy', { method: 'PATCH', body: { ...(patch || {}) } }),
+
   /* ---- units & agents ---- */
   getUnits: ({ tier = '', kind = '', state = '', projectId = '', status = '', include = '' } = {}) =>
     requestJson('/api/units' + qs({ tier, kind, state, project_id: projectId, status, include })),

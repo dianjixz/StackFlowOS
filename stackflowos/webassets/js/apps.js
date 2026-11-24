@@ -7,7 +7,8 @@
  */
 
 import * as agentChat from './agentchat.js';
-import { api } from './api.js';
+import * as autonomy from './autonomy.js';
+import { api, isUnsupported } from './api.js';
 import { applyConfig, loadState, on, state } from './store.js';
 import * as units from './units.js';
 import { renderCapabilitiesPane } from './capabilities.js';
@@ -60,6 +61,7 @@ const APP_META = {
   agents: { titleKey: 'app.agents', subKey: 'app.sub.agents', icon: 'agents' },
   units: { titleKey: 'app.units', subKey: 'app.sub.units', icon: 'units' },
   approvals: { titleKey: 'app.approvals', subKey: 'app.sub.approvals', icon: 'approvals' },
+  autonomy: { titleKey: 'app.autonomy', subKey: 'app.sub.autonomy', icon: 'autonomy' },
   events: { titleKey: 'app.events', subKey: 'app.sub.events', icon: 'events' },
   settings: { titleKey: 'app.settings', subKey: 'app.sub.settings', icon: 'settings' },
 };
@@ -98,6 +100,7 @@ let pendingRender = false;
 let pointerDown = false;
 let lastSheetSignature = '';
 let consoleTimer = null;
+let autonomyTimer = null;
 
 const view = {
   projectTasks: [],
@@ -106,6 +109,7 @@ const view = {
   tasksError: '',
   tasksToken: 0,
   selectedTaskId: null,
+  pendingTaskId: null,
   scrollToTask: false,
   agentFilter: 'all',
   rules: [],
@@ -122,6 +126,11 @@ const view = {
   settingsNotice: [],
   settingsReady: false,
   ruleForm: null,
+  autonomyStatus: null,
+  autonomyLoading: false,
+  autonomyError: '',
+  autonomyUnsupported: false,
+  autonomyLoaded: false,
 };
 
 /* ================================================================== */
@@ -187,6 +196,9 @@ export function initApps() {
     if (current.name === 'events') scheduleConsoleReload();
     if (current.name === 'approvals' && String(event.type || '').startsWith('approval.')) {
       scheduleDecisionsReload();
+    }
+    if (current.name === 'autonomy' && String(event.type || '').startsWith('autonomy.')) {
+      scheduleAutonomyReload();
     }
     if (current.name === 'units') units.noteUnitStateEvent(event);
   });
@@ -285,6 +297,11 @@ function hideSheet({ clearHash }) {
   const hadCurrent = Boolean(current);
   current = null;
   pendingRender = false;
+  if (autonomyTimer) {
+    window.clearTimeout(autonomyTimer);
+    autonomyTimer = null;
+  }
+  autonomy.unmount();
   units.closeUnitDrawer();
   exitAgentChatMode();
   if (els.layer) els.layer.hidden = true;
@@ -308,6 +325,15 @@ function showApp(name, projectId = null,
   const wasHidden = els.layer.hidden;
   if (wasHidden) lastFocused = document.activeElement;
   current = { name, projectId: projectId || null, agentId: agentId || null };
+  // The autonomy view owns a debounced reload timer; leaving the app stops it
+  // so a closed sheet never keeps requesting in the background.
+  if (name !== 'autonomy') {
+    if (autonomyTimer) {
+      window.clearTimeout(autonomyTimer);
+      autonomyTimer = null;
+    }
+    autonomy.unmount();
+  }
   els.layer.hidden = false;
   document.body.classList.add('sheet-open');
   setSheetHeader(t(APP_META[name].titleKey), t(APP_META[name].subKey), APP_META[name].icon);
@@ -315,7 +341,15 @@ function showApp(name, projectId = null,
   if (wasHidden) els.sheet.focus({ preventScroll: true });
 
   view.settingsReady = name === 'settings' ? false : view.settingsReady;
-  view.selectedTaskId = null;
+  if (name === 'projects' && projectId && view.pendingTaskId) {
+    // Deep link from the autonomy findings list: select the referenced task
+    // once its project board is open (the pending id is consumed here).
+    view.selectedTaskId = view.pendingTaskId;
+    view.scrollToTask = true;
+    view.pendingTaskId = null;
+  } else {
+    view.selectedTaskId = null;
+  }
   if (name === 'projects' && projectId) {
     if (view.tasksProjectId !== projectId) {
       view.projectTasks = [];
@@ -328,6 +362,10 @@ function showApp(name, projectId = null,
     view.rules = state.rules.slice();
     loadRules();
     loadDecisions();
+  }
+  if (name === 'autonomy') {
+    autonomy.mount();
+    if (!view.autonomyLoaded && !view.autonomyLoading) loadAutonomyStatus();
   }
   if (name === 'events') loadConsole();
   renderSheet({ preserveScroll: false });
@@ -445,6 +483,9 @@ function renderSheet({ preserveScroll = true } = {}) {
       break;
     case 'approvals':
       content = renderApprovalsApp();
+      break;
+    case 'autonomy':
+      content = renderAutonomyApp();
       break;
     case 'events':
       content = renderEventsApp();
@@ -1979,6 +2020,90 @@ function scheduleConsoleReload() {
 }
 
 /* ================================================================== */
+/* autonomy                                                            */
+/* ================================================================== */
+
+function renderAutonomyApp() {
+  return autonomy.render({
+    status: view.autonomyStatus,
+    loading: view.autonomyLoading,
+    error: view.autonomyError,
+    unsupported: view.autonomyUnsupported,
+    handlers: {
+      onRefresh: () => loadAutonomyStatus({ quiet: true }),
+      onPatrol: runAutonomyPatrol,
+      onSave: saveAutonomyPolicy,
+      onOpenProject: (projectId) => openApp('project', projectId),
+      onOpenTask: (projectId, taskId) => {
+        // There is no task deep link; open the project task board with the
+        // matching card selected so the operator lands on the right task.
+        view.pendingTaskId = taskId || null;
+        openApp('project', projectId);
+      },
+    },
+  });
+}
+
+let autonomyToken = 0;
+async function loadAutonomyStatus({ quiet = false } = {}) {
+  const token = ++autonomyToken;
+  const first = !view.autonomyStatus;
+  view.autonomyLoading = true;
+  if (current?.name === 'autonomy' && first) renderSheet();
+  try {
+    const data = await api.getAutonomy();
+    if (token !== autonomyToken) return;
+    view.autonomyStatus = data && typeof data === 'object' ? data : null;
+    view.autonomyError = '';
+    view.autonomyUnsupported = false;
+    view.autonomyLoaded = Boolean(view.autonomyStatus);
+  } catch (error) {
+    if (token !== autonomyToken) return;
+    view.autonomyError = error?.message || String(error);
+    view.autonomyUnsupported = isUnsupported(error);
+    if (!quiet && !view.autonomyUnsupported && current?.name === 'autonomy') toastError(error);
+  } finally {
+    if (token === autonomyToken) {
+      view.autonomyLoading = false;
+      if (current?.name === 'autonomy') renderSheet();
+    }
+  }
+}
+
+async function runAutonomyPatrol() {
+  if (!canWrite()) throw new Error(t('autonomy.viewer_hint'));
+  await api.runAutonomyPatrol(false);
+  await loadAutonomyStatus({ quiet: true });
+}
+
+async function saveAutonomyPolicy(patch) {
+  if (!canWrite()) throw new Error(t('autonomy.viewer_hint'));
+  const data = await api.patchAutonomyPolicy(patch);
+  if (data && typeof data === 'object' && 'policy' in data) {
+    view.autonomyStatus = data;
+  } else {
+    await loadAutonomyStatus({ quiet: true });
+  }
+  view.autonomyError = '';
+  view.autonomyUnsupported = false;
+  view.autonomyLoaded = true;
+  if (current?.name === 'autonomy') renderSheet();
+  return data;
+}
+
+function scheduleAutonomyReload() {
+  window.clearTimeout(autonomyTimer);
+  autonomyTimer = window.setTimeout(() => {
+    autonomyTimer = null;
+    if (!current || current.name !== 'autonomy') return;
+    // Never yank a half-edited policy form from under the operator; the next
+    // manual refresh or the save itself reconciles the stale snapshot.
+    if (isFormFocused()) return;
+    loadAutonomyStatus({ quiet: true }).catch(() => {});
+  }, 500);
+}
+
+/* ================================================================== */
 /* settings                                                            */
 /* ================================================================== */
 
@@ -2444,4 +2569,5 @@ function tickCountdowns() {
     textNode.textContent = expired ? '已过期' : text;
     node.classList.toggle('is-urgent', urgent);
   }
+  if (current?.name === 'autonomy') autonomy.tick(els.body);
 }
