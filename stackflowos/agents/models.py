@@ -7,6 +7,14 @@ field here is safe to serialise into the roster snapshot.
 Status machine (docs/architecture.md §8.1)::
 
     spawning -> idle -> working -> waiting -> done | failed | dead
+
+A spawn request that arrives while ``agents.max_workers`` workers are running
+is parked first::
+
+    queued -> spawning -> idle -> ...
+    queued -> dead            (operator canceled it / project archived)
+
+``queued`` agents own no process and do not count against ``max_workers``.
 """
 
 from __future__ import annotations
@@ -15,7 +23,8 @@ import time
 from dataclasses import asdict, dataclass, field, fields
 
 #: Every legal agent status, in lifecycle order.
-AGENT_STATUSES = ("spawning", "idle", "working", "waiting", "done", "failed", "dead")
+AGENT_STATUSES = ("queued", "spawning", "idle", "working", "waiting",
+                  "done", "failed", "dead")
 
 #: Statuses from which no further work happens.
 TERMINAL_AGENT_STATUSES = ("done", "failed", "dead")

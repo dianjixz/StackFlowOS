@@ -44,6 +44,7 @@ from ..util.net import (
 from ..util.redact import is_secret_key, redact_text
 from .api import call_ok, emit_event, request_permission
 from .roles import get_role
+from .sandbox import wrap_shell_command
 
 #: Per-stream cap for captured shell output; the full text goes to a log file.
 OUTPUT_CAP_BYTES = 20 * 1024
@@ -207,6 +208,9 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
           {"command": "string", "cwd": "string", "timeout_s": "number"}, "high"),
     _spec("net.fetch", "net.fetch", "抓取 http/https 网页",
           {"url": "string", "max_bytes": "integer"}, "medium"),
+    _spec("capability.call", "capability.call",
+          "调用 hub 上注册的能力工具（MCP/插件/外部 provider），最终审批由 hub 侧执行",
+          {"name": "string", "args": "object"}, "medium"),
     _spec("task.update", "task.manage",
           "更新任务（task_id 默认自己的任务；patch 可含 status=todo|doing|review|done|blocked、"
           "title、description、error）",
@@ -1108,6 +1112,18 @@ class ToolExecutor:
             scope = {**base_scope, "url": url}
             return scope, "抓取网页", _truncate(_net_preview(url), limit)
 
+        if name == "capability.call":
+            capability_name = _arg_str(args, "name", required=True)
+            call_args = _arg_dict(args, "args", {})
+            scope = {**base_scope, "name": capability_name}
+            if self.task_id:
+                scope["task_id"] = self.task_id
+            preview = f"调用能力 {capability_name}"
+            if call_args:
+                preview += "\n" + json.dumps(call_args, ensure_ascii=False,
+                                             default=str, sort_keys=True)
+            return scope, "调用能力工具", _truncate(_redact(preview), limit)
+
         if name == "task.update":
             task_id = self._task_id_arg(args)
             patch = _arg_dict(args, "patch")
@@ -1280,6 +1296,7 @@ class ToolExecutor:
             "fs.delete": self._fs_delete,
             "shell.exec": self._shell_exec,
             "net.fetch": self._net_fetch,
+            "capability.call": self._capability_call,
             "task.update": self._task_update,
             "task.artifact": self._task_artifact,
             "task.note": self._task_note,
@@ -1496,15 +1513,36 @@ class ToolExecutor:
         # valid value is clamped to ``security.shell_max_timeout_s``.
         timeout_s = self._resolve_shell_timeout(args)
 
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=str(cwd),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._shell_env(),
-            start_new_session=True,  # setsid: a timeout can kill the whole group
-        )
+        # Optional per-call sandbox (security.sandbox / sandbox_allow_network).
+        # Import-guarded: without the security module the original command runs
+        # and the reason is logged once by ``agents.sandbox``.
+        sandbox = wrap_shell_command(self.config, command, cwd=cwd,
+                                     writable_paths=[self.workspace],
+                                     logger=self.log)
+        sandboxed = str(sandbox.get("status")) == "wrapped"
+        spawn_command: Any = sandbox.get("command") if sandboxed else command
+        spawn_kwargs = {
+            "cwd": str(cwd),
+            "stdin": asyncio.subprocess.DEVNULL,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "env": self._shell_env(),
+            "start_new_session": True,  # setsid: a timeout can kill the group
+        }
+        if sandboxed:
+            # Landlock: the plan carries a preexec_fn that restricts the child
+            # (and bwrap expresses the confinement in argv).
+            if sandbox.get("preexec") is not None:
+                spawn_kwargs["preexec_fn"] = sandbox["preexec"]
+            if sandbox.get("use_exec"):
+                proc = await asyncio.create_subprocess_exec(
+                    *spawn_command, **spawn_kwargs)
+            else:  # pragma: no cover - string wrapper fallback
+                proc = await asyncio.create_subprocess_shell(
+                    spawn_command, **spawn_kwargs)
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                spawn_command, **spawn_kwargs)
         log = self._open_shell_log(command, cwd)
         out_reader = _CappedStream(proc.stdout, log=log, name="stdout",
                                    logger=self.log)
@@ -1562,6 +1600,12 @@ class ToolExecutor:
             "log": (str(log.path)
                     if log is not None and not log.failed else ""),
             "cwd": str(cwd),
+            "sandbox": {
+                "status": str(sandbox.get("status") or "disabled"),
+                "mode": str(sandbox.get("mode") or "off"),
+                "backend": str(sandbox.get("backend") or ""),
+                "notes": list(sandbox.get("notes") or []),
+            },
         }
 
     async def _net_fetch(self, args: dict, scope: dict) -> dict:
@@ -1606,6 +1650,61 @@ class ToolExecutor:
             raise
         except Exception as exc:  # urllib raises many exception types
             raise ToolError(f"fetch failed: {type(exc).__name__}: {exc}") from exc
+
+    async def _capability_call(self, args: dict, scope: dict) -> dict:
+        """Call a hub-registered capability tool through ``capability.call``.
+
+        The hub (units workstream) owns the capability catalogue, the MCP/plugin
+        bridge and the final approval; this tool is only the worker-side
+        transport.  Until that RPC action exists the call fails with a clear
+        ``capability.call is unavailable`` error instead of crashing the worker.
+        """
+        name = _arg_str(args, "name", required=True)
+        call_args = _arg_dict(args, "args", {})
+        try:
+            encoded = json.dumps(call_args, ensure_ascii=False, default=str)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ToolError(f"capability args are not JSON-serialisable: {exc}")
+        if len(encoded.encode("utf-8")) > 256 * 1024:
+            raise ToolError("capability args are too large (max 256 KiB)")
+        payload: dict[str, Any] = {"name": name, "args": call_args}
+        if self.project_id:
+            payload["project_id"] = self.project_id
+        if self.task_id:
+            payload["task_id"] = self.task_id
+        try:
+            result = await call_ok(self.sys, "capability.call", payload)
+        except Denied as exc:
+            raise ToolError(f"DENIED: {exc.message}") from exc
+        except SfoError as exc:
+            code = str(getattr(exc, "code", "") or "ERROR")
+            message = str(getattr(exc, "message", "") or exc)
+            if code in ("DENIED", "UNAUTHORIZED", "FORBIDDEN",
+                        "PERMISSION_DENIED"):
+                raise ToolError(f"DENIED: {code}: {message}") from exc
+            if code in ("NOT_FOUND", "NOT_IMPLEMENTED", "BAD_REQUEST",
+                        "UNAVAILABLE"):
+                raise ToolError(
+                    f"capability.call is unavailable on this hub: {message}"
+                ) from exc
+            raise ToolError(f"capability.call failed: {code}: {message}") from exc
+        except Exception as exc:  # missing RPC action / transport failure
+            raise ToolError(
+                "capability.call is unavailable on this hub "
+                f"({type(exc).__name__}: {exc})") from exc
+        if not isinstance(result, dict):
+            result = {"value": result}
+        # The hub's mandatory approval gate returns a *result* with
+        # executed=false (status pending/denied/expired) instead of raising.
+        # Fail closed so the brain never mistakes "not executed" for success.
+        status = str(result.get("status") or "").lower()
+        if result.get("executed") is False or status in (
+                "denied", "pending", "expired", "canceled", "cancelled"):
+            reason = str(result.get("reason") or status or "not executed")
+            raise ToolError(f"DENIED: capability {name!r}: {reason}")
+        payload_out = dict(result)
+        payload_out.setdefault("name", name)
+        return payload_out
 
     # -- sys-bound tools --------------------------------------------------
     async def _task_update(self, args: dict, scope: dict) -> dict:

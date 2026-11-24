@@ -13,6 +13,7 @@ failed and blocks the task, but never crashes the worker.  It also exposes
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from .api import call_ok, emit_event
 from .brain import Action, AgentView, Brain
 from .models import Agent, now_ms
 from .tools import TOOLS, ToolExecutor, ToolResult, tools_for
+from .workspace_git import GitError, WorkspaceGit
 
 #: Loop guards: give up instead of burning steps on a hopeless agent.
 MAX_FAIL_STREAK = 6
@@ -32,6 +34,10 @@ MAX_REPEAT_DENIED = 2
 
 #: Terminal run statuses returned to the worker glue.
 TERMINAL_RUN_STATUSES = ("done", "failed", "blocked", "killed", "paused")
+
+
+class TaskDeadlineExceeded(Exception):
+    """Raised inside the loop when ``agents.task_timeout_s`` is exhausted."""
 
 
 @dataclass
@@ -109,6 +115,15 @@ class AgentRunner:
         self._fail_streak = 0
         self._repeat_key: tuple | None = None
         self._repeat_count = 0
+        # -- limits / deadline (re-read live from ``agents`` config) --------
+        self._tool_calls = 0
+        self._deadline_at: float | None = None
+        self._started_at: float | None = None
+        self._timeout_s = 0.0
+        # -- per-task git branch isolation (attached-rw workspaces) --------
+        self._git: WorkspaceGit | None = None
+        self._git_branch = ""
+        self._git_started = False
 
     # -- control flags (unit.pause / unit.kill) --------------------------
     def pause(self) -> None:
@@ -137,12 +152,20 @@ class AgentRunner:
 
     # -- main loop --------------------------------------------------------
     async def run(self) -> RunResult:
-        """Run the brain/tool loop and return a final :class:`RunResult`."""
+        """Run the brain/tool loop and return a final :class:`RunResult`.
+
+        Every task is bounded twice: ``agents.task_timeout_s`` (wall clock, via
+        ``asyncio.wait_for`` around each brain/tool await) and
+        ``agents.max_tool_calls_per_task`` (runaway-loop protection).  Both
+        limits are re-read live so a pushed config change applies mid-task.
+        """
         try:
             claim_result = await self._claim()
             if claim_result is not None:
                 return claim_result
+            self._begin_deadline()
             await self._mark_working()
+            await self._git_begin()
             while True:
                 if self._killed:
                     return await self._finish("收到 kill 请求，停止工作。", "killed",
@@ -150,12 +173,14 @@ class AgentRunner:
                 if self._paused:
                     return await self._finish("收到 pause 请求，暂停工作。", "paused",
                                               self._steps)
-                if self._steps >= self.max_steps:
+                if self._expired():
+                    return await self._finish_timeout()
+                if self._steps >= self._max_steps():
                     return await self._finish(
-                        f"达到最大步数 max_steps={self.max_steps}，停止。",
+                        f"达到最大步数 max_steps={self._max_steps()}，停止。",
                         "failed", self._steps)
                 view = await self._view()
-                action = await self.brain.next_action(view)
+                action = await self._await_bounded(self.brain.next_action(view))
                 if action is None:
                     return await self._finish("大脑返回空动作。", "failed", self._steps)
                 if action.finish is not None:
@@ -168,8 +193,11 @@ class AgentRunner:
                 if not action.tool:
                     return await self._finish("大脑未给出工具调用或结束动作。",
                                               "failed", self._steps)
-                result = await self._execute(action)
+                if self._tool_limit_reached():
+                    return await self._finish_tool_limit(action)
+                result = await self._await_bounded(self._execute(action))
                 self._steps += 1
+                self._tool_calls += 1
                 self._bump_stats(result)
                 # The LLM needs the *content* of fs.read/shell output, not
                 # just a one-line event summary, otherwise it re-reads files
@@ -204,6 +232,8 @@ class AgentRunner:
                         "step": self._steps,
                         "say": action.say,
                     })
+        except TaskDeadlineExceeded:
+            return await self._finish_timeout()
         except Exception as exc:  # noqa: BLE001 - worker must never crash
             self.log.exception("agent %s crashed", getattr(self.agent, "id", "?"))
             summary = f"agent 运行失败：{type(exc).__name__}: {exc}"
@@ -212,6 +242,175 @@ class AgentRunner:
             except Exception:  # pragma: no cover - sys unreachable
                 self.log.exception("cannot report failure for %s", self.agent.id)
                 return RunResult(summary, "failed", self._steps)
+
+    # -- limits / deadline -------------------------------------------------
+    def _max_steps(self) -> int:
+        value = getattr(self.config, "max_steps", self.max_steps)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return max(1, int(self.max_steps))
+
+    def _task_timeout_s(self) -> float:
+        try:
+            return max(0.0, float(getattr(self.config, "task_timeout_s", 0) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _max_tool_calls(self) -> int:
+        try:
+            return int(getattr(self.config, "max_tool_calls_per_task", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _tool_limit_reached(self) -> bool:
+        limit = self._max_tool_calls()
+        return limit > 0 and self._tool_calls >= limit
+
+    def reload_limits(self) -> dict:
+        """Re-read limits after a live config push (safe mid-task)."""
+        self.max_steps = self._max_steps()
+        timeout = self._task_timeout_s()
+        if self._timeout_s > 0 or self._deadline_at is not None:
+            self._timeout_s = timeout
+            if timeout > 0 and self._started_at is not None:
+                self._deadline_at = self._started_at + timeout
+            else:
+                self._deadline_at = None
+        return {"max_steps": self._max_steps(),
+                "task_timeout_s": self._task_timeout_s(),
+                "max_tool_calls_per_task": self._max_tool_calls()}
+
+    def _begin_deadline(self) -> None:
+        self._timeout_s = self._task_timeout_s()
+        try:
+            self._started_at = asyncio.get_running_loop().time()
+        except RuntimeError:  # pragma: no cover - sync test helper
+            self._started_at = 0.0
+        self._deadline_at = (self._started_at + self._timeout_s
+                             if self._timeout_s > 0 else None)
+
+    def _remaining(self) -> float | None:
+        if self._deadline_at is None:
+            return None
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:  # pragma: no cover - sync test helper
+            return self._deadline_at
+        return self._deadline_at - now
+
+    def _expired(self) -> bool:
+        remaining = self._remaining()
+        return remaining is not None and remaining <= 0
+
+    async def _await_bounded(self, awaitable: Any) -> Any:
+        """Await one step with the remaining task budget as the timeout."""
+        remaining = self._remaining()
+        if remaining is None:
+            return await awaitable
+        if remaining <= 0:
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise TaskDeadlineExceeded()
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            if self._expired():
+                raise TaskDeadlineExceeded() from exc
+            raise
+
+    async def _finish_timeout(self) -> RunResult:
+        timeout = self._timeout_s or self._task_timeout_s()
+        summary = (f"任务超时：超过 agents.task_timeout_s={timeout:g}s，"
+                   f"停止并由 hub 回收。")
+        self.log.warning("agent %s timed out after %ss", self.agent.id, timeout)
+        return await self._finish(
+            summary, "blocked", self._steps,
+            extra={"timeout": True, "task_timeout_s": timeout,
+                   "tool_calls": self._tool_calls})
+
+    async def _finish_tool_limit(self, action: Action) -> RunResult:
+        limit = self._max_tool_calls()
+        summary = (f"工具调用次数达到上限 agents.max_tool_calls_per_task="
+                   f"{limit}，停止（最后一次尝试：{action.tool}）。")
+        self.log.warning("agent %s hit the tool-call limit (%s)",
+                         self.agent.id, limit)
+        return await self._finish(
+            summary, "blocked", self._steps,
+            extra={"limit": "max_tool_calls_per_task",
+                   "max_tool_calls_per_task": limit,
+                   "tool_calls": self._tool_calls})
+
+    # -- git isolation (attached-rw only) ---------------------------------
+    def _security_config(self) -> Any:
+        return getattr(self.executor, "config", None)
+
+    async def _git_begin(self) -> None:
+        """Put an attached-rw workspace on a per-task branch (best effort)."""
+        security = self._security_config()
+        if not bool(getattr(security, "workspace_git", False)):
+            return
+        if not self.agent.task_id or not self.agent.project_id:
+            return
+        try:
+            project = _as_dict(await call_ok(
+                self.sys, "project.get",
+                {"project_id": self.agent.project_id}), "project")
+        except SfoError:
+            return
+        if str(project.get("workspace_mode") or "") != "attached-rw":
+            return
+        workspace = Path(str(project.get("workspace") or self.workspace))
+        if not workspace.is_dir():
+            return
+        try:
+            git = WorkspaceGit(workspace, logger=self.log)
+            git.ensure_repo()
+            info = git.task_branch(self.agent.project_id, self.agent.task_id)
+        except GitError as exc:
+            self.log.warning("workspace git unavailable for %s: %s",
+                             self.agent.project_id, exc)
+            return
+        except Exception:  # pragma: no cover - git must never kill a task
+            self.log.exception("workspace git setup failed for %s",
+                               self.agent.project_id)
+            return
+        self._git = git
+        self._git_branch = str(info.get("branch") or "")
+        self._git_started = True
+        await self._emit("agent.working", {
+            "agent_id": self.agent.id,
+            "role": self.agent.role,
+            "task_id": self.agent.task_id,
+            "git_branch": self._git_branch,
+        })
+
+    async def _git_end(self, status: str) -> dict:
+        """Commit the task branch (when enabled) and report its state."""
+        git = self._git
+        if git is None:
+            return {}
+        self._git = None
+        result: dict = {"branch": self._git_branch or ""}
+        security = self._security_config()
+        commit = bool(getattr(security, "workspace_git_commit", True))
+        try:
+            if commit:
+                result.update(git.commit_task(
+                    self.agent.task_id, status=status,
+                    message=(f"sfo: {self.agent.task_id or self.agent.id} "
+                             f"({status})")))
+            else:
+                result.update(git.diff_summary())
+        except GitError as exc:
+            self.log.warning("task commit failed for %s: %s",
+                             self.agent.task_id, exc)
+            result["error"] = str(exc)
+        except Exception:  # pragma: no cover - git must never kill a task
+            self.log.exception("task commit crashed for %s",
+                               self.agent.task_id)
+        result.setdefault("branch", self._git_branch)
+        return result
 
     # -- tool execution helpers --------------------------------------------
     async def _execute(self, action: Action) -> ToolResult:
@@ -370,8 +569,13 @@ class AgentRunner:
         self._events = self._events[-40:]
 
     # -- finish / abort ---------------------------------------------------
-    async def _finish(self, summary: str, status: str, steps: int) -> RunResult:
+    async def _finish(self, summary: str, status: str, steps: int, *,
+                      extra: dict | None = None) -> RunResult:
         """Record the outcome on the task, the agent roster and the event log."""
+        git_info = await self._git_end(status) if status != "paused" else {}
+        payload_extra = dict(extra or {})
+        if git_info:
+            payload_extra.setdefault("git", git_info)
         await self._note_task(summary)
         if self.agent.task_id:
             if status == "done":
@@ -411,14 +615,16 @@ class AgentRunner:
         event_type = {"done": "agent.finished", "failed": "agent.failed",
                       "blocked": "agent.failed", "killed": "agent.terminated"}.get(
             status, "agent.finished")
-        await self._emit(event_type, {
+        payload = {
             "agent_id": self.agent.id,
             "role": self.agent.role,
             "project_id": self.agent.project_id,
             "task_id": self.agent.task_id,
             "summary": summary,
             "status": agent_state,
-        })
+        }
+        payload.update(payload_extra)
+        await self._emit(event_type, payload)
         return RunResult(summary, status, steps)
 
     async def _abort(self, summary: str, status: str) -> RunResult:

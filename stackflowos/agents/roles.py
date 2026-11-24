@@ -71,7 +71,7 @@ _TESTER_PROMPT = """你是测试工人（Tester），随任务生灭。
 _REVIEWER_PROMPT = """你是评审人（Reviewer），随任务生灭。
 职责：检查任务产物是否存在、是否匹配任务要求，在 review/<task-id>-review.md 写出评审意见；满足验收条件时把任务置为 done，否则打回 todo 并说明缺什么。
 边界：
-- 只读代码与产物，不修改实现，不跑危险命令。
+- 只读代码与产物，不修改实现，不跑危险命令；唯一允许的写入是项目 workspace 内的 review 记录（review/<task-id>-review.md）。
 - 结论必须有证据（文件路径、命令结果）；不确定时打回而不是放行。
 - 完成后调用 finish，summary 写评审结论。"""
 
@@ -110,7 +110,7 @@ ROLES: dict[str, RoleDef] = {
             "task.note", "agent.spawn", "agent.kill", "agent.list",
             "project.get", "project.update", "project.archive",
             "event.query", "memory.get", "memory.set", "unit.list",
-            "fs.read", "fs.list", "wait",
+            "fs.read", "fs.list", "wait", "capability.call",
         ),
         system_prompt=_LEAD_PROMPT,
         ephemeral=False,
@@ -125,6 +125,7 @@ ROLES: dict[str, RoleDef] = {
         tools=(
             "fs.read", "fs.list", "fs.write", "task.update", "task.artifact",
             "task.note", "task.list", "event.query", "memory.get",
+            "capability.call",
         ),
         system_prompt=_ARCHITECT_PROMPT,
     ),
@@ -136,6 +137,7 @@ ROLES: dict[str, RoleDef] = {
         tools=(
             "fs.read", "fs.list", "fs.write", "shell.exec", "task.update",
             "task.artifact", "task.note", "task.list", "event.query",
+            "capability.call",
         ),
         system_prompt=_CODER_PROMPT,
     ),
@@ -146,7 +148,7 @@ ROLES: dict[str, RoleDef] = {
         color="#f7a35c",
         tools=(
             "shell.exec", "fs.read", "fs.list", "fs.write", "task.update",
-            "task.artifact", "task.note", "event.query",
+            "task.artifact", "task.note", "event.query", "capability.call",
         ),
         system_prompt=_TESTER_PROMPT,
     ),
@@ -156,8 +158,9 @@ ROLES: dict[str, RoleDef] = {
         description="审查产物，通过（done）或打回（todo）",
         color="#bb9af7",
         tools=(
-            "fs.read", "fs.list", "task.update", "task.artifact",
+            "fs.read", "fs.list", "fs.write", "task.update", "task.artifact",
             "task.note", "task.list", "event.query", "memory.get",
+            "capability.call",
         ),
         system_prompt=_REVIEWER_PROMPT,
     ),
@@ -168,7 +171,7 @@ ROLES: dict[str, RoleDef] = {
         color="#56c8d8",
         tools=(
             "net.fetch", "fs.read", "fs.list", "fs.write", "task.update",
-            "task.artifact", "task.note", "event.query",
+            "task.artifact", "task.note", "event.query", "capability.call",
         ),
         system_prompt=_RESEARCHER_PROMPT,
     ),

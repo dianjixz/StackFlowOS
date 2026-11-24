@@ -203,15 +203,23 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.procs[0].terminated)
         self.assertIn("agent.failed", self.eventlog.types())
 
-    async def test_spawn_rejects_unknown_role_and_capacity(self) -> None:
+    async def test_spawn_rejects_unknown_role_and_queues_at_capacity(self) -> None:
         with self.assertRaises(BadRequest):
             await self.sup.spawn("wizard", "p-1")
         self.assertEqual(self.allocator.ids, [])
 
-        sup = self._make(config=AgentsCfg(max_workers=1))
-        await sup.spawn("coder", "p-1")
+        sup = self._make(config=AgentsCfg(max_workers=1, queue_max=1))
+        running = await sup.spawn("coder", "p-1")
+        self.assertEqual(running.status, "idle")
+        # Capacity is no longer an error: the request waits in the queue.
+        queued = await sup.spawn("tester", "p-1", task_id="t-2")
+        self.assertEqual(queued.status, "queued")
+        self.assertIsNone(queued.unit_id)
+        self.assertEqual(sup.queue_snapshot()["count"], 1)
+        # ... but agents.queue_max still bounds the waiters.
         with self.assertRaises(Conflict):
-            await sup.spawn("tester", "p-1")
+            await sup.spawn("reviewer", "p-1")
+        await sup.close()
 
     # -- protocol v2 tokens (H3) -----------------------------------------
     async def test_spawn_passes_unit_token_only_through_env(self) -> None:

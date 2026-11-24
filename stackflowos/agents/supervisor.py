@@ -25,11 +25,19 @@ from typing import Any, Awaitable, Callable
 from ..errors import BadRequest, Conflict, NotFound, Unavailable
 from ..util.jsonio import read_json, write_json
 from ..util.logging import get_logger
+from .hotreload import public_runtime_config
 from .models import (AGENT_STATUSES, TERMINAL_AGENT_STATUSES, Agent,
                      display_name_for, now_ms)
+from .queue import (DispatchQueue, QueueEntry, QueueFull, compute_priority,
+                    clamp_priority)
 from .roles import get_role
 
 ControlFn = Callable[[str, str, dict], Awaitable[Any]]
+
+#: Statuses that own an OS process (queued agents do not count against
+#: ``agents.max_workers`` and are not signalled on shutdown).
+RUNNING_AGENT_STATUSES = ("spawning", "idle", "working", "waiting")
+QUEUED_AGENT_STATUS = "queued"
 
 # S3: bounded TERM→KILL escalation.  Tests shorten these through the
 # constructor instead of sleeping for real seconds.
@@ -144,10 +152,28 @@ class AgentSupervisor:
         self.eventlog = eventlog
         self.config = getattr(config, "agents", config)
         self.max_workers = int(getattr(self.config, "max_workers", 6))
+        self.queue_max = max(1, int(getattr(self.config, "queue_max", 64)))
+        self.task_timeout_s = float(getattr(self.config, "task_timeout_s", 1800.0))
+        self.max_tool_calls_per_task = int(
+            getattr(self.config, "max_tool_calls_per_task", 200))
+        self.config_reload_s = float(getattr(self.config, "config_reload_s", 10.0))
         self.sys_rpc = str(sys_rpc)
         self.state_dir = Path(state_dir)
         self.root = Path(root)
         self.spawn_timeout_s = float(spawn_timeout_s)
+        #: Priority dispatch queue (agents.max_workers reached -> park here).
+        self.queue = DispatchQueue(max_size=self.queue_max)
+        #: Optional callbacks wired by the agents extension (build(app)):
+        #: ``task_lookup(task_id)`` returns a Task/dict for deps + priority,
+        #: ``task_requeue(task_id)`` moves a stuck ``doing`` task back to todo.
+        self.task_lookup: Callable[[str], Any] | None = None
+        self.task_requeue: Callable[[str], Any] | None = None
+        #: Last non-secret payload pushed to workers by :meth:`on_config`.
+        self.last_pushed_config: dict = {}
+        self._drain_task: asyncio.Task | None = None
+        self._monitor_task: asyncio.Task | None = None
+        self._starting: set[str] = set()
+        self._closing = False
         # S3: how long a terminating worker gets between SIGTERM and SIGKILL,
         # and between SIGKILL and giving up on the pid.
         self.terminate_grace_s = (_TERM_GRACE_S if terminate_grace_s is None
@@ -247,26 +273,193 @@ class AgentSupervisor:
     # spawn
     # ------------------------------------------------------------------
     async def spawn(self, role: str, project_id: str | None = None, *,
-                    task_id: str | None = None, reason: str = "") -> Agent:
-        """Allocate a unit, start a worker process and wait until online."""
-        get_role(role)  # validate role before allocating anything
-        active = [agent for agent in self._agents.values()
-                  if agent.status not in TERMINAL_AGENT_STATUSES]
-        if len(active) >= self.max_workers:
-            raise Conflict(
-                f"agent capacity reached: {len(active)}/{self.max_workers}",
-                detail={"max_workers": self.max_workers})
+                    task_id: str | None = None, reason: str = "",
+                    priority: int | None = None) -> Agent:
+        """Spawn a worker -- or park the request when capacity is exhausted.
 
+        Compatibility: the old signature ``spawn(role, project_id,
+        task_id=..., reason=...)`` still works.  The new ``priority`` keyword
+        overrides the derived value (task priority + role weight).
+
+        At ``agents.max_workers`` running workers the request is queued (status
+        ``queued``) instead of raising; :meth:`drain_queue` starts it when a
+        slot frees, and ``agents.queue_max`` bounds the waiters.
+        """
+        get_role(role)  # validate role before allocating anything
+        task = self._ready_task(task_id)
+        chosen = compute_priority(role, task, priority)
+        if self._running_count() >= self.max_workers:
+            return self._enqueue(role, project_id, task_id, reason,
+                                 priority=chosen)
         work_id = str(self.allocator.new_work_id(role))
+        agent = self.register(role=role, project_id=project_id,
+                              unit_id=work_id, task_id=task_id)
+        agent.stats["priority"] = chosen
+        await self._allocate_and_launch(agent, role=role,
+                                        project_id=project_id,
+                                        task_id=task_id, reason=reason,
+                                        work_id=work_id, priority=chosen)
+        return agent
+
+    # -- priority queue ---------------------------------------------------
+    def _running_count(self) -> int:
+        return sum(1 for agent in self._agents.values()
+                   if agent.status in RUNNING_AGENT_STATUSES)
+
+    def _ready_task(self, task_id: str | None) -> Any:
+        """Look up the task and enforce dependency ordering (S2 contract).
+
+        Only wired when the agents extension installs ``task_lookup`` (the real
+        hub); bare unit tests keep the old permissive behaviour.  A task whose
+        ``deps`` are not all ``done`` is refused with :class:`Conflict` so a
+        lead cannot dispatch downstream work early.
+        """
+        lookup = self.task_lookup
+        if lookup is None or not task_id:
+            return None
+        task = lookup(task_id)
+        if task is None:
+            return None
+        deps = _unit_field(task, "deps") or []
+        pending: list[dict] = []
+        for dep_id in deps:
+            try:
+                dep = lookup(str(dep_id))
+            except Exception:  # a dangling dep must fail closed (not dispatch)
+                dep = None
+            status = _unit_field(dep, "status")
+            if status != "done":
+                pending.append({"task_id": str(dep_id), "status": status or "missing"})
+        if pending:
+            raise Conflict(
+                f"task {task_id} is blocked by unfinished dependencies",
+                detail={"task_id": str(task_id), "blocked_by": pending})
+        return task
+
+    def _enqueue(self, role: str, project_id: str | None,
+                 task_id: str | None, reason: str, *, priority: int) -> Agent:
+        """Park one spawn request; raise :class:`Conflict` when full."""
+        if len(self.queue) >= self.queue.max_size:
+            raise Conflict(
+                f"agent queue is full: {len(self.queue)}/{self.queue.max_size}",
+                detail={"queue_max": self.queue.max_size})
+        agent = self.register(role=role, project_id=project_id, unit_id="",
+                              task_id=task_id, status=QUEUED_AGENT_STATUS)
+        agent.stats["priority"] = clamp_priority(priority)
+        agent.summary = f"queued (priority {agent.stats['priority']})"
+        agent.touch()
+        try:
+            entry = self.queue.put(QueueEntry(
+                agent_id=agent.id, role=role, project_id=project_id,
+                task_id=task_id, priority=int(agent.stats["priority"]),
+                reason=reason))
+        except QueueFull as exc:
+            # Roll the roster back so a refused request leaves no ghost agent.
+            self._agents.pop(agent.id, None)
+            raise Conflict(
+                f"agent queue is full: {len(self.queue)}/{self.queue.max_size}",
+                detail={"queue_max": self.queue.max_size}) from exc
+        self.save()
+        self._emit("agent.queued", {
+            "queue_id": entry.id,
+            "agent_id": agent.id,
+            "role": role,
+            "project_id": project_id,
+            "task_id": task_id,
+            "priority": entry.priority,
+            "position": len(self.queue),
+            "reason": reason,
+        })
+        return agent
+
+    def _schedule_drain(self) -> None:
+        """Start a background drain when a slot may have opened up."""
+        if self._closing or not self.queue:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - sync test call
+            return
+        if self._drain_task is not None and not self._drain_task.done():
+            return
+        self._drain_task = loop.create_task(self._drain_safe())
+        self._drain_task.add_done_callback(self._drain_done)
+
+    def _drain_done(self, task: asyncio.Task) -> None:
+        if self._drain_task is task:
+            self._drain_task = None
+        if not task.cancelled() and task.exception() is not None:
+            self.log.warning("queue drain failed: %s", task.exception())
+
+    async def _drain_safe(self) -> None:
+        try:
+            await self.drain_queue()
+        except Exception:  # pragma: no cover - drain must never kill the hub
+            self.log.exception("queue drain crashed")
+
+    async def drain_queue(self) -> list[Agent]:
+        """Start as many queued spawns as free slots allow (FIFO by priority)."""
+        started: list[Agent] = []
+        guard = 0
+        while self.queue and self._running_count() < self.max_workers:
+            entry = self.queue.pop()
+            if entry is None:  # pragma: no cover - len() checked above
+                break
+            guard += 1
+            if guard > self.queue.max_size + 1:  # pragma: no cover - defensive
+                break
+            agent = self._agents.get(entry.agent_id)
+            if agent is None or agent.status != QUEUED_AGENT_STATUS:
+                continue
+            self._emit("agent.dequeued", {
+                "queue_id": entry.id,
+                "agent_id": agent.id,
+                "role": entry.role,
+                "project_id": entry.project_id,
+                "task_id": entry.task_id,
+                "priority": entry.priority,
+                "reason": entry.reason,
+            })
+            self._starting.add(agent.id)
+            try:
+                await self._allocate_and_launch(
+                    agent, role=entry.role, project_id=entry.project_id,
+                    task_id=entry.task_id, reason=entry.reason,
+                    priority=entry.priority)
+            except Exception as exc:  # keep draining the rest
+                self.log.warning("queued spawn %s failed: %s", agent.id, exc)
+                agent.status = "failed"
+                agent.error = f"dequeue failed: {exc}"
+                agent.touch()
+                self.save()
+                self._emit("agent.failed", {
+                    "agent_id": agent.id, "role": entry.role,
+                    "project_id": entry.project_id,
+                    "task_id": entry.task_id,
+                    "summary": agent.error,
+                })
+            else:
+                started.append(agent)
+            finally:
+                self._starting.discard(agent.id)
+        self.save()
+        return started
+
+    async def _allocate_and_launch(self, agent: Agent, *, role: str,
+                                   project_id: str | None,
+                                   task_id: str | None, reason: str,
+                                   work_id: str | None = None,
+                                   priority: int = 50) -> Agent:
+        """Allocate a unit, launch its worker and report it online."""
+        work_id = str(work_id or self.allocator.new_work_id(role))
+        agent.unit_id = work_id
+        agent.stats["priority"] = int(priority)
         try:
             addresses = await _maybe_await(self.allocator.allocate(work_id))
         except Exception as exc:
             raise Unavailable(
                 f"cannot allocate unit {work_id}: {exc}") from exc
         self._addresses[work_id] = addresses
-
-        agent = self.register(role=role, project_id=project_id,
-                              unit_id=work_id, task_id=task_id)
         try:
             token = await self._issue_token(work_id, project_id, role,
                                             agent.id, task_id)
@@ -283,8 +476,7 @@ class AgentSupervisor:
                 "summary": agent.error,
             })
             raise
-
-        if agent.status == "spawning":
+        if agent.status in ("spawning", QUEUED_AGENT_STATUS):
             agent.status = "idle"
         agent.error = None
         agent.touch()
@@ -298,9 +490,69 @@ class AgentSupervisor:
             "display_name": agent.display_name,
             "model": agent.model,
             "reason": reason,
+            "priority": int(priority),
         })
         self.save()
+        self._ensure_monitor()
         return agent
+
+    def cancel_queued(self, queue_id: str, *,
+                      reason: str = "canceled") -> dict:
+        """Cancel one queued spawn before it starts (operator action)."""
+        entry = self.queue.get(str(queue_id))
+        if entry is None:
+            # Accept an agent id as convenience (the UI knows both).
+            entry = next((candidate for candidate in self.queue.entries()
+                          if candidate.agent_id == str(queue_id)), None)
+        if entry is None:
+            raise NotFound(f"queued spawn not found: {queue_id}")
+        agent = self._agents.get(entry.agent_id)
+        if agent is None:
+            self.queue.remove(entry.id)
+            raise NotFound(f"agent not found: {entry.agent_id}")
+        if (agent.id in self._starting
+                or agent.status != QUEUED_AGENT_STATUS):
+            raise Conflict(
+                f"agent {agent.id} already left the queue (status={agent.status})")
+        self.queue.remove(entry.id)
+        agent.status = "dead"
+        agent.summary = f"queue canceled: {reason}"
+        agent.error = None
+        agent.touch()
+        self.save()
+        payload = {
+            "queue_id": entry.id,
+            "agent_id": agent.id,
+            "role": agent.role,
+            "project_id": agent.project_id,
+            "task_id": agent.task_id,
+            "priority": entry.priority,
+            "canceled": True,
+            "reason": reason,
+        }
+        self._emit("agent.dequeued", payload)
+        return {"queue_id": entry.id, "canceled": True,
+                "agent": agent.to_dict()}
+
+    def queue_snapshot(self, *, project_id: str | None = None) -> dict:
+        """Status view for ``GET /api/agents/queue``."""
+        queued = self.queue.snapshot(project_id=project_id)
+        for item in queued:
+            agent = self._agents.get(str(item.get("agent_id") or ""))
+            if agent is not None:
+                item["display_name"] = agent.display_name
+                item["model"] = agent.model
+                item["status"] = agent.status
+                item["created_at"] = agent.created_at
+        running = self._running_count()
+        return {
+            "queued": queued,
+            "count": len(queued),
+            "running": running,
+            "max_workers": self.max_workers,
+            "queue_max": self.queue.max_size,
+            "available": max(0, self.max_workers - running),
+        }
 
     async def _launch(self, agent: Agent, work_id: str,
                       token: str | None = None) -> None:
@@ -438,6 +690,31 @@ class AgentSupervisor:
         agent = self._agents.get(agent_id)
         if agent is None or agent.status in TERMINAL_AGENT_STATUSES:
             return False
+        if agent.status == QUEUED_AGENT_STATUS:
+            # A queued agent has no process; killing it just leaves the queue.
+            entry = self.queue.remove_agent(agent.id)
+            agent.status = "dead"
+            agent.summary = f"killed while queued: {reason}"
+            agent.touch()
+            self.save()
+            if entry is not None:
+                self._emit("agent.dequeued", {
+                    "queue_id": entry.id,
+                    "agent_id": agent.id,
+                    "role": agent.role,
+                    "project_id": agent.project_id,
+                    "task_id": agent.task_id,
+                    "priority": entry.priority,
+                    "canceled": True,
+                    "reason": reason,
+                })
+            self._emit("agent.terminated", {
+                "agent_id": agent.id, "role": agent.role,
+                "project_id": agent.project_id, "task_id": agent.task_id,
+                "reason": reason, "queued": True,
+            })
+            self._schedule_drain()
+            return True
         work_id = agent.unit_id
         handled = False
         if self.control is not None and work_id:
@@ -464,6 +741,7 @@ class AgentSupervisor:
             "task_id": agent.task_id,
             "reason": reason,
         })
+        self._schedule_drain()
         return True
 
     async def kill_project(self, project_id: str, *,
@@ -483,15 +761,209 @@ class AgentSupervisor:
         return await self.kill_project(project_id, reason="project_archived")
 
     # ------------------------------------------------------------------
+    # live config / timeout reaping
+    # ------------------------------------------------------------------
+    async def on_config(self, config: Any) -> dict:
+        """Apply a live config patch: limits, queue bound and worker push.
+
+        Called by ``App.update_config`` with the *full* Config.  Every running
+        worker receives ``unit.configure`` with the non-secret runtime view
+        (limits + provider/model/base_url); API keys are never pushed.  A
+        worker that does not implement the action is recorded and skipped --
+        the persisted config stays the source of truth.
+        """
+        agents_cfg = getattr(config, "agents", config)
+        self.config = agents_cfg
+        self.max_workers = max(1, int(getattr(agents_cfg, "max_workers",
+                                             self.max_workers)))
+        self.queue_max = max(1, int(getattr(agents_cfg, "queue_max",
+                                            self.queue_max)))
+        self.queue.set_max_size(self.queue_max)
+        self.task_timeout_s = float(getattr(agents_cfg, "task_timeout_s",
+                                            self.task_timeout_s))
+        self.max_tool_calls_per_task = int(getattr(
+            agents_cfg, "max_tool_calls_per_task", self.max_tool_calls_per_task))
+        self.config_reload_s = float(getattr(agents_cfg, "config_reload_s",
+                                             self.config_reload_s))
+        payload = public_runtime_config(config)
+        self.last_pushed_config = payload
+        pushed: list[dict] = []
+        failed: list[dict] = []
+        for agent in list(self._agents.values()):
+            if (agent.status not in RUNNING_AGENT_STATUSES
+                    or not agent.unit_id or self.control is None):
+                continue
+            try:
+                result = await _maybe_await(self.control(
+                    agent.unit_id, "unit.configure", dict(payload)))
+            except Exception as exc:  # worker may be older / unreachable
+                failed.append({"agent_id": agent.id, "unit_id": agent.unit_id,
+                               "error": f"{type(exc).__name__}: {exc}"})
+                self.log.warning("configure push to %s failed: %s",
+                                 agent.unit_id, exc)
+                continue
+            pushed.append({"agent_id": agent.id, "unit_id": agent.unit_id,
+                           "result": result})
+            self._emit("agent.configured", {
+                "agent_id": agent.id,
+                "unit_id": agent.unit_id,
+                "role": agent.role,
+                "project_id": agent.project_id,
+                "task_id": agent.task_id,
+            })
+        # A higher max_workers or a smaller queue may free slots immediately.
+        self._schedule_drain()
+        return {"pushed": len(pushed), "failed": len(failed),
+                "agents": pushed, "errors": failed, "config": payload}
+
+    def _ensure_monitor(self) -> None:
+        """Start the timeout watchdog once (idempotent, loop-safe)."""
+        if self._closing or self.task_timeout_s <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - sync call
+            return
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
+        self._monitor_task = loop.create_task(self._monitor_loop())
+        self._monitor_task.add_done_callback(self._monitor_done)
+
+    def _monitor_done(self, task: asyncio.Task) -> None:
+        if self._monitor_task is task:
+            self._monitor_task = None
+
+    async def _monitor_loop(self) -> None:
+        while not self._closing:
+            timeout = float(self.task_timeout_s)
+            interval = 5.0 if timeout <= 0 else max(
+                0.25, min(5.0, timeout / 4.0))
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:  # pragma: no cover - shutdown
+                return
+            if self._closing:
+                return
+            try:
+                await self.reap_stalled()
+            except asyncio.CancelledError:  # pragma: no cover - shutdown
+                return
+            except Exception:  # pragma: no cover - watchdog must survive
+                self.log.exception("timeout reaper failed")
+
+    async def reap_stalled(self, *, now: int | None = None) -> list[dict]:
+        """Reclaim task agents that blew ``agents.task_timeout_s``.
+
+        ``last_seen`` is refreshed by the worker heartbeat; a worker that is
+        wedged (tool call/LLM hang, no heartbeat) is killed, its unit released,
+        the task moved back to ``todo`` when it is still ``doing`` and a
+        replacement spawn queued.  Runner-reported timeouts are handled by the
+        runner itself (agent.finish + task.blocked), so this is the safety net
+        for a process that cannot report.
+        """
+        timeout = float(self.task_timeout_s)
+        if timeout <= 0:
+            return []
+        current = int(now if now is not None else now_ms())
+        reaped: list[dict] = []
+        for agent in list(self._agents.values()):
+            if agent.status not in RUNNING_AGENT_STATUSES:
+                continue
+            if not agent.task_id:
+                continue
+            last = int(agent.last_seen or agent.created_at or current)
+            if current - last <= timeout * 1000.0:
+                continue
+            info: dict[str, Any] = {
+                "agent_id": agent.id,
+                "role": agent.role,
+                "project_id": agent.project_id,
+                "task_id": agent.task_id,
+                "unit_id": agent.unit_id,
+                "last_seen": last,
+                "timeout_s": timeout,
+            }
+            self._emit("agent.timeout", info)
+            work_id = agent.unit_id
+            if work_id and self.control is not None:
+                try:
+                    await _maybe_await(self.control(
+                        work_id, "unit.kill", {"reason": "task_timeout"}))
+                except Exception:
+                    self.log.warning("timeout kill via control failed for %s",
+                                     work_id, exc_info=True)
+            if work_id:
+                await self._terminate(work_id)
+                self._release(work_id)
+                self._close_log(work_id)
+            agent.status = "failed"
+            agent.error = f"task timed out after {timeout:g}s"
+            agent.summary = agent.error
+            agent.touch()
+            self._emit("agent.failed", {
+                "agent_id": agent.id, "role": agent.role,
+                "project_id": agent.project_id, "task_id": agent.task_id,
+                "summary": agent.error, "timeout": True,
+            })
+            task = None
+            if self.task_lookup is not None:
+                try:
+                    task = self.task_lookup(agent.task_id)
+                except Exception:
+                    task = None
+            status = _unit_field(task, "status")
+            if task is not None and status not in ("doing", "todo"):
+                # Blocked/done/review: do not fight the worker's own report.
+                info["reassigned"] = False
+            else:
+                if task is not None and status == "doing" and self.task_requeue:
+                    try:
+                        result = self.task_requeue(agent.task_id)
+                        if inspect.isawaitable(result):
+                            await result
+                        info["task_requeued"] = True
+                    except Exception as exc:
+                        info["task_requeue_error"] = str(exc)
+                try:
+                    replacement = self._enqueue(
+                        agent.role, agent.project_id, agent.task_id,
+                        reason="timeout_retry",
+                        priority=int(agent.stats.get("priority", 50)))
+                    info["replacement_agent_id"] = replacement.id
+                    info["reassigned"] = True
+                except Conflict as exc:
+                    info["reassigned"] = False
+                    info["requeue_error"] = exc.message
+            reaped.append(info)
+        if reaped:
+            self.save()
+            self._schedule_drain()
+        return reaped
+
+    async def close(self) -> None:
+        """Stop the watchdog/drain helpers (hub shutdown)."""
+        self._closing = True
+        for task in (self._drain_task, self._monitor_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._drain_task = None
+        self._monitor_task = None
+
+    # ------------------------------------------------------------------
     # roster (sync)
     # ------------------------------------------------------------------
     def register(self, *, role: str, project_id: str | None, unit_id: str,
-                 task_id: str | None = None, model: str = "") -> Agent:
-        """Create (or refresh) the roster entry for a unit."""
-        if not unit_id:
+                 task_id: str | None = None, model: str = "",
+                 status: str = "spawning") -> Agent:
+        """Create (or refresh) the roster entry for a unit.
+
+        ``unit_id`` may be empty only for a queued agent: it has no process and
+        gets its unit id when :meth:`drain_queue` starts it.
+        """
+        if not unit_id and status != QUEUED_AGENT_STATUS:
             raise BadRequest("unit_id is required to register an agent")
         for existing in self._agents.values():
-            if existing.unit_id == unit_id:
+            if unit_id and existing.unit_id == unit_id:
                 existing.role = role
                 existing.project_id = project_id
                 existing.task_id = task_id or existing.task_id
@@ -506,8 +978,8 @@ class AgentSupervisor:
             role=role,
             project_id=project_id,
             task_id=task_id,
-            unit_id=unit_id,
-            status="spawning",
+            unit_id=unit_id or None,
+            status=status,
             model=model or "",
             display_name=display_name_for(role, n),
         )
@@ -540,6 +1012,8 @@ class AgentSupervisor:
         if "last_seen" not in patch:
             agent.touch()
         self.save()
+        if agent.status in TERMINAL_AGENT_STATUSES:
+            self._schedule_drain()
         return agent
 
     def finish(self, agent_id: str, summary: str, *,
@@ -560,6 +1034,8 @@ class AgentSupervisor:
             "task_id": agent.task_id,
             "summary": agent.summary,
         })
+        if agent.status in TERMINAL_AGENT_STATUSES:
+            self._schedule_drain()
         return agent
 
     def list(self, *, project_id: str | None = None,
@@ -608,10 +1084,15 @@ class AgentSupervisor:
         for agent in self._agents.values():
             by_status[agent.status] = by_status.get(agent.status, 0) + 1
             by_role[agent.role] = by_role.get(agent.role, 0) + 1
+        running = sum(1 for agent in self._agents.values()
+                      if agent.status in RUNNING_AGENT_STATUSES)
         return {
             "total": len(self._agents),
             "active": sum(1 for agent in self._agents.values()
                           if agent.status not in TERMINAL_AGENT_STATUSES),
+            "running": running,
+            "queued": len(self.queue),
+            "queue_max": self.queue.max_size,
             "by_status": by_status,
             "by_role": by_role,
             "max_workers": self.max_workers,
@@ -625,6 +1106,14 @@ class AgentSupervisor:
         payload = {
             "agents": [agent.to_dict() for agent in self._agents.values()],
             "counters": dict(self._counters),
+            "queue": self.queue.to_payload(),
+            "limits": {
+                "max_workers": self.max_workers,
+                "queue_max": self.queue.max_size,
+                "task_timeout_s": self.task_timeout_s,
+                "max_tool_calls_per_task": self.max_tool_calls_per_task,
+                "config_reload_s": self.config_reload_s,
+            },
         }
         try:
             write_json(self.state_path, payload)
@@ -659,6 +1148,18 @@ class AgentSupervisor:
                 except (TypeError, ValueError):
                     continue
         self._agents = agents
+        self.queue.load(payload.get("queue"))
+        # A queued roster entry without a queue row would never start: drop it
+        # back to a failed state instead of leaving a ghost that occupies a
+        # roster slot forever.
+        for agent in list(self._agents.values()):
+            if agent.status != QUEUED_AGENT_STATUS:
+                continue
+            if any(entry.agent_id == agent.id for entry in self.queue.entries()):
+                continue
+            agent.status = "failed"
+            agent.error = "queued agent lost its queue entry (snapshot)"
+            agent.touch()
 
     # ------------------------------------------------------------------
     # process / event plumbing

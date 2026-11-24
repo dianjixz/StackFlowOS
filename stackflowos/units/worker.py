@@ -24,6 +24,8 @@ from pathlib import Path
 
 from ..agents import Agent, AgentRunner, MockBrain, ToolExecutor
 from ..agents.api import SysAPI
+from ..agents.hotreload import install_config_reload
+from ..agents.sandbox import apply_process_sandbox
 from ..ai import make_provider
 from ..config import Config
 from ..transport import RpcClient, UnitAddresses, UnitTransport
@@ -150,6 +152,7 @@ async def run_worker(args: argparse.Namespace) -> int:
             "status": state["status"],
             "step": state["step"],
             "paused": state["paused"],
+            "sandbox": state.get("sandbox"),
         }
 
     def _wrap(fn):
@@ -164,6 +167,12 @@ async def run_worker(args: argparse.Namespace) -> int:
     unit.register_action("unit.status", _wrap(on_status))
 
     await unit.start()
+    # Live config: the hub pushes ``unit.configure`` (limits/model/provider,
+    # never secrets); with agents.config_reload_s > 0 we also reconcile by
+    # polling sys.config.get through the existing RPC client.
+    reloader = install_config_reload(
+        unit, cfg, sys=sys_api, logger=log,
+        rebuild_brain=lambda: _make_brain(args.role, cfg))
     agent: Agent | None = None
     runner: AgentRunner | None = None
     heartbeat_task: asyncio.Task | None = None
@@ -182,6 +191,28 @@ async def run_worker(args: argparse.Namespace) -> int:
             workspace_dir.mkdir(parents=True, exist_ok=True)
         read_only = bool(project and project.get("workspace_mode") == "attached-ro")
 
+        # OS sandbox for the worker process itself (security.sandbox): write
+        # only the project workspace + state tmp/logs, reads everywhere.  The
+        # module is optional; a missing/failing sandbox is reported and the
+        # worker keeps running unsandboxed (never blocks the hub).
+        writable_paths = [workspace_dir, cfg.paths.tmp_dir,
+                          cfg.paths.logs_dir / "agents"]
+        for path in writable_paths:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError:  # pragma: no cover - read-only state dir
+                pass
+        sandbox_report = apply_process_sandbox(
+            cfg.security, writable_paths, logger=log)
+        state["sandbox"] = sandbox_report
+        if sandbox_report.get("status") == "applied":
+            log.info("worker sandbox applied: backend=%s writable=%s",
+                     sandbox_report.get("backend"), writable_paths)
+        elif sandbox_report.get("mode") not in (None, "off"):
+            log.warning("worker sandbox not applied (%s): %s",
+                        sandbox_report.get("status"),
+                        sandbox_report.get("reason"))
+
         abilities = _abilities_for(args.role)
         await sys_api.call("unit.register", {
             "work_id": work_id,
@@ -196,7 +227,8 @@ async def run_worker(args: argparse.Namespace) -> int:
             "abilities": abilities,
             "hwinfo": {"python": sys.version.split()[0], "platform": sys.platform},
             "started_at": int(time.time() * 1000),
-            "metadata": {"role": args.role, "task_id": args.task},
+            "metadata": {"role": args.role, "task_id": args.task,
+                         "sandbox": sandbox_report},
         })
 
         agent_data = await sys_api.call("agent.register", {
@@ -234,6 +266,9 @@ async def run_worker(args: argparse.Namespace) -> int:
         runner = AgentRunner(sys_api, agent, brain, executor, config=cfg.agents,
                              logger=get_logger(f"agent.{work_id}"),
                              workspace=workspace_dir)
+        reloader.runner = runner
+        reloader.executor = executor
+        reloader.agent = agent
         state["runner"] = runner
         state["status"] = "working"
 
@@ -294,6 +329,10 @@ async def run_worker(args: argparse.Namespace) -> int:
                 await heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
+        try:
+            await reloader.stop()
+        except Exception:
+            log.debug("config reloader stop failed", exc_info=True)
         try:
             await unit.stop()
         except Exception:
