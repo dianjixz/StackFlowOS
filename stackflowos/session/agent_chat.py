@@ -48,6 +48,9 @@ from typing import Any
 
 from ..agents.models import Agent, now_ms
 from ..agents.tools import ToolExecutor, ToolResult, tools_for
+from ..ai.llm import (attach_runtime, complete, openai_tool_schemas,
+                      supports_native_tools)
+from ..ai.types import coerce_tool_calls
 from ..ai.prompts import SYSTEM_PROMPT_OS, role_prompt
 from ..errors import BadRequest, Conflict, SfoError
 from ..security import Principal
@@ -283,6 +286,49 @@ def _parse_action(raw: str) -> dict | None:
     return _action_from_native_tags(text)
 
 
+class _ProseDeltaForwarder:
+    """Forward streamed prose to the UI, suppress tool-action JSON.
+
+    Native tool calls and the JSON protocol both produce text that starts with
+    ``{``/````` ``` ``; showing that raw in the chat bubble is noise.  We wait
+    for the first non-space character: if it looks like an action payload the
+    whole step is suppressed (the tool card is the UI), otherwise subsequent
+    chunks stream through immediately.
+    """
+
+    _ACTION_STARTS = ("{", "[", "<", "```")
+
+    def __init__(self, emit: Any) -> None:
+        self._emit = emit
+        self._pending = ""
+        self._decided = False
+        self._blocked = False
+        self.chars = 0
+
+    async def feed(self, delta: dict) -> None:
+        if delta.get("type") != "text":
+            return
+        chunk = str(delta.get("text") or "")
+        if not chunk or self._blocked:
+            return
+        self._pending += chunk
+        stripped = self._pending.lstrip()
+        if not stripped:
+            return
+        if not self._decided:
+            if stripped.startswith(self._ACTION_STARTS):
+                self._blocked = True
+                self._pending = ""
+                return
+            self._decided = True
+        text = self._pending
+        self._pending = ""
+        if not text:
+            return
+        self.chars += len(text)
+        await self._emit(text)
+
+
 class _AgentSys:
     """In-process ``SysAPI`` for one agent-chat turn.
 
@@ -337,6 +383,19 @@ class AgentChatService:
         #: that belong to that turn (not a live worker's older request).
         self._turn_started: dict[str, int] = {}
         self._closed = False
+        # Usage/cost accounting is shared with the hub runtime so a provider
+        # rebuild on config reload keeps a single, persistent counter.
+        try:
+            attach_runtime(provider, app)
+        except Exception:  # telemetry must never block startup
+            self.log.debug("could not attach llm runtime", exc_info=True)
+
+    async def on_config(self, config: Any) -> None:
+        """Re-attach accounting after a hot config reload swapped providers."""
+        try:
+            attach_runtime(self.provider, self.app)
+        except Exception:
+            self.log.debug("could not re-attach llm runtime", exc_info=True)
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -517,6 +576,17 @@ class AgentChatService:
         self._drafts[agent.id] = {
             "message_id": reply_id, "typing": True, "text": "", "tools": [],
         }
+
+        async def emit_chunk(chunk: str) -> None:
+            draft = self._drafts.get(agent.id)
+            if draft is not None:
+                draft["text"] = str(draft.get("text") or "") + chunk
+                draft["typing"] = False
+            self._emit(agent, "agent.chat.delta", {
+                "message_id": reply_id, "delta": chunk, "role": "assistant",
+            })
+
+        forwarder = _ProseDeltaForwarder(emit_chunk)
         try:
             project = self._project(agent)
             executor = self._executor(agent, project)
@@ -525,10 +595,14 @@ class AgentChatService:
                                              user_msg.text)
             await self._typing(agent, reply_id, True)
             answer, tools_used = await self._tool_loop(
-                agent, project, messages, tools, executor, reply_id)
+                agent, project, messages, tools, executor, reply_id,
+                on_delta=forwarder.feed)
             answer = (answer or "").strip() or "（模型没有返回内容）"
             await self._typing(agent, reply_id, False)
-            await self._stream(agent, reply_id, answer)
+            # If the provider already streamed the prose, do not replay it with
+            # the chunked fallback (which exists for non-streaming providers).
+            if forwarder.chars == 0:
+                await self._stream(agent, reply_id, answer)
             message = AgentChatMessage(
                 id=reply_id, role="assistant", text=answer, ts=now_ms(),
                 agent_id=agent.id,
@@ -566,29 +640,52 @@ class AgentChatService:
     async def _tool_loop(self, agent: Agent, project: Any,
                          messages: list[dict], tools: list[Any],
                          executor: ToolExecutor | None,
-                         reply_id: str) -> tuple[str, list[dict]]:
+                         reply_id: str,
+                         on_delta: Any = None) -> tuple[str, list[dict]]:
         """Run the LLM/tool loop until the model answers in natural language."""
         allowed = {spec.name for spec in tools}
         specs = [{"name": spec.name, "description": spec.description,
                   "args": spec.args, "capability": spec.capability}
                  for spec in tools]
+        native_specs = openai_tool_schemas(specs)
+        native = supports_native_tools(self.provider)
         records: list[dict] = []
         bad_format = 0
         if executor is None:
-            return await self._plain_reply(messages), records
+            return await self._plain_reply(
+                messages, agent=agent, on_delta=on_delta), records
 
-        for _step in range(MAX_TOOL_STEPS):
+        for step in range(MAX_TOOL_STEPS):
+            native_calls: list[Any] = []
+            text = ""
             try:
-                raw = await self.provider.chat(messages, tools=specs or None)
+                if native:
+                    result = await self.provider.chat_with_tools(
+                        messages, tools=native_specs or None,
+                        role=agent.role, project_id=agent.project_id,
+                        on_delta=on_delta)
+                    text = str(result.text or "").strip()
+                    native_calls = coerce_tool_calls(result.tool_calls)
+                else:
+                    raw = await self.provider.chat(messages, tools=specs or None)
+                    text = str(raw or "").strip()
             except SfoError as exc:
                 return f"模型调用失败：{exc.code}: {exc.message}", records
             except Exception as exc:  # noqa: BLE001 - report, do not crash
                 self.log.exception("provider chat failed for %s", agent.id)
                 return f"模型调用失败：{type(exc).__name__}: {exc}", records
-            text = str(raw or "").strip()
-            if not text:
+            if not text and not native_calls:
                 return "（模型没有返回内容）", records
-            action = _parse_action(text)
+
+            action: dict | None
+            if native_calls:
+                call = native_calls[0]
+                action = {"tool": call.name,
+                          "args": dict(call.arguments or {}),
+                          "_native": True,
+                          "_call_id": call.id or f"call-{step}"}
+            else:
+                action = _parse_action(text)
             if action is not None and action["tool"] in allowed:
                 await self._typing(agent, reply_id, False)
                 record = self._run_tool_record(agent, action, reply_id)
@@ -603,11 +700,31 @@ class AgentChatService:
                 self._finish_tool_record(record, result)
                 self._draft_upsert_tool(agent.id, record)
                 await self._emit_tool(agent, reply_id, record)
-                messages.append({"role": "assistant", "content": text[:4000]})
-                messages.append({"role": "user", "content": (
-                    "工具结果（" + action["tool"] + "）："
-                    + json.dumps(self._result_payload(result),
-                                 ensure_ascii=False, default=str))})
+                payload = json.dumps(self._result_payload(result),
+                                     ensure_ascii=False, default=str)
+                if action.get("_native"):
+                    # Native protocol: assistant tool_calls + a tool-role
+                    # result carrying the matching tool_call_id.
+                    messages.append({
+                        "role": "assistant",
+                        "content": text[:4000],
+                        "tool_calls": [{
+                            "id": action["_call_id"],
+                            "type": "function",
+                            "function": {
+                                "name": action["tool"],
+                                "arguments": json.dumps(
+                                    action["args"] or {}, ensure_ascii=False),
+                            },
+                        }],
+                    })
+                    messages.append({"role": "tool",
+                                     "tool_call_id": action["_call_id"],
+                                     "content": payload})
+                else:
+                    messages.append({"role": "assistant", "content": text[:4000]})
+                    messages.append({"role": "user", "content": (
+                        "工具结果（" + action["tool"] + "）：" + payload)})
                 await self._typing(agent, reply_id, True)
                 bad_format = 0
                 continue
@@ -642,15 +759,21 @@ class AgentChatService:
                 f"{MAX_TOOL_STEPS} 步工具调用，先停在这里。"
                 "你可以让我继续，或指定下一步。"), records
 
-    async def _plain_reply(self, messages: list[dict]) -> str:
+    async def _plain_reply(self, messages: list[dict], *,
+                           agent: Agent | None = None,
+                           on_delta: Any = None) -> str:
         try:
-            raw = await self.provider.chat(messages)
+            result = await complete(
+                self.provider, messages,
+                role=getattr(agent, "role", None),
+                project_id=getattr(agent, "project_id", None),
+                on_delta=on_delta)
+            return str(result.text or "").strip() or "（模型没有返回内容）"
         except SfoError as exc:
             return f"模型调用失败：{exc.code}: {exc.message}"
         except Exception as exc:  # noqa: BLE001
             self.log.exception("provider chat failed")
             return f"模型调用失败：{type(exc).__name__}: {exc}"
-        return str(raw or "").strip() or "（模型没有返回内容）"
 
     def _run_tool_record(self, agent: Agent, action: dict,
                          reply_id: str) -> dict:
@@ -802,7 +925,8 @@ class AgentChatService:
             "- 当操作员要求检查、修改、运行、创建内容时，先调用工具，"
             "不要只描述步骤；工具结果会作为下一条消息发给你，你可以继续调用，"
             "最后用自然语言总结（引用真实路径与结果）。\n"
-            "- 需要动手时，只输出一个 JSON 对象："
+            "- 需要动手时，优先直接调用提供的工具（function calling）；"
+            "如果模型无法使用原生调用，才输出一个 JSON 对象："
             '{"tool": "工具名", "args": {...}}；不要加 Markdown 代码块，'
             "不要一次输出多个 JSON。\n"
             "- 不要使用 DSML、XML、<tool>、<invoke> 或函数调用标签；"

@@ -1,308 +1,107 @@
-"""LLM providers and the optional LLM-driven brain.
+"""LLM providers, routing and the optional LLM-driven brain.
 
-Providers use the OpenAI-compatible ``/chat/completions`` shape over stdlib
-``urllib`` (no third-party dependencies).  ``MockProvider`` is deterministic and
-offline so the whole system runs and tests without network.
+The public construction point is :func:`make_provider`, used by the hub and by
+worker processes.  Providers implement native tool calling, usage accounting
+and streaming; :class:`stackflowos.ai.router.Router` adds role routes and a
+fallback chain.  ``chat()`` keeps the historical "return a string" contract.
 
-``make_provider`` is the single construction point used by sys/hub; it accepts
-any object with the :class:`stackflowos.config.LLMCfg` attributes.
+``LLMBrain`` sends native tool schemas when the provider supports them and
+falls back to the JSON action protocol otherwise, so local OpenAI-compatible
+gateways with weak function-calling support keep working.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 from typing import Any, Protocol, runtime_checkable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from ..errors import BadRequest, SfoError, Unavailable
 from ..util.logging import get_logger
+from .factory import create_provider, spec_from_config
 from .prompts import SYSTEM_PROMPT_OS, role_prompt, tool_call_protocol
+from .providers import (
+    AnthropicProvider,
+    BaseProvider,
+    GeminiProvider,
+    MockProvider,
+    OpenAICompatibleProvider,
+    _compact,
+    _content_text,
+    _is_transient,
+    _last_user_text,
+    _redact,
+    anthropic_tools,
+    gemini_tools,
+    normalise_finish_reason,
+    openai_tool_schemas,
+)
+from .router import Router
+from .telemetry import attach_provider_runtime, estimate_messages_tokens
+from .types import (LLMResult, ToolCall, Usage, coerce_tool_calls,
+                    parse_tool_arguments)
 
 _log = get_logger("ai.llm")
 
-
+#: Kept for backwards compatibility with older callers/tests.
 _TRANSIENT_HTTP = ("LLM HTTP 429", "LLM HTTP 500", "LLM HTTP 502",
                    "LLM HTTP 503", "LLM HTTP 504")
-
-
-def _is_transient(message: str) -> bool:
-    return (message.startswith(_TRANSIENT_HTTP)
-            or message.startswith("LLM connection failed")
-            or message.startswith("LLM request failed"))
-
-
-@runtime_checkable
-class LLMProvider(Protocol):
-    """Minimal text-completion interface used by the agents."""
-
-    async def chat(self, messages: list[dict], *,
-                   tools: list[dict] | None = None) -> str:
-        ...
-
-    async def ping(self) -> dict:
-        ...
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-def _content_text(content: Any) -> str:
-    """Flatten OpenAI message content (string or multimodal parts) to text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        return "\n".join(parts)
-    return "" if content is None else str(content)
-
-
-def _last_user_text(messages: list[dict]) -> str:
-    for message in reversed(messages or []):
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") == "user":
-            return _content_text(message.get("content"))
-    for message in reversed(messages or []):
-        if isinstance(message, dict):
-            text = _content_text(message.get("content"))
-            if text:
-                return text
-    return ""
-
-
-def _compact(text: str, limit: int = 120) -> str:
-    cleaned = " ".join(str(text).split())
-    return cleaned if len(cleaned) <= limit else cleaned[: max(0, limit - 1)] + "…"
-
-
-def _redact(text: str, secret: str) -> str:
-    if secret and secret in text:
-        return text.replace(secret, "***")
-    return text
-
-
-# ---------------------------------------------------------------------------
-# mock provider
-# ---------------------------------------------------------------------------
-
-class MockProvider:
-    """Deterministic, offline provider used by default (llm.provider=mock)."""
-
-    name = "mock"
-
-    async def chat(self, messages: list[dict], *,
-                   tools: list[dict] | None = None) -> str:
-        """Return a deterministic Chinese reply summarising the last user turn."""
-        text = _last_user_text(messages)
-        short = _compact(text, 140)
-        lowered = text.lower()
-        if any(keyword in lowered for keyword in
-               ("状态", "进度", "status", "progress")):
-            return (
-                "当前系统运行正常：hub 在线，项目任务由各 Agent 在后台推进。"
-                f"你问的是「{short}」。更细的进度可以在工作面板查看任务状态与事件流；"
-                "我是本地 mock 助手，不会调用外部模型。")
-        if any(keyword in lowered for keyword in ("审批", "approval", "权限")):
-            return (
-                f"收到：「{short}」。权限请求会出现在审批中心，"
-                "低风险动作按策略自动放行，中高风险需要你确认（允许一次/一小时/总是允许/拒绝）。")
-        return (
-            f"收到：「{short}」。我是 StackFlowOS 的本地模拟助手"
-            "（provider=mock），已记录你的输入；需要真实模型分析时，"
-            "请在系统设置的 AI 一栏切换 provider 并填写 API 地址。")
-
-    async def ping(self) -> dict:
-        """Report provider health without any network call."""
-        return {"ok": True, "provider": "mock"}
-
-
-# ---------------------------------------------------------------------------
-# OpenAI-compatible provider
-# ---------------------------------------------------------------------------
-
-class OpenAICompatibleProvider:
-    """POST ``{base_url}/chat/completions`` via urllib in a worker thread."""
-
-    name = "openai"
-
-    def __init__(self, *, base_url: str, model: str, api_key: str = "",
-                 temperature: float = 0.2, max_tokens: int = 4096,
-                 timeout_s: float = 60.0, retries: int = 2,
-                 retry_backoff_s: float = 0.5) -> None:
-        if not base_url:
-            raise BadRequest("llm.base_url is required for the openai provider")
-        if not model:
-            raise BadRequest("llm.model is required for the openai provider")
-        self.base_url = str(base_url).rstrip("/")
-        self.model = str(model)
-        self.api_key = str(api_key or "")
-        self.temperature = float(temperature)
-        # Sent verbatim: the upstream endpoint/model is the authority on its
-        # own limit. Do not silently rewrite an operator's setting.
-        self.max_tokens = max(1, int(max_tokens))
-        self.timeout_s = float(timeout_s)
-        self.retries = max(0, int(retries))
-        self.retry_backoff_s = max(0.0, float(retry_backoff_s))
-        self._endpoint: str | None = None
-
-    async def chat(self, messages: list[dict], *,
-                   tools: list[dict] | None = None) -> str:
-        """Send one chat completion request and return the assistant text."""
-        if not isinstance(messages, list) or not messages:
-            raise BadRequest("messages must be a non-empty list")
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": max(1, int(self.max_tokens)),
-        }
-        # `tools` is accepted for interface parity; the JSON action protocol
-        # keeps provider-native tool calling out of the critical path.
-        _ = tools
-        raw = await self._post_with_retry(body)
-        try:
-            payload = json.loads(raw)
-        except ValueError as exc:
-            raise Unavailable("LLM returned non-JSON response") from exc
-        try:
-            content = payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise Unavailable("LLM response is missing choices[0].message.content") from exc
-        text = _content_text(content)
-        if not text:
-            raise Unavailable("LLM returned an empty message")
-        return text
-
-    async def _post_with_retry(self, body: dict) -> str:
-        """POST, retrying transient failures (429/5xx/timeouts/connection)."""
-        for attempt in range(self.retries + 1):
-            try:
-                return await asyncio.to_thread(self._post, body)
-            except Unavailable as exc:
-                if attempt >= self.retries or not _is_transient(str(exc)):
-                    raise
-                delay = self.retry_backoff_s * (2 ** attempt)
-                _log.info("LLM transient error (%s); retry %d/%d in %.1fs",
-                          exc, attempt + 1, self.retries, delay)
-                await asyncio.sleep(delay)
-        raise Unavailable("LLM request failed")  # pragma: no cover
-
-    def _candidate_urls(self) -> list[str]:
-        """Plausible chat-completion URLs for the configured base URL.
-
-        Operators paste ``http://host:port`` as often as ``.../v1``. Trying
-        the conventional suffixes avoids a confusing 404 for a correct
-        endpoint. The first working URL is cached for later calls.
-        """
-        base = self.base_url
-        if base.endswith("/chat/completions"):
-            urls = [base]
-        elif base.endswith("/v1") or "/v1/" in base:
-            urls = [base + "/chat/completions"]
-        else:
-            urls = [
-                base + "/v1/chat/completions",
-                base + "/chat/completions",
-                base + "/api/chat/completions",
-            ]
-        if self._endpoint is not None and self._endpoint in urls:
-            urls.remove(self._endpoint)
-            urls.insert(0, self._endpoint)
-        return urls
-
-    def _post(self, body: dict) -> str:
-        raw_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        last_error: Unavailable | None = None
-        for url in self._candidate_urls():
-            request = Request(url, data=raw_body, headers=headers, method="POST")
-            try:
-                with urlopen(request, timeout=self.timeout_s) as response:
-                    raw = response.read().decode("utf-8", "replace")
-                self._endpoint = url
-                return raw
-            except HTTPError as exc:
-                detail = ""
-                try:
-                    detail = exc.read()[:300].decode("utf-8", "replace")
-                except Exception:  # pragma: no cover - body may be unreadable
-                    detail = ""
-                detail = _redact(_compact(detail, 200), self.api_key)
-                suffix = f": {detail}" if detail else ""
-                error = Unavailable(f"LLM HTTP {exc.code}{suffix}")
-                if exc.code in (404, 405) or (exc.code == 400 and "model" in detail.lower()):
-                    # Wrong path (or a proxy that only accepts another one);
-                    # try the next candidate. 400/model errors are not path
-                    # problems, so surface them immediately.
-                    if exc.code in (404, 405):
-                        last_error = error
-                        continue
-                raise error from exc
-            except URLError as exc:
-                raise Unavailable(f"LLM connection failed: {exc.reason}") from exc
-            except Exception as exc:  # socket timeout, malformed URL, ...
-                raise Unavailable(
-                    f"LLM request failed: {type(exc).__name__}") from exc
-        if last_error is not None:
-            raise last_error
-        raise Unavailable("LLM request failed: no endpoint candidate")
-
-    async def ping(self) -> dict:
-        """Round-trip a tiny chat request and report latency."""
-        started = time.monotonic()
-        try:
-            await self.chat([{"role": "user", "content": "ping"}])
-        except SfoError as exc:
-            return {"ok": False, "provider": self.name, "model": self.model,
-                    "error": f"{exc.code}: {exc.message}"}
-        except Exception as exc:  # pragma: no cover - defensive
-            return {"ok": False, "provider": self.name, "model": self.model,
-                    "error": type(exc).__name__}
-        return {
-            "ok": True,
-            "provider": self.name,
-            "model": self.model,
-            "latency_ms": int((time.monotonic() - started) * 1000),
-        }
 
 
 # ---------------------------------------------------------------------------
 # factory
 # ---------------------------------------------------------------------------
 
-def make_provider(cfg: Any) -> LLMProvider:
-    """Build a provider from an ``LLMCfg``-like object."""
-    provider = str(getattr(cfg, "provider", "mock") or "mock").strip().lower()
-    if provider in ("", "mock"):
-        return MockProvider()
-    if provider in ("openai", "openai-compatible", "openai_compatible"):
-        return OpenAICompatibleProvider(
-            base_url=str(getattr(cfg, "base_url", "") or ""),
-            model=str(getattr(cfg, "model", "") or ""),
-            api_key=str(getattr(cfg, "api_key", "") or ""),
-            temperature=float(getattr(cfg, "temperature", 0.2)),
-            max_tokens=int(getattr(cfg, "max_tokens", 4096)),
-            timeout_s=float(getattr(cfg, "timeout_s", 60.0)),
-        )
-    raise BadRequest(f"unsupported llm provider: {provider!r}")
+def make_provider(cfg: Any) -> Any:
+    """Build the configured provider (or a router when routes/fallback are set).
+
+    ``app.update_config`` calls this for every successful config patch and
+    swaps ``chat.provider`` / ``agent_chat.provider``; the returned object is
+    stateless apart from usage/circuit counters, which live in the shared
+    runtime so a rebuild does not lose or duplicate accounting.
+    """
+    routes = getattr(cfg, "routes", None) or []
+    fallback = getattr(cfg, "fallback", None) or []
+    if routes or fallback:
+        return Router(cfg)
+    return create_provider(spec_from_config(cfg))
+
+
+def attach_runtime(provider: Any, app: Any) -> None:
+    """Backwards-friendly alias for ``attach_provider_runtime``."""
+    attach_provider_runtime(provider, app)
+
+
+def supports_native_tools(provider: Any) -> bool:
+    """True when the provider implements the structured interface."""
+    return callable(getattr(provider, "chat_with_tools", None))
+
+
+async def complete(provider: Any, messages: list[dict], *,
+                   tools: list[dict] | None = None,
+                   role: str | None = None,
+                   project_id: str | None = None,
+                   on_delta: Any = None) -> LLMResult:
+    """Call the structured interface when available, else the legacy one.
+
+    ``tools`` is a native tool schema list (use :func:`openai_tool_schemas`).
+    Legacy providers receive no tools, which preserves their old prompt
+    contract (the JSON protocol is described in the system prompt).
+    """
+    method = getattr(provider, "chat_with_tools", None)
+    if callable(method):
+        return await method(messages, tools=tools, role=role,
+                            project_id=project_id, on_delta=on_delta)
+    raw = await provider.chat(messages)
+    text = raw if isinstance(raw, str) else str(raw or "")
+    usage = Usage(prompt=estimate_messages_tokens(messages),
+                  completion=max(0, len(text) // 3))
+    return LLMResult(text=text, usage=usage,
+                     model=str(getattr(provider, "model", "") or ""),
+                     provider=str(getattr(provider, "name", "") or ""))
 
 
 # ---------------------------------------------------------------------------
-# LLM-driven brain
+# brain helpers
 # ---------------------------------------------------------------------------
 
 def _first_json_object(text: str) -> dict | None:
@@ -421,21 +220,27 @@ ACTION_STR_LIMIT = 1500
 
 
 class LLMBrain:
-    """Brain that asks an :class:`LLMProvider` for one JSON action per step.
+    """Brain that asks an :class:`LLMProvider` for one action per step.
 
     It keeps one conversation per agent run: the opening state, every action
     the model chose and every tool result (``observe``), so the model can read
     files, react to errors/denials and build on earlier steps like any
     ordinary tool-using agent.
+
+    When the provider supports native tool calling, the tool schemas are sent
+    as ``tools`` and the reply is parsed from ``tool_calls``.  Otherwise (and
+    whenever the model answers in text) the documented JSON action protocol is
+    still parsed, so existing local-model setups keep working.
     """
 
-    def __init__(self, provider: LLMProvider, role: str, *,
+    def __init__(self, provider: Any, role: str, *,
                  max_steps: int = 16) -> None:
         self.provider = provider
         self.role = str(role)
         self.max_steps = int(max_steps)
         self._history: list[dict] = []
         self._pending: Any = None
+        self._pending_call_id: str | None = None
         self._board_sig = ""
         self._dropped = 0
 
@@ -445,11 +250,21 @@ class LLMBrain:
 
     # -- conversation memory ---------------------------------------------
     def _system(self) -> str:
-        return "\n\n".join((SYSTEM_PROMPT_OS, role_prompt(self.role),
+        text = "\n\n".join((SYSTEM_PROMPT_OS, role_prompt(self.role),
                              tool_call_protocol(self.role)))
+        if supports_native_tools(self.provider):
+            text += ("\n\n本模型支持原生工具调用：优先直接调用提供的工具；"
+                     "如果无法使用原生调用，再按上面的 JSON 协议输出。")
+        return text
 
     def observe(self, action: Any, result: Any) -> None:
-        """Record the tool result for the action returned by ``next_action``."""
+        """Record the tool result for the action returned by ``next_action``.
+
+        Native tool calls are answered with a ``tool`` message carrying the
+        matching ``tool_call_id``; the legacy JSON path keeps the old
+        ``user``-role "工具结果" message because those providers have no
+        tool-message slot in their conversation format.
+        """
         payload: dict[str, Any] = {"tool": getattr(action, "tool", None),
                                    "ok": bool(getattr(result, "ok", False))}
         error = getattr(result, "error", None)
@@ -463,7 +278,13 @@ class LLMBrain:
         text = json.dumps(payload, ensure_ascii=False)
         if len(text) > 12_000:
             text = text[:12_000] + "…[结果已截断]"
-        self._history.append({"role": "user", "content": f"工具结果：{text}"})
+        call_id = self._pending_call_id
+        if call_id:
+            self._history.append({"role": "tool", "tool_call_id": call_id,
+                                  "content": text})
+        else:
+            self._history.append({"role": "user", "content": f"工具结果：{text}"})
+        self._pending_call_id = None
         self._pending = None
 
     def _remember_action(self, action: Any, reply: str) -> None:
@@ -478,14 +299,45 @@ class LLMBrain:
             content = _compact(reply, 600)
         self._history.append({"role": "assistant", "content": content})
 
+    def _remember_native_action(self, action: Any, call: ToolCall,
+                                reply: str) -> None:
+        record = {
+            "role": "assistant",
+            "content": _compact(reply, 600) if reply else "",
+            "tool_calls": [{
+                "id": call.id or "call-0",
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(dict(action.args or {}),
+                                            ensure_ascii=False),
+                },
+            }],
+        }
+        self._history.append(record)
+
     def _trim(self) -> None:
         """Drop the oldest assistant/user pairs (index 0 holds the opening)."""
         def size() -> int:
-            return sum(len(item["content"]) for item in self._history)
+            total = 0
+            for item in self._history:
+                content = item.get("content")
+                total += len(content) if isinstance(content, str) else 0
+                if item.get("tool_calls"):
+                    total += len(json.dumps(item["tool_calls"],
+                                            ensure_ascii=False))
+            return total
         while len(self._history) > 3 and (
                 len(self._history) > MAX_HISTORY_MESSAGES
                 or size() > MAX_HISTORY_CHARS):
-            del self._history[1:3]
+            remove = 2
+            first = self._history[1]
+            if (isinstance(first, dict) and first.get("role") == "assistant"
+                    and first.get("tool_calls") and len(self._history) > 2
+                    and isinstance(self._history[2], dict)
+                    and self._history[2].get("role") == "tool"):
+                remove = 2
+            del self._history[1:1 + remove]
             self._dropped += 1
 
     def _step_hint(self, view: Any) -> str:
@@ -496,6 +348,14 @@ class LLMBrain:
         if self._dropped:
             hint += f"（较早的 {self._dropped} 轮对话已省略。）"
         return hint
+
+    @staticmethod
+    def _project_id(view: Any) -> str | None:
+        project = getattr(view, "project", None)
+        if isinstance(project, dict):
+            value = project.get("id")
+            return str(value) if value else None
+        return None
 
     async def next_action(self, view: Any) -> Any:
         """Ask the model for one action, retrying malformed replies twice."""
@@ -523,15 +383,27 @@ class LLMBrain:
                                       "content": "\n".join(tail)})
         self._trim()
 
-        tools = [{"name": spec.name, "description": spec.description,
-                  "capability": spec.capability, "args": spec.args}
-                 for spec in specs]
-        messages: list[dict] = ([{"role": "system", "content": self._system()}]
-                                + [dict(item) for item in self._history])
+        legacy_tools = [{"name": spec.name, "description": spec.description,
+                         "capability": spec.capability, "args": spec.args}
+                        for spec in specs]
+        native_tools = openai_tool_schemas(legacy_tools)
+        native = supports_native_tools(self.provider)
+        project_id = self._project_id(view)
         last_error = ""
         for _attempt in range(3):
+            messages: list[dict] = ([{"role": "system", "content": self._system()}]
+                                    + [dict(item) for item in self._history])
+            result: LLMResult | None = None
+            reply = ""
             try:
-                reply = await self.provider.chat(messages, tools=tools)
+                if native:
+                    result = await self.provider.chat_with_tools(
+                        messages, tools=native_tools, role=self.role,
+                        project_id=project_id)
+                    reply = result.text or ""
+                else:
+                    reply = await self.provider.chat(messages,
+                                                     tools=legacy_tools)
             except SfoError as exc:
                 return Action(finish={
                     "summary": f"LLM 调用失败：{exc.code}: {exc.message}",
@@ -541,11 +413,31 @@ class LLMBrain:
                 return Action(finish={
                     "summary": f"LLM 调用失败：{type(exc).__name__}",
                     "status": "failed"})
+
+            calls = coerce_tool_calls(
+                result.tool_calls if result is not None else None)
+            if calls:
+                call = calls[0]
+                action, error = self._parse_tool_call(call, allowed)
+                if action is not None:
+                    self._remember_native_action(action, call, reply)
+                    self._pending = action
+                    self._pending_call_id = call.id or "call-0"
+                    return action
+                last_error = error
+                messages.append({"role": "assistant",
+                                 "content": _compact(reply, 500)})
+                messages.append({"role": "user", "content": (
+                    f"上一条工具调用无法使用：{error}。"
+                    "请只调用可用工具，或输出一个合法 JSON 对象（tool 或 finish）。")})
+                continue
+
             payload = _first_json_object(reply)
             action, error = self._parse(payload, allowed)
             if action is not None:
                 self._remember_action(action, reply)
                 self._pending = action
+                self._pending_call_id = None
                 return action
             last_error = error
             messages.append({"role": "assistant", "content": _compact(reply, 500)})
@@ -555,6 +447,16 @@ class LLMBrain:
         return Action(finish={
             "summary": f"LLM 连续 3 次返回无法解析的内容：{last_error}",
             "status": "failed"})
+
+    @staticmethod
+    def _parse_tool_call(call: ToolCall, tools: Any) -> tuple[Any, str]:
+        from ..agents.brain import Action
+
+        if not isinstance(call.name, str) or call.name not in tools:
+            return None, f"未知工具 {call.name!r}（可用：{sorted(tools)}）"
+        if not isinstance(call.arguments, dict):
+            return None, "arguments 必须是对象"
+        return Action(tool=call.name, args=dict(call.arguments)), ""
 
     @staticmethod
     def _parse(payload: dict | None, tools: Any) -> tuple[Any, str]:
@@ -589,9 +491,36 @@ class LLMBrain:
 
 
 __all__ = [
+    "AnthropicProvider",
+    "BaseProvider",
+    "GeminiProvider",
     "LLMBrain",
+    "LLMResult",
     "LLMProvider",
     "MockProvider",
     "OpenAICompatibleProvider",
+    "Router",
+    "ToolCall",
+    "Usage",
+    "anthropic_tools",
+    "attach_runtime",
+    "complete",
+    "gemini_tools",
     "make_provider",
+    "normalise_finish_reason",
+    "openai_tool_schemas",
+    "parse_tool_arguments",
+    "supports_native_tools",
 ]
+
+
+@runtime_checkable
+class LLMProvider(Protocol):
+    """Structural provider protocol kept for backwards-compatible imports."""
+
+    async def chat(self, messages: list[dict], *,
+                   tools: list[dict] | None = None) -> str:
+        ...
+
+    async def ping(self) -> dict:
+        ...

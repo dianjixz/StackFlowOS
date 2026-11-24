@@ -29,6 +29,7 @@ from ..errors import SfoError
 from ..kernel import Context
 from ..util.jsonio import read_json, write_json
 from ..util.logging import get_logger
+from ..ai.llm import attach_runtime, complete
 from .operator import catalog_text
 
 MAX_HISTORY = 200
@@ -73,6 +74,19 @@ class ChatService:
         self._messages: list[ChatMessage] = []
         self._tasks: set[asyncio.Task] = set()
         self._closed = False
+        # Share usage/cost/context accounting with every provider instance;
+        # app.update_config swaps providers but keeps the same runtime.
+        try:
+            attach_runtime(provider, app)
+        except Exception:  # telemetry must never block chat startup
+            self.log.debug("could not attach llm runtime", exc_info=True)
+
+    async def on_config(self, config: Any) -> None:
+        """Re-attach after a hot config reload swapped the provider."""
+        try:
+            attach_runtime(self.provider, self.app)
+        except Exception:
+            self.log.debug("could not re-attach llm runtime", exc_info=True)
 
     # -- lifecycle --------------------------------------------------------
     async def start(self) -> None:
@@ -130,8 +144,19 @@ class ChatService:
             return
         reply_id = _mid()
         await self._emit_delta(reply_id, "", role="assistant", typing=True)
+        streamed: list[str] = []
+
+        async def on_delta(delta: dict) -> None:
+            if self._closed or delta.get("type") != "text":
+                return
+            chunk = str(delta.get("text") or "")
+            if not chunk:
+                return
+            streamed.append(chunk)
+            await self._emit_delta(reply_id, chunk, role="assistant")
+
         try:
-            answer = await self._compose(user_msg.text)
+            answer = await self._compose(user_msg.text, on_delta=on_delta)
         except SfoError as exc:
             answer = f"这个操作没做成：{exc.message}"
         except Exception as exc:  # never let the chat die
@@ -139,7 +164,13 @@ class ChatService:
             answer = f"我这边出了点问题：{exc}"
         if not answer:
             answer = "我在。"
-        await self._stream(answer, reply_id)
+        streamed_text = "".join(streamed)
+        if streamed_text and answer.startswith(streamed_text):
+            remaining = answer[len(streamed_text):]
+            if remaining:
+                await self._stream(remaining, reply_id)
+        else:
+            await self._stream(answer, reply_id)
         await self._append(ChatMessage(
             id=reply_id, role="assistant", text=answer, ts=_now_ms(),
             agent_id="agent-assistant",
@@ -184,7 +215,7 @@ class ChatService:
             self.log.exception("could not persist chat history")
 
     # -- composition ------------------------------------------------------
-    async def _compose(self, text: str) -> str:
+    async def _compose(self, text: str, *, on_delta: Any = None) -> str:
         intent = self._detect_intent(text)
         if intent == "project_access":
             return await self._do_project_access(text)
@@ -203,7 +234,7 @@ class ChatService:
         if intent == "help":
             return self._help_text()
         if self.provider is not None and getattr(self.provider, "name", "") != "mock":
-            return await self._llm_reply(text)
+            return await self._llm_reply(text, on_delta=on_delta)
         return self._fallback_text(text)
 
     def _detect_intent(self, text: str) -> str:
@@ -519,7 +550,7 @@ class ChatService:
             },
         }
 
-    async def _llm_reply(self, text: str) -> str:
+    async def _llm_reply(self, text: str, *, on_delta: Any = None) -> str:
         try:
             snap = self.app.snapshot()
         except Exception:
@@ -543,7 +574,9 @@ class ChatService:
                 history[-1].get("content") != text:
             history.append({"role": "user", "content": text})
         messages.extend(history)
-        raw = await self.provider.chat(messages)
+        result = await complete(self.provider, messages, role="assistant",
+                                on_delta=on_delta)
+        raw = result.text or ""
         action = _parse_action(raw)
         if action:
             runner = getattr(self.app, "operator_tool", None) or \
