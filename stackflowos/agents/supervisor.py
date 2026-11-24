@@ -896,14 +896,20 @@ class AgentSupervisor:
                 await self._terminate(work_id)
                 self._release(work_id)
                 self._close_log(work_id)
-            agent.status = "failed"
+            # A timeout is a budget/precondition stop, not an execution bug:
+            # keep it distinct from "failed" so a human raises the limit
+            # instead of hunting for a crash.
+            agent.status = "blocked"
             agent.error = f"task timed out after {timeout:g}s"
+            agent.error_code = "TASK_TIMEOUT"
             agent.summary = agent.error
             agent.touch()
-            self._emit("agent.failed", {
+            self._emit("agent.blocked", {
                 "agent_id": agent.id, "role": agent.role,
                 "project_id": agent.project_id, "task_id": agent.task_id,
-                "summary": agent.error, "timeout": True,
+                "summary": agent.error, "error": agent.error,
+                "status": "blocked", "error_code": "TASK_TIMEOUT",
+                "timeout": True,
             })
             task = None
             if self.task_lookup is not None:
@@ -993,7 +999,7 @@ class AgentSupervisor:
         if not isinstance(patch, dict):
             raise BadRequest("agent patch must be an object")
         allowed = {"status", "model", "display_name", "task_id", "project_id",
-                   "summary", "error", "stats", "last_seen"}
+                   "summary", "error", "error_code", "stats", "last_seen"}
         unknown = set(patch) - allowed
         if unknown:
             raise BadRequest(f"unknown agent fields: {sorted(unknown)}")
@@ -1017,22 +1023,43 @@ class AgentSupervisor:
         return agent
 
     def finish(self, agent_id: str, summary: str, *,
-               status: str = "done") -> Agent:
-        """Record a terminal-ish result on the roster."""
+               status: str = "done", error: str | None = None,
+               error_code: str | None = None) -> Agent:
+        """Record a terminal-ish result on the roster.
+
+        ``blocked`` and ``failed`` are deliberately distinct: ``blocked`` means a
+        precondition is missing (scope/workspace/task/limit) and ``failed``
+        means execution actually raised.  Both must carry a non-empty
+        ``error`` so the UI and the next agent can explain the stop; a status
+        without a reason would reproduce the "failed with an empty error"
+        diagnosis hole.
+        """
         if status not in AGENT_STATUSES:
             raise BadRequest(f"invalid agent status: {status!r}")
         agent = self.get(agent_id)
         agent.status = status
         agent.summary = str(summary or "")
+        agent.error_code = (str(error_code) if error_code else None)
+        if status in ("blocked", "failed", "dead"):
+            fallback = (f"agent stopped as {status} without a reason; "
+                        "inspect the event log for the last step")
+            agent.error = str(error or summary or fallback)
+        else:
+            agent.error = None
         agent.touch()
         self.save()
-        event_type = "agent.finished" if status == "done" else "agent.failed"
+        event_type = {"done": "agent.finished", "blocked": "agent.blocked",
+                      "failed": "agent.failed",
+                      "dead": "agent.terminated"}.get(status, "agent.finished")
         self._emit(event_type, {
             "agent_id": agent.id,
             "role": agent.role,
             "project_id": agent.project_id,
             "task_id": agent.task_id,
             "summary": agent.summary,
+            "status": agent.status,
+            "error": agent.error,
+            "error_code": agent.error_code,
         })
         if agent.status in TERMINAL_AGENT_STATUSES:
             self._schedule_drain()

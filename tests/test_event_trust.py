@@ -184,7 +184,8 @@ class EventTrustTests(unittest.IsolatedAsyncioTestCase):
             ALLOWED_RPC_EVENT_TYPES,
             frozenset({
                 "agent.step", "agent.working", "agent.waiting", "agent.failed",
-                "agent.finished", "agent.terminated", "agent.registered",
+                "agent.blocked", "agent.finished", "agent.terminated",
+                "agent.registered",
                 "task.review", "task.blocked",
                 "tool.invoked", "tool.result", "tool.failed", "tool.denied",
                 "unit.paused",

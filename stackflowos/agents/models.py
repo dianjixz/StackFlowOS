@@ -6,7 +6,14 @@ field here is safe to serialise into the roster snapshot.
 
 Status machine (docs/architecture.md §8.1)::
 
-    spawning -> idle -> working -> waiting -> done | failed | dead
+    spawning -> idle -> working -> waiting -> done | blocked | failed | dead
+
+``blocked`` means "could not start or could not continue because a
+precondition is missing" (no project scope, no workspace, task missing or
+already claimed, step/tool/time budget exhausted).  ``failed`` is reserved for
+an execution error (crash, LLM failure, broken tool).  The split matters to
+humans: ``failed`` sends them looking for a bug, ``blocked`` tells them to add a
+precondition instead.
 
 A spawn request that arrives while ``agents.max_workers`` workers are running
 is parked first::
@@ -24,10 +31,10 @@ from dataclasses import asdict, dataclass, field, fields
 
 #: Every legal agent status, in lifecycle order.
 AGENT_STATUSES = ("queued", "spawning", "idle", "working", "waiting",
-                  "done", "failed", "dead")
+                  "done", "blocked", "failed", "dead")
 
 #: Statuses from which no further work happens.
-TERMINAL_AGENT_STATUSES = ("done", "failed", "dead")
+TERMINAL_AGENT_STATUSES = ("done", "blocked", "failed", "dead")
 
 #: Human labels used to build display names.  Falls back to the capitalised
 #: role name for unknown roles.
@@ -71,6 +78,9 @@ class Agent:
     stats: dict = field(default_factory=dict)
     summary: str = ""
     error: str | None = None
+    #: Stable machine-readable reason for ``blocked``/``failed`` (e.g.
+    #: ``PROJECT_UNBOUND``, ``WORKSPACE_MISSING``, ``TASK_TIMEOUT``).
+    error_code: str | None = None
 
     def __post_init__(self) -> None:
         if not self.created_at:

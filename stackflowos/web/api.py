@@ -189,6 +189,8 @@ class WebAPI:
         r("DELETE", r"/api/projects/([^/]+)", self.project_delete)
         r("POST", r"/api/projects/([^/]+)/delete", self.project_delete)
         r("POST", r"/api/projects/([^/]+)/complete", self.project_complete)
+        r("GET", r"/api/projects/([^/]+)/healthcheck", self.project_healthcheck)
+        r("POST", r"/api/projects/([^/]+)/onboard", self.project_onboard)
         r("GET", r"/api/projects/([^/]+)/tasks", self.tasks_list)
         r("POST", r"/api/projects/([^/]+)/tasks", self.tasks_create)
         r("PATCH", r"/api/tasks/([^/]+)", self.task_patch)
@@ -242,21 +244,38 @@ class WebAPI:
     async def state(self, match, query, body):
         return _ok(self.app.snapshot())
 
+    @staticmethod
+    def _event_filters(query: dict) -> dict:
+        types: list[str] | None = None
+        if query.get("types"):
+            types = [t.strip() for t in str(query["types"]).split(",") if t.strip()]
+        return {
+            "types": types,
+            "source": query.get("source") or None,
+            "agent_id": query.get("agent_id") or None,
+            "since_ts": query.get("since_ts"),
+            "until_ts": query.get("until_ts"),
+        }
+
     async def events(self, match, query, body):
         since = _int_query(query, "since", 0, 0)
         limit = _int_query(query, "limit", 200, 1, 1000)
-        records = self.app.eventlog.since(since, limit=limit,
-                                          project_id=query.get("project_id") or None)
+        filters = self._event_filters(query)
+        if any(value not in (None, "") for value in filters.values()):
+            records = self.app.eventlog.query(
+                project_id=query.get("project_id") or None,
+                limit=limit, **filters)
+        else:
+            records = self.app.eventlog.since(
+                since, limit=limit,
+                project_id=query.get("project_id") or None)
         return _ok({"events": [r.to_dict() for r in records],
                     "last_seq": self.app.eventlog.last_seq})
 
     async def console(self, match, query, body):
-        types: list[str] | None = None
-        if query.get("types"):
-            types = [t.strip() for t in str(query["types"]).split(",") if t.strip()]
         limit = _int_query(query, "limit", 200, 1, 1000)
-        rows = self.app.console(types=types, project_id=query.get("project_id") or None,
-                                limit=limit)
+        rows = self.app.console(project_id=query.get("project_id") or None,
+                                limit=limit, **self._event_filters(query))
         return _ok({"events": rows})
 
     async def chat_history(self, match, query, body):
@@ -304,6 +323,12 @@ class WebAPI:
 
     async def project_get(self, match, query, body):
         return _ok(self.app.project_card(match.group(1)))
+
+    async def project_healthcheck(self, match, query, body):
+        return _ok(self.app.project_health(match.group(1)))
+
+    async def project_onboard(self, match, query, body):
+        return _ok(await self.app.onboard_project(match.group(1)))
 
     async def project_patch(self, match, query, body):
         project_id = match.group(1)

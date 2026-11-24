@@ -1752,3 +1752,22 @@ table { border-collapse: collapse; }
 .section-head h3 { display: flex; align-items: center; gap: 6px; }
 
 .unit-drawer-open { overflow: hidden; }
+
+/* project onboarding health report */
+.health-slot:empty { display: none; }
+.health-card { margin-top: 16px; }
+.health-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.health-head h3 { margin: 0; }
+.health-summary { margin-left: auto; color: var(--muted); font-size: 12px; }
+.health-rows { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.health-row { display: grid; grid-template-columns: max-content 140px minmax(0, 1fr); gap: 4px 10px; align-items: baseline; }
+.health-label { font-weight: 600; }
+.health-message { min-width: 0; overflow-wrap: anywhere; }
+.health-fix { grid-column: 2 / -1; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.health-blocker { color: var(--danger); font-size: 13px; margin-top: 6px; }
+@media (max-width: 700px) {
+  .health-row { grid-template-columns: max-content minmax(0, 1fr); }
+  .health-label { grid-column: 2; }
+  .health-message { grid-column: 2; }
+  .health-fix { grid-column: 2; }
+}

@@ -51,6 +51,37 @@ def _parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check environment and configuration")
     _add_common(doctor)
 
+    project = sub.add_parser(
+        "project", help="project onboarding / health (state reads only)")
+    project_sub = project.add_subparsers(dest="project_command")
+    project_health = project_sub.add_parser(
+        "health", help="check whether a project is ready for an agent")
+    project_health.add_argument("project_id")
+    project_health.add_argument("--json", action="store_true",
+                                help="print the raw report")
+    _add_common(project_health)
+    project_scaffold = project_sub.add_parser(
+        "scaffold", help="create the fixed workspace layout + brief.md")
+    project_scaffold.add_argument("project_id")
+    project_scaffold.add_argument("--json", action="store_true")
+    _add_common(project_scaffold)
+
+    events = sub.add_parser(
+        "events", help="replay the local event stream (agent/source/time filters)")
+    events.add_argument("--project", default=None)
+    events.add_argument("--agent", default=None, help="agent id (agent-...)")
+    events.add_argument("--source", default=None, help="exact event source")
+    events.add_argument("--types", default=None,
+                        help="comma-separated types or prefixes, e.g. tool,agent")
+    events.add_argument("--since-ts", type=int, default=None,
+                        help="inclusive start timestamp (epoch ms)")
+    events.add_argument("--until-ts", type=int, default=None,
+                        help="inclusive end timestamp (epoch ms)")
+    events.add_argument("--limit", type=int, default=200)
+    events.add_argument("--json", action="store_true",
+                        help="print raw JSONL records")
+    _add_common(events)
+
     status = sub.add_parser("status", help="print a running hub's state")
     status.add_argument("--url", default=None, help="hub base URL (default: config web host/port)")
     status.add_argument("--token", default=None,
@@ -167,6 +198,10 @@ def main(argv: list[str] | None = None) -> int:
             [a for a in (argv if argv is not None else sys.argv[1:])][1:]
         )
         return _worker_main(worker_args)
+    if args.command == "project":
+        return _run_cli(lambda: _project_cmd(args))
+    if args.command == "events":
+        return _run_cli(lambda: _events_cmd(args))
     if args.command == "doctor":
         return _run_cli(lambda: _doctor(args))
     if args.command == "status":
@@ -501,7 +536,7 @@ async def _run_aggregator(app, project_id: str, timeout: float = 25.0) -> None:
 
     existing = [a for a in app.supervisor.list(project_id=project_id)
                 if a.role == "aggregator"]
-    if any(a.status not in ("dead", "failed") for a in existing):
+    if any(a.status not in ("dead", "blocked", "failed") for a in existing):
         return
     try:
         agent = await app.spawn_agent("aggregator", project_id)
@@ -513,7 +548,7 @@ async def _run_aggregator(app, project_id: str, timeout: float = 25.0) -> None:
     while time.time() < deadline:
         await asyncio.sleep(0.5)
         current = app.supervisor.get(agent_id)
-        if current.status in ("done", "failed", "dead"):
+        if current.status in ("done", "blocked", "failed", "dead"):
             break
 
 async def _watch_demo(app, *, timeout: int, server=None) -> int:
@@ -578,6 +613,155 @@ def _worker_main(args) -> int:
             return 0
 
     return asyncio.run(_run())
+
+
+def _read_project_record(paths, project_id: str) -> tuple[dict, list[dict]] | None:
+    """Read one project record directly from state (no store writes)."""
+    from .util.jsonio import read_json
+
+    try:
+        raw = read_json(paths.state_dir / "state" / "projects.json",
+                        default=None)
+    except (OSError, ValueError) as exc:
+        print(f"cannot read project state: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    for item in raw.get("projects") or []:
+        if isinstance(item, dict) and str(item.get("id")) == project_id:
+            tasks = [task for task in (item.get("tasks") or [])
+                     if isinstance(task, dict)]
+            return item, tasks
+    print(f"project not found: {project_id}", file=sys.stderr)
+    return None
+
+
+def _offline_project_health(cfg, project: dict, tasks: list[dict]) -> dict:
+    """Build a health report from state files only (safe while the hub runs)."""
+    from .kernel import Context
+    from .projects.health import build_report
+    from .security import PolicyEngine
+    from .util.jsonio import read_json
+
+    project_id = str(project.get("id") or "")
+    memory_path = cfg.paths.state_dir / "state" / "memory" / f"{project_id}.json"
+    try:
+        memory = read_json(memory_path, default={})
+    except (OSError, ValueError):
+        memory = {}
+    if not isinstance(memory, dict):
+        memory = {}
+    ctx = Context(name="cli-project-health")
+    # ``eventlog=None`` is deliberate: an offline check must not write a
+    # second sequence into the live log.  PolicyEngine only needs the log for
+    # rule.* events; evaluate() is pure.
+    policy = PolicyEngine(
+        ctx, None,
+        rules_path=cfg.paths.state_dir / "state" / "rules.json",
+        config=cfg.security,
+        projects_root=cfg.paths.projects_dir,
+        workspace_resolver=lambda pid: (
+            project.get("workspace") if str(pid) == project_id else None),
+    )
+    return build_report(
+        project, tasks, memory=memory, policy=policy, agents=None,
+        eventlog=None, paths=cfg.paths)
+
+
+def _project_cmd(args) -> int:
+    command = getattr(args, "project_command", None)
+    if command == "health":
+        return _project_health_cmd(args)
+    if command == "scaffold":
+        return _project_scaffold_cmd(args)
+    print("usage: sfo project {health|scaffold} <project_id>", file=sys.stderr)
+    return 2
+
+
+def _project_health_cmd(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    loaded = _read_project_record(cfg.paths, args.project_id)
+    if loaded is None:
+        return 1
+    project, tasks = loaded
+    report = _offline_project_health(cfg, project, tasks)
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        summary = report["summary"]
+        print(f"{report['project_id']}  {report['status']}  "
+              f"ok={summary['ok']} warn={summary['warn']} fail={summary['fail']}"
+              f" unchecked={summary['unchecked']}")
+        for check in report["checks"]:
+            marker = {"ok": "[ok]  ", "warn": "[warn]", "fail": "[fail]"}.get(
+                check["status"], "[????]")
+            print(f"{marker} {check['label']}: {check['message']}")
+            fix = check.get("fix")
+            if fix and check["status"] != "ok":
+                print(f"        fix: {fix}")
+        if report.get("next_actions"):
+            print("\n下一步：")
+            for action in report["next_actions"]:
+                print(f"- {action}")
+    return 0 if report.get("ready") else 1
+
+
+def _project_scaffold_cmd(args) -> int:
+    from .projects import onboarding as project_onboarding
+
+    cfg = _build_config(args, for_web=False)
+    loaded = _read_project_record(cfg.paths, args.project_id)
+    if loaded is None:
+        return 1
+    project, _tasks = loaded
+    result = project_onboarding.ensure_scaffold(project, write=True)
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"workspace: {result['workspace']}")
+        print(f"created: {', '.join(result['created']) or '-'}")
+        print(f"missing: {', '.join(result['missing']) or '-'}")
+        print(f"brief:   {result['brief']}")
+        if result.get("refused"):
+            print(f"refused: {result['refused']}")
+        for warning in result.get("warnings") or []:
+            print(f"[warn] {warning}")
+        print("\n提示：scaffold 只写 workspace；看板种子任务与项目记忆由 hub 的 "
+              "POST /api/projects/<id>/onboard 补齐。")
+    return 0 if not result.get("missing") and not result.get("refused") else 1
+
+
+def _events_cmd(args) -> int:
+    """Replay the local event stream with agent/source/time filters."""
+    from .l2.eventlog import EventLog
+
+    cfg = _build_config(args, for_web=False)
+    log = EventLog(cfg.paths.events_dir)
+    types = [item.strip() for item in (args.types or "").split(",")
+             if item.strip()] or None
+    records = log.query(
+        project_id=args.project or None,
+        types=types,
+        source=args.source or None,
+        agent_id=args.agent or None,
+        since_ts=args.since_ts,
+        until_ts=args.until_ts,
+        limit=max(1, min(int(args.limit or 200), log.QUERY_MAX_LIMIT)),
+    )
+    for record in records:
+        row = record.to_dict()
+        if getattr(args, "json", False):
+            print(json.dumps(row, ensure_ascii=False))
+            continue
+        data = json.dumps(row.get("data") or {}, ensure_ascii=False,
+                          default=str)
+        if len(data) > 240:
+            data = data[:239] + "…"
+        print(f"{row.get('seq'):>7}  {row.get('ts')}  {row.get('type'):<24}  "
+              f"{row.get('source'):<22}  {row.get('project_id') or '-':<6}  {data}")
+    if not records:
+        print("no matching events", file=sys.stderr)
+    return 0
 
 
 def _doctor(args) -> int:

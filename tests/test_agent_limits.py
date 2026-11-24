@@ -47,6 +47,7 @@ class RunnerLimitTests(unittest.IsolatedAsyncioTestCase):
                      "description": "x", "status": "todo", "role": "coder",
                      "artifacts": [], "notes": []}
         self.sys = FakeSysAPI(task=self.task)
+        self.sys.project["workspace"] = str(self.ws)
         self.agent = Agent(id="agent-coder-1", role="coder",
                            project_id="p-1", task_id="t-1")
         self.executor = ToolExecutor(
@@ -67,12 +68,13 @@ class RunnerLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("超时", result.summary)
         self.assertIn("task_timeout_s", result.summary)
         self.assertEqual(self.sys.task["status"], "blocked")
-        failed = [event for event in self.sys.events
-                  if event.get("type") == "agent.failed"]
-        self.assertTrue(failed)
-        self.assertTrue(failed[-1]["data"].get("timeout"))
-        self.assertEqual(failed[-1]["data"].get("task_timeout_s"), 0.05)
-        self.assertEqual(self.agent.status, "failed")
+        blocked = [event for event in self.sys.events
+                   if event.get("type") == "agent.blocked"]
+        self.assertTrue(blocked)
+        self.assertTrue(blocked[-1]["data"].get("timeout"))
+        self.assertEqual(blocked[-1]["data"].get("task_timeout_s"), 0.05)
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "TASK_TIMEOUT")
 
     async def test_tool_call_cap_stops_the_run(self) -> None:
         cfg = AgentsCfg(max_steps=50, task_timeout_s=60,
@@ -83,11 +85,13 @@ class RunnerLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.steps, 2)
         self.assertIn("max_tool_calls_per_task", result.summary)
         self.assertEqual(self.sys.task["status"], "blocked")
-        failed = [event for event in self.sys.events
-                  if event.get("type") == "agent.failed"]
-        self.assertTrue(failed)
-        self.assertEqual(failed[-1]["data"].get("limit"),
+        blocked = [event for event in self.sys.events
+                   if event.get("type") == "agent.blocked"]
+        self.assertTrue(blocked)
+        self.assertEqual(blocked[-1]["data"].get("limit"),
                          "max_tool_calls_per_task")
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "TOOL_LIMIT")
 
     async def test_reload_limits_applies_live_and_mid_run(self) -> None:
         cfg = AgentsCfg(max_steps=50, task_timeout_s=60,

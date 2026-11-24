@@ -288,14 +288,15 @@ class SupervisorTimeoutReaperTests(_SupervisorHelpers,
         self.assertEqual(info["task_id"], "t-1")
         self.assertTrue(info.get("reassigned"))
         self.assertEqual(requeued, ["t-1"])
-        self.assertEqual(agent.status, "failed")
+        self.assertEqual(agent.status, "blocked")
+        self.assertEqual(agent.error_code, "TASK_TIMEOUT")
         self.assertIn("timed out", agent.error or "")
         # The replacement parked on the queue (max_workers is still 1).
         self.assertEqual(sup.queue_snapshot()["count"], 1)
         self.assertEqual(sup.queue_snapshot()["queued"][0]["reason"],
                          "timeout_retry")
         self.assertIn("agent.timeout", self.eventlog.types())
-        self.assertIn("agent.failed", self.eventlog.types())
+        self.assertIn("agent.blocked", self.eventlog.types())
 
     async def test_reap_skips_agents_inside_the_deadline(self) -> None:
         sup = self._make(max_workers=1, task_timeout_s=100)

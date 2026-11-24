@@ -457,6 +457,39 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                                       unit_id="coder.5")
         self.assertEqual(new_agent.id, "agent-coder-2")
 
+    # -- terminal semantics ----------------------------------------------
+    async def test_finish_blocked_is_distinct_from_failed(self) -> None:
+        agent = await self.sup.spawn("coder", "p-1", task_id="t-1")
+        blocked = self.sup.finish(agent.id, "workspace is missing",
+                                  status="blocked",
+                                  error_code="WORKSPACE_MISSING")
+        self.assertEqual(blocked.status, "blocked")
+        self.assertEqual(blocked.error, "workspace is missing")
+        self.assertEqual(blocked.error_code, "WORKSPACE_MISSING")
+        self.assertIn("agent.blocked", self.eventlog.types())
+        self.assertNotIn("agent.failed", self.eventlog.types())
+        # The process is terminal, so capacity is released.
+        self.assertEqual(self.sup.stats()["running"], 0)
+
+    async def test_finish_failure_without_reason_is_never_silent(self) -> None:
+        agent = await self.sup.spawn("coder", "p-1", task_id="t-1")
+        failed = self.sup.finish(agent.id, "", status="failed")
+        self.assertEqual(failed.status, "failed")
+        self.assertTrue(failed.error, "failed must always carry a reason")
+        self.assertIn("without a reason", failed.error)
+        self.assertIn("agent.failed", self.eventlog.types())
+
+    async def test_finish_done_clears_stale_error(self) -> None:
+        agent = await self.sup.spawn("coder", "p-1", task_id="t-1")
+        self.sup.update(agent.id, {"status": "working",
+                                   "error": "old failure",
+                                   "error_code": "OLD"})
+        done = self.sup.finish(agent.id, "finished", status="done")
+        self.assertEqual(done.status, "done")
+        self.assertIsNone(done.error)
+        self.assertIsNone(done.error_code)
+
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -535,7 +535,7 @@ class ChatService:
                  "status": agent.get("status"),
                  "task_id": agent.get("task_id")}
                 for agent in (snap.get("agents") or [])
-                if agent.get("status") not in ("done", "failed", "dead")
+                if agent.get("status") not in ("done", "blocked", "failed", "dead")
             ][:12],
             "approvals": [
                 {"id": approval.get("id"),

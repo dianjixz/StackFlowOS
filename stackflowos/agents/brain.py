@@ -46,6 +46,8 @@ class AgentView:
     workspace: str = ""
     recent: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
+    #: Project memory seeded at onboarding (``goal``/``conventions``/...).
+    memory: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -164,7 +166,10 @@ class MockBrain:
         """Return the next tool call or finish for ``view``."""
         step = int(view.step or 0)
         if step >= self.max_steps:
-            return _finish(f"达到步数上限（{self.max_steps}），停止。", "failed")
+            # A budget limit is a precondition for continuing, not an
+            # execution error: report blocked so a human knows to raise the
+            # limit (failed would send them looking for a bug).
+            return _finish(f"达到步数上限（{self.max_steps}），停止。", "blocked")
         planner = {
             "lead": self._lead,
             "architect": self._architect,

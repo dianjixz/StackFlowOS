@@ -59,7 +59,11 @@ class AttachProjectTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(card["external"])
         self.assertEqual(card["workspace_mode"], "attached-ro")
         self.assertEqual(Path(card["workspace"]), self.external.resolve())
-        self.assertEqual(card["total_tasks"], 0)
+        # Attaching seeds one state-only onboarding task (the external tree
+        # itself is never touched); that is the work signal for the first agent.
+        self.assertEqual(card["total_tasks"], 1)
+        tasks = self.app.projects.task_list(project_id=card["id"])
+        self.assertTrue(tasks[0].title.startswith("入职自检"))
 
         listing = await self.app.operator_tool(
             "project.files", {"project_id": card["id"], "path": "src"})
@@ -150,17 +154,20 @@ class AttachProjectTests(unittest.IsolatedAsyncioTestCase):
         await self.app.chat.send_user(f"打开 {self.external} 这个项目")
         deadline = asyncio.get_running_loop().time() + 10
         project = None
+        history = []
         while asyncio.get_running_loop().time() < deadline:
             for candidate in self.app.projects.list():
                 if Path(candidate.workspace) == self.external.resolve():
                     project = candidate
                     break
-            if project is not None:
+            history = self.app.chat.history(5)
+            replied = (history and history[-1].get("role") == "assistant"
+                       and "接入目录" in history[-1].get("text", ""))
+            if project is not None and replied:
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
         self.assertIsNotNone(project, "chat did not attach the directory")
         self.assertEqual(project.workspace_mode, "attached-ro")
-        history = self.app.chat.history(5)
         self.assertIn("已接入目录", history[-1]["text"])
 
     async def test_file_explanations_are_human_readable(self):

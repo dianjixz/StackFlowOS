@@ -140,6 +140,8 @@ export const api = {
   createProject: (name, goal) => requestJson('/api/projects', { method: 'POST', body: { name, goal } }),
   attachProject: (payload) => requestJson('/api/projects/attach', { method: 'POST', body: payload }),
   getProject: (id) => requestJson(`/api/projects/${enc(id)}`),
+  getProjectHealth: (id) => requestJson(`/api/projects/${enc(id)}/healthcheck`),
+  onboardProject: (id) => requestJson(`/api/projects/${enc(id)}/onboard`, { method: 'POST', body: {} }),
   patchProject: (id, patch) => requestJson(`/api/projects/${enc(id)}`, { method: 'PATCH', body: { patch } }),
   archiveProject: (id) => requestJson(`/api/projects/${enc(id)}/archive`, { method: 'POST', body: {} }),
   setProjectAccess: (id, allowWrites, confirm = false) =>

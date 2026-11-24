@@ -267,6 +267,22 @@ class RpcScopeTests(unittest.IsolatedAsyncioTestCase):
         await self._assert_denied(worker, "event.since",
                                   {"project_id": self.pb.id})
 
+    async def test_project_health_and_memory_list_are_own_project(self):
+        worker = self._worker()
+        report = await self._call(worker, "project.health", {})
+        self.assertEqual(report["project_id"], self.pa.id)
+        self.assertTrue(report["checks"])
+        binding = next(check for check in report["checks"]
+                       if check["id"] == "agent.binding")
+        self.assertEqual(binding["status"], "ok")
+        await self._assert_denied(worker, "project.health",
+                                  {"project_id": self.pb.id})
+
+        memory = await self._call(worker, "memory.list", {})
+        self.assertIsInstance(memory.get("memory"), dict)
+        await self._assert_denied(worker, "memory.list",
+                                  {"project_id": self.pb.id})
+
     async def test_event_append_forces_project_and_source(self):
         worker = self._worker()
         seq = self.app.eventlog.last_seq

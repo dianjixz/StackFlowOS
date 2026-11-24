@@ -182,9 +182,16 @@ def _compact_state(view: Any) -> str:
             for event in events[-6:] if isinstance(event, dict)
         ],
         "workspace": getattr(view, "workspace", ""),
+        "memory": {},
         "step": getattr(view, "step", 0),
         "last_tool_results": [],
     }
+    memory = getattr(view, "memory", None)
+    if isinstance(memory, dict):
+        state["memory"] = {
+            str(key): _clip_value(value, 400)
+            for key, value in list(memory.items())[:20]
+        }
     for result in (getattr(view, "tool_results", None) or [])[-3:]:
         if not isinstance(result, dict):
             continue

@@ -233,6 +233,10 @@ class EventLog:
 
     def query(self, *, project_id: str | None = None,
               types: list[str] | None = None,
+              source: str | None = None,
+              agent_id: str | None = None,
+              since_ts: int | None = None,
+              until_ts: int | None = None,
               limit: int = 200) -> list[EventRecord]:
         """Return up to ``limit`` records matching the filters, oldest first.
 
@@ -243,8 +247,14 @@ class EventLog:
         reversed to oldest-first so callers keep the console's ordering.
 
         ``types`` matches exact event types or dotted prefixes: ``["rule"]``
-        matches ``rule`` and ``rule.created`` but not ``rulebook``.  The scan is
-        bounded by :attr:`query_max_scan_records` /
+        matches ``rule`` and ``rule.created`` but not ``rulebook``.
+        ``source`` is an exact match; ``agent_id`` matches the hub-assigned
+        ``agent:<id>`` source (and the bare id / ``data.agent_id`` for older
+        records), which is what makes "show me this agent's actions" an
+        ordinary replay query.  ``since_ts``/``until_ts`` are inclusive
+        millisecond timestamps (``record.ts``).
+
+        The scan is bounded by :attr:`query_max_scan_records` /
         :attr:`query_max_scan_bytes`; history beyond that is not searched.
         """
         try:
@@ -256,11 +266,27 @@ class EventLog:
                 f"limit must be between 1 and {self.QUERY_MAX_LIMIT}")
         project = str(project_id) if project_id else None
         type_match = _type_matcher(types)
+        source_text = str(source) if source else None
+        target_agent = str(agent_id) if agent_id else None
+        start_ts = _optional_ms(since_ts, "since_ts")
+        end_ts = _optional_ms(until_ts, "until_ts")
 
         def keep(record: EventRecord) -> bool:
             if project is not None and record.project_id != project:
                 return False
             if type_match is not None and not type_match(record.type):
+                return False
+            if source_text is not None and record.source != source_text:
+                return False
+            if target_agent is not None:
+                owned = record.source in (target_agent, f"agent:{target_agent}")
+                if not owned and isinstance(record.data, dict):
+                    owned = str(record.data.get("agent_id") or "") == target_agent
+                if not owned:
+                    return False
+            if start_ts is not None and int(record.ts or 0) < start_ts:
+                return False
+            if end_ts is not None and int(record.ts or 0) > end_ts:
                 return False
             return True
 
@@ -778,6 +804,19 @@ def _iter_lines_reversed(path: Path, byte_budget: list[int],
         if pos == 0 and buffered:
             # A partial first line (budget exhausted mid-file) is not a record.
             yield buffered
+
+
+def _optional_ms(value: Any, name: str) -> int | None:
+    """Coerce an optional millisecond timestamp; reject garbage with a 400."""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise BadRequest(f"{name} must be an integer millisecond timestamp") from None
+    if number < 0:
+        raise BadRequest(f"{name} must be non-negative")
+    return number
 
 
 def _type_matcher(types: list[str] | None) -> Callable[[str], bool] | None:

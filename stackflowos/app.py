@@ -33,6 +33,8 @@ from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler
 from .memory import MemoryStore
 from .protocol import PROTOCOL_VERSION
 from .projects import ProjectStore, plan_for
+from .projects import onboarding as project_onboarding
+from .projects.health import build_report as build_project_health
 from .security import (ApprovalBroker, PolicyEngine, Principal,
                        RpcAuthRegistry, project_workspace)
 from .session.agent_chat import AgentChatService
@@ -82,6 +84,9 @@ PRINCIPAL_ACTIONS = frozenset({
     # ``capability.call`` forwards the live principal so the extension can run
     # the same approval/audit path as an in-process tool call.
     "capability.call",
+    # ``project.health`` reports the caller's own agent binding when the call
+    # comes from a worker.
+    "project.health",
 })
 
 #: Event types a remote RPC caller may append (X2, plan §5.2.7).  Workers and
@@ -92,7 +97,7 @@ PRINCIPAL_ACTIONS = frozenset({
 #: an unknown/new type cannot silently become forgeable.
 ALLOWED_RPC_EVENT_TYPES = frozenset({
     "agent.step", "agent.working", "agent.waiting", "agent.failed",
-    "agent.finished", "agent.terminated", "agent.registered",
+    "agent.blocked", "agent.finished", "agent.terminated", "agent.registered",
     "task.review", "task.blocked",
     "tool.invoked", "tool.result", "tool.failed", "tool.denied",
     "unit.paused",
@@ -385,7 +390,7 @@ class App:
                             continue
                         running = [a for a in self.supervisor.list(project_id=project.id)
                                    if a.role == "aggregator"
-                                   and a.status not in ("done", "failed", "dead")]
+                                   and a.status not in ("done", "blocked", "failed", "dead")]
                         if running:
                             continue
                         try:
@@ -427,64 +432,85 @@ class App:
             task.cancel()
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
-        try:
-            for agent in self.supervisor.list():
-                if agent.status not in ("done", "failed", "dead"):
-                    await self.supervisor.kill(agent.id, reason="hub_shutdown")
-        except Exception:
-            self.log.exception("failed to stop agents")
-        close_supervisor = getattr(self.supervisor, "close", None)
-        if callable(close_supervisor):
+        # ``start()`` may fail before all services exist (the hub lock is
+        # acquired first, for example).  Stopping a half-built App must be a
+        # no-op for the missing pieces instead of an AttributeError.
+        supervisor = getattr(self, "supervisor", None)
+        if supervisor is not None:
             try:
-                await maybe_await(close_supervisor())
+                for agent in supervisor.list():
+                    if agent.status not in ("done", "blocked", "failed", "dead"):
+                        await supervisor.kill(agent.id, reason="hub_shutdown")
             except Exception:
-                self.log.exception("agent supervisor close failed")
-        try:
-            await self.failure.stop()
-        except Exception:
-            self.log.exception("failure manager stop failed")
-        try:
-            await self.chat.stop()
-        except Exception:
-            self.log.exception("chat stop failed")
+                self.log.exception("failed to stop agents")
+            close_supervisor = getattr(supervisor, "close", None)
+            if callable(close_supervisor):
+                try:
+                    await maybe_await(close_supervisor())
+                except Exception:
+                    self.log.exception("agent supervisor close failed")
+        failure = getattr(self, "failure", None)
+        if failure is not None:
+            try:
+                await failure.stop()
+            except Exception:
+                self.log.exception("failure manager stop failed")
+        chat = getattr(self, "chat", None)
+        if chat is not None:
+            try:
+                await chat.stop()
+            except Exception:
+                self.log.exception("chat stop failed")
         if getattr(self, "agent_chat", None) is not None:
             try:
                 await self.agent_chat.stop()
             except Exception:
                 self.log.exception("agent chat stop failed")
-        try:
-            await stop_extensions(self.extensions)
-        except Exception:
-            self.log.exception("extension shutdown failed")
-        try:
-            self.eventlog.append("sys.shutdown", {}, source="sys")
-        except Exception:
-            pass
-        try:
-            await self.transport.stop()
-        except Exception:
-            self.log.exception("transport stop failed")
-        try:
-            self.allocator.cleanup()
-        except Exception:
-            self.log.exception("allocator cleanup failed")
-        try:
-            result = self.eventlog.close()
-            if hasattr(result, "__await__"):
-                await result
-        except Exception:
-            pass
+        if getattr(self, "extensions", None) is not None:
+            try:
+                await stop_extensions(self.extensions)
+            except Exception:
+                self.log.exception("extension shutdown failed")
+        eventlog = getattr(self, "eventlog", None)
+        if eventlog is not None:
+            try:
+                eventlog.append("sys.shutdown", {}, source="sys")
+            except Exception:
+                pass
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            try:
+                await transport.stop()
+            except Exception:
+                self.log.exception("transport stop failed")
+        allocator = getattr(self, "allocator", None)
+        if allocator is not None:
+            try:
+                allocator.cleanup()
+            except Exception:
+                self.log.exception("allocator cleanup failed")
+        if eventlog is not None:
+            try:
+                result = eventlog.close()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
         backend = getattr(self, "storage_backend", None)
         if backend is not None:
             try:
                 backend.close()
             except Exception:
                 self.log.exception("storage backend close failed")
-        try:
-            await self.ctx.dispose()
-        except Exception:
-            self.log.exception("context dispose failed")
-        self.rpc_auth.revoke_all()
+        ctx = getattr(self, "ctx", None)
+        if ctx is not None:
+            try:
+                await ctx.dispose()
+            except Exception:
+                self.log.exception("context dispose failed")
+        rpc_auth = getattr(self, "rpc_auth", None)
+        if rpc_auth is not None:
+            rpc_auth.revoke_all()
         self._release_hub_lock()
 
     # ------------------------------------------------------------------
@@ -591,6 +617,7 @@ class App:
             "project.create": self._project_create,
             "project.list": self._project_list,
             "project.get": self._project_get,
+            "project.health": self._project_health,
             "project.update": self._project_update,
             "project.archive": self._project_archive,
             "project.delete": self._project_delete,
@@ -612,6 +639,7 @@ class App:
             "event.append": self._event_append,
             "event.since": self._event_since,
             "memory.get": self._memory_get,
+            "memory.list": self._memory_list,
             "memory.set": self._memory_set,
             "chat.send": self._chat_send,
         }
@@ -778,7 +806,9 @@ class App:
             return data
         if action == "event.since":
             return self._force_own_project(principal, data)
-        if action in ("memory.get", "memory.set"):
+        if action in ("memory.get", "memory.list", "memory.set"):
+            return self._force_own_project(principal, data)
+        if action == "project.health":
             return self._force_own_project(principal, data)
         if action == "unit.list":
             # The registry filter is the only view a unit gets: no global
@@ -1182,7 +1212,7 @@ class App:
                            exc_info=True)
         now = now_ms()
         for agent in self.supervisor.list():
-            if agent.unit_id == work_id and agent.status not in ("dead", "done", "failed"):
+            if agent.unit_id == work_id and agent.status not in ("dead", "done", "blocked", "failed"):
                 try:
                     self.supervisor.update(agent.id, {"last_seen": now})
                 except Exception:
@@ -1247,7 +1277,7 @@ class App:
 
     def _mark_agent_dead(self, work_id: str, *, reason: str) -> None:
         agent = self._agent_for_unit(work_id)
-        if agent is None or agent.status in ("done", "failed", "dead"):
+        if agent is None or agent.status in ("done", "blocked", "failed", "dead"):
             return
         try:
             self.supervisor.update(agent.id, {"status": "dead", "error": reason})
@@ -1542,9 +1572,14 @@ class App:
         return agent.to_dict()
 
     async def _agent_finish(self, data, src):
-        agent = self.supervisor.finish(str(data.get("agent_id") or ""),
-                                       str(data.get("summary") or ""),
-                                       status=str(data.get("status") or "done"))
+        agent = self.supervisor.finish(
+            str(data.get("agent_id") or ""),
+            str(data.get("summary") or ""),
+            status=str(data.get("status") or "done"),
+            error=(str(data["error"]) if data.get("error") is not None else None),
+            error_code=(str(data["error_code"])
+                        if data.get("error_code") is not None else None),
+        )
         return agent.to_dict()
 
     async def _agent_spawn(self, data, src):
@@ -1669,17 +1704,55 @@ class App:
         )
         return {"seq": record.seq, "id": record.id}
 
+    async def _project_health(self, data, src, principal=None):
+        project_id = str(data.get("project_id") or "")
+        if not project_id and principal is not None:
+            project_id = str(principal.project_id or "")
+        agent = None
+        agent_id = getattr(principal, "agent_id", None) if principal else None
+        if agent_id:
+            try:
+                agent = self.supervisor.get(str(agent_id))
+            except SfoError:
+                agent = None
+        return self.project_health(project_id, agent=agent)
+
     async def _event_since(self, data, src):
-        records = self.eventlog.since(
-            int(data.get("seq") or 0),
-            limit=int(data.get("limit") or 500),
-            project_id=data.get("project_id"),
-        )
+        # ``seq`` keeps the incremental SSE-style contract; the optional
+        # filters turn the same call into a replay query (by agent/source/time/
+        # type).  Older clients that only send ``seq`` are unchanged.
+        filters = any(data.get(key) not in (None, "")
+                      for key in ("source", "agent_id", "since_ts", "until_ts",
+                                  "types"))
+        limit = int(data.get("limit") or 500)
+        if filters:
+            types = data.get("types")
+            if isinstance(types, str):
+                types = [item.strip() for item in types.split(",") if item.strip()]
+            records = self.eventlog.query(
+                project_id=data.get("project_id"),
+                types=types,
+                source=data.get("source") or None,
+                agent_id=data.get("agent_id") or None,
+                since_ts=data.get("since_ts"),
+                until_ts=data.get("until_ts"),
+                limit=limit,
+            )
+        else:
+            records = self.eventlog.since(
+                int(data.get("seq") or 0),
+                limit=limit,
+                project_id=data.get("project_id"),
+            )
         return {"events": [r.to_dict() for r in records]}
 
     async def _memory_get(self, data, src):
         return {"value": self.memory.get(str(data.get("project_id") or ""),
                                          str(data.get("key") or ""))}
+
+    async def _memory_list(self, data, src):
+        project_id = str(data.get("project_id") or "")
+        return {"memory": self.memory.all(project_id)}
 
     async def _memory_set(self, data, src):
         value = self.memory.set(str(data.get("project_id") or ""),
@@ -1710,6 +1783,9 @@ class App:
             name, goal, created_by=created_by,
             milestones=[{"title": title} for title in milestone_titles],
         )
+        # The house must be readable before the work starts: nameplate,
+        # fixed layout, seed task and memory are written before planner tasks.
+        self._onboard_project(project, write_files=True, seed_task=True)
         title_to_milestone = {m.title: m.id for m in project.milestones}
         for item in plan:
             self.projects.add_task(
@@ -1754,17 +1830,100 @@ class App:
         project = self.projects.create(
             name or target.name, goal, created_by=created_by,
             workspace=target, workspace_mode=mode)
+        # Never mutate an attached tree implicitly: inspect it, seed the
+        # board/memory (state only), and let project.health report missing
+        # layout with a fix.  An attached-rw project opts in explicitly.
+        onboard = self._onboard_project(project, write_files=False,
+                                        seed_task=True)
         self.eventlog.append("project.attach.completed", {
             "project_id": project.id,
             "name": project.name,
             "path": project.workspace,
             "workspace_mode": mode,
             "by": created_by,
+            "onboarded": onboard,
         }, source="operator", project_id=project.id)
         card = self.project_card(project.id)
         card["attached_now"] = True
         card["existing"] = False
         return card
+
+    def _seed_project_memory(self, project: Any) -> list[str]:
+        """Write onboarding memory keys that do not exist yet (never overwrite)."""
+        seed = project_onboarding.memory_seed(project)
+        seeded: list[str] = []
+        for key, value in seed.items():
+            try:
+                if self.memory.get(project.id, key) is None:
+                    self.memory.set(project.id, key, value)
+                    seeded.append(key)
+            except SfoError:
+                self.log.warning("could not seed memory %s/%s", project.id, key,
+                                 exc_info=True)
+        return seeded
+
+    def _onboard_project(self, project: Any, *, write_files: bool,
+                         seed_task: bool = True) -> dict:
+        """Apply the onboarding kit to one project and record what changed.
+
+        Filesystem scaffolding is best effort: a read-only or permission-denied
+        workspace must not fail project creation.  The health check exposes the
+        missing pieces with a fix, which is the whole point of the kit.
+        """
+        scaffold = project_onboarding.ensure_scaffold(project, write=write_files)
+        seeded = self._seed_project_memory(project)
+        seed_task_id: str | None = None
+        try:
+            existing = self.projects.task_list(project_id=project.id)
+        except SfoError:
+            existing = []
+        if seed_task and not project_onboarding.seed_task_present(existing):
+            spec = project_onboarding.seed_task_spec(project)
+            try:
+                task = self.projects.add_task(
+                    project.id, spec["title"], spec["description"],
+                    role=spec["role"], priority=spec["priority"],
+                    created_by=spec["created_by"])
+                seed_task_id = task.id
+            except SfoError:
+                self.log.warning("could not seed task for %s", project.id,
+                                 exc_info=True)
+        payload = {
+            "project_id": project.id,
+            "workspace": str(project.workspace),
+            "write_files": bool(write_files),
+            "scaffold": scaffold,
+            "memory_keys": seeded,
+            "seed_task_id": seed_task_id,
+        }
+        try:
+            self.eventlog.append("project.onboarded", payload, source="sys",
+                                 project_id=project.id)
+        except Exception:  # pragma: no cover - telemetry is best effort
+            self.log.debug("project.onboarded append failed", exc_info=True)
+        return payload
+
+    async def onboard_project(self, project_id: str, *,
+                              by: str = "human:operator") -> dict:
+        """Idempotently (re)apply scaffold, seed task and memory to a project."""
+        project = self.projects.get(project_id)
+        self.eventlog.append("project.onboard.requested", {
+            "project_id": project_id, "by": by,
+        }, source="operator", project_id=project_id)
+        result = self._onboard_project(project, write_files=True,
+                                       seed_task=True)
+        result["health"] = self.project_health(project_id)
+        return result
+
+    def project_health(self, project_id: str, *, agent: Any = None) -> dict:
+        """Return the project health report (see ``projects.health``)."""
+        project = self.projects.get(project_id)
+        tasks = self.projects.task_list(project_id=project_id)
+        agents = self.supervisor.list(project_id=project_id)
+        return build_project_health(
+            project, tasks, memory=self.memory, policy=self.policy,
+            agents=agents, agent=agent, security=self.config.security,
+            paths=self.paths, eventlog=self.eventlog)
 
     async def set_project_access(self, project_id: str, *, allow_writes: bool,
                                  by: str = "human:operator") -> dict:
@@ -1904,7 +2063,7 @@ class App:
     async def _wait_agents_stopped(self, project_id: str, *,
                                    timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
-        terminal = ("done", "failed", "dead")
+        terminal = ("done", "blocked", "failed", "dead")
         while time.monotonic() < deadline:
             active_agents = [agent for agent in self.supervisor.list(project_id=project_id)
                              if agent.status not in terminal]
@@ -1928,7 +2087,7 @@ class App:
                 agent = self.supervisor.get(principal)
             except Exception:
                 agent = None
-            if agent is not None and agent.status not in ("dead", "failed", "done"):
+            if agent is not None and agent.status not in ("dead", "blocked", "failed", "done"):
                 continue
             try:
                 self.approvals.decide(request.id, decision="deny", by="system",
@@ -2061,7 +2220,33 @@ class App:
 
     async def spawn_agent(self, role: str, project_id: str | None = None,
                           task_id: str | None = None) -> dict:
-        agent = await self.supervisor.spawn(role, project_id, task_id=task_id,
+        """Spawn a worker with an explicit, ready project scope.
+
+        An agent without a project can do nothing useful: every tool is either
+        scoped away or escalates to high risk, and the process burns its step
+        budget before ending as a mystery failure.  Refuse the spawn instead
+        and name the missing precondition.
+        """
+        if not project_id:
+            raise BadRequest(
+                "派工必须绑定项目（project_id）：没有 scope 的 Agent 无法访问"
+                "工作区/任务，最终只会以 blocked 结束。",
+                detail={"role": role, "reason": "project scope is required"})
+        project = self.projects.get(str(project_id))
+        if project.status == "archived":
+            raise Conflict(f"project {project_id} is archived; unarchive or "
+                           "pick another project",
+                           detail={"project_id": project.id,
+                                   "status": project.status})
+        workspace = Path(str(project.workspace or ""))
+        if not workspace.is_absolute() or not workspace.is_dir():
+            raise Conflict(
+                f"project {project_id} has no usable workspace: {workspace}",
+                detail={"project_id": project.id,
+                        "workspace": str(workspace),
+                        "fix": "恢复工作区或重新接入项目后重试"})
+        agent = await self.supervisor.spawn(role, project.id,
+                                            task_id=task_id,
                                             reason="operator_requested")
         return agent.to_dict()
 
@@ -2542,8 +2727,11 @@ class App:
             "stats": self.stats(),
         }
 
-    def console(self, *, types: list[str] | None = None, project_id: str | None = None,
-                limit: int = 200) -> list[dict]:
+    def console(self, *, types: list[str] | None = None,
+                project_id: str | None = None, limit: int = 200,
+                source: str | None = None, agent_id: str | None = None,
+                since_ts: int | None = None,
+                until_ts: int | None = None) -> list[dict]:
         """Return filtered events oldest-first, searching memory *and* files.
 
         L7: never derive the window from ``tail()`` first — an old project's
@@ -2551,8 +2739,10 @@ class App:
         the filters while scanning backwards, so a matching event is found
         regardless of how recently it was appended.
         """
-        records = self.eventlog.query(types=types, project_id=project_id,
-                                      limit=limit)
+        records = self.eventlog.query(
+            types=types, project_id=project_id, limit=limit,
+            source=source, agent_id=agent_id, since_ts=since_ts,
+            until_ts=until_ts)
         return [r.to_dict() for r in records]
 
 

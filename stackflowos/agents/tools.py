@@ -227,6 +227,9 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
           {"project_id": "string"}),
     _spec("project.get", "data.read", "读取项目",
           {"project_id": "string"}),
+    _spec("project.health", "data.read",
+          "检查项目是否就绪（scope/workspace/目录/看板/记忆/权限/审计）并给出修复建议",
+          {"project_id": "string"}),
     _spec("project.update", "project.update", "更新项目字段（如 brief）",
           {"project_id": "string", "patch": "object"}, "medium"),
     _spec("project.archive", "project.archive", "归档项目并停止其 Agent（保留工作区）",
@@ -241,10 +244,15 @@ TOOLS: dict[str, ToolSpec] = {spec.name: spec for spec in (
           {"agent_id": "string", "reason": "string"}, "high"),
     _spec("agent.list", "data.read", "列出 agent",
           {"project_id": "string"}),
-    _spec("event.query", "data.read", "按 seq 查询事件",
-          {"project_id": "string", "since": "integer", "limit": "integer"}),
+    _spec("event.query", "data.read",
+          "查询事件（seq 增量或按 agent/source/type/时间回放）",
+          {"project_id": "string", "since": "integer", "limit": "integer",
+           "types": "string", "source": "string", "agent_id": "string",
+           "since_ts": "integer", "until_ts": "integer"}),
     _spec("memory.get", "data.read", "读取项目记忆",
           {"project_id": "string", "key": "string"}),
+    _spec("memory.list", "data.read", "列出项目记忆键值",
+          {"project_id": "string"}),
     _spec("memory.set", "data.write", "写入项目记忆",
           {"project_id": "string", "key": "string", "value": "object"}, "medium"),
     _spec("unit.list", "data.read", "列出在线单元", {}),
@@ -1238,7 +1246,21 @@ class ToolExecutor:
             scope = {"project_id": project_id, "since": since,
                      "limit": limit_n} if project_id else {"since": since,
                                                            "limit": limit_n}
+            for key in ("types", "source", "agent_id"):
+                value = _arg_optional_str(args, key)
+                if value:
+                    scope[key] = value
             return scope, "读取事件", f"since={since} limit={limit_n}"
+
+        if name == "project.health":
+            project_id = _arg_optional_str(args, "project_id", self.project_id)
+            scope = {**base_scope, "project_id": project_id} if project_id else dict(base_scope)
+            return scope, "项目自检", _truncate(str(project_id or "本项目"), limit)
+
+        if name == "memory.list":
+            project_id = _arg_optional_str(args, "project_id", self.project_id)
+            scope = {**base_scope, "project_id": project_id} if project_id else dict(base_scope)
+            return scope, "读取项目记忆", _truncate(str(project_id or "本项目"), limit)
 
         if name == "memory.get":
             project_id = _arg_optional_str(args, "project_id", self.project_id)
@@ -1303,6 +1325,7 @@ class ToolExecutor:
             "task.create": self._task_create,
             "task.list": self._task_list,
             "project.get": self._project_get,
+            "project.health": self._project_health,
             "project.update": self._project_update,
             "project.archive": self._project_archive,
             "project.delete": self._project_delete,
@@ -1311,6 +1334,7 @@ class ToolExecutor:
             "agent.list": self._agent_list,
             "event.query": self._event_query,
             "memory.get": self._memory_get,
+            "memory.list": self._memory_list,
             "memory.set": self._memory_set,
             "unit.list": self._unit_list,
             "wait": self._wait,
@@ -1784,6 +1808,13 @@ class ToolExecutor:
             raise ToolError("project_id is required")
         return await call_ok(self.sys, "project.get", {"project_id": project_id})
 
+    async def _project_health(self, args: dict, scope: dict) -> dict:
+        project_id = _arg_optional_str(args, "project_id", self.project_id)
+        if not project_id:
+            raise ToolError("project_id is required (agent has no project)")
+        return await call_ok(self.sys, "project.health",
+                             {"project_id": project_id})
+
     async def _project_update(self, args: dict, scope: dict) -> dict:
         project_id = _arg_optional_str(args, "project_id", self.project_id)
         if not project_id:
@@ -1847,6 +1878,13 @@ class ToolExecutor:
         payload: dict[str, Any] = {"seq": since, "limit": limit}
         if project_id:
             payload["project_id"] = project_id
+        for key in ("types", "source", "agent_id"):
+            value = _arg_optional_str(args, key)
+            if value:
+                payload[key] = value
+        for key in ("since_ts", "until_ts"):
+            if key in args and args[key] is not None:
+                payload[key] = _arg_int(args, key, 0, minimum=0)
         return await call_ok(self.sys, "event.since", payload)
 
     async def _memory_get(self, args: dict, scope: dict) -> dict:
@@ -1856,6 +1894,13 @@ class ToolExecutor:
             raise ToolError("project_id is required")
         return await call_ok(self.sys, "memory.get",
                              {"project_id": project_id, "key": key})
+
+    async def _memory_list(self, args: dict, scope: dict) -> dict:
+        project_id = _arg_optional_str(args, "project_id", self.project_id)
+        if not project_id:
+            raise ToolError("project_id is required")
+        return await call_ok(self.sys, "memory.list",
+                             {"project_id": project_id})
 
     async def _memory_set(self, args: dict, scope: dict) -> dict:
         project_id = _arg_optional_str(args, "project_id", self.project_id)

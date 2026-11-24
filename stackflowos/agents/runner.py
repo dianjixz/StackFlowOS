@@ -160,6 +160,9 @@ class AgentRunner:
         limits are re-read live so a pushed config change applies mid-task.
         """
         try:
+            preflight = await self._preflight()
+            if preflight is not None:
+                return preflight
             claim_result = await self._claim()
             if claim_result is not None:
                 return claim_result
@@ -178,11 +181,13 @@ class AgentRunner:
                 if self._steps >= self._max_steps():
                     return await self._finish(
                         f"达到最大步数 max_steps={self._max_steps()}，停止。",
-                        "failed", self._steps)
+                        "blocked", self._steps, reason_code="MAX_STEPS")
                 view = await self._view()
                 action = await self._await_bounded(self.brain.next_action(view))
                 if action is None:
-                    return await self._finish("大脑返回空动作。", "failed", self._steps)
+                    return await self._finish("大脑返回空动作。", "failed",
+                                              self._steps,
+                                              reason_code="BRAIN_EMPTY")
                 if action.finish is not None:
                     payload = action.finish if isinstance(action.finish, dict) else {}
                     summary = str(payload.get("summary") or "任务结束。")
@@ -192,7 +197,8 @@ class AgentRunner:
                     return await self._finish(summary, status, self._steps)
                 if not action.tool:
                     return await self._finish("大脑未给出工具调用或结束动作。",
-                                              "failed", self._steps)
+                                              "failed", self._steps,
+                                              reason_code="BRAIN_NO_ACTION")
                 if self._tool_limit_reached():
                     return await self._finish_tool_limit(action)
                 result = await self._await_bounded(self._execute(action))
@@ -225,7 +231,11 @@ class AgentRunner:
                 await self._observe(action, result)
                 stuck = self._track_failure(action, result)
                 if stuck:
-                    return await self._finish(stuck, "blocked", self._steps)
+                    code = ("TOOL_DENIED"
+                            if str(result.error or "").startswith("DENIED")
+                            else "TOOL_LOOP")
+                    return await self._finish(stuck, "blocked", self._steps,
+                                              reason_code=code)
                 if action.say:
                     await self._emit("agent.step", {
                         "agent_id": self.agent.id,
@@ -238,7 +248,8 @@ class AgentRunner:
             self.log.exception("agent %s crashed", getattr(self.agent, "id", "?"))
             summary = f"agent 运行失败：{type(exc).__name__}: {exc}"
             try:
-                return await self._finish(summary, "failed", self._steps)
+                return await self._finish(summary, "failed", self._steps,
+                                          reason_code="AGENT_CRASH")
             except Exception:  # pragma: no cover - sys unreachable
                 self.log.exception("cannot report failure for %s", self.agent.id)
                 return RunResult(summary, "failed", self._steps)
@@ -327,7 +338,8 @@ class AgentRunner:
         return await self._finish(
             summary, "blocked", self._steps,
             extra={"timeout": True, "task_timeout_s": timeout,
-                   "tool_calls": self._tool_calls})
+                   "tool_calls": self._tool_calls},
+            reason_code="TASK_TIMEOUT")
 
     async def _finish_tool_limit(self, action: Action) -> RunResult:
         limit = self._max_tool_calls()
@@ -339,7 +351,8 @@ class AgentRunner:
             summary, "blocked", self._steps,
             extra={"limit": "max_tool_calls_per_task",
                    "max_tool_calls_per_task": limit,
-                   "tool_calls": self._tool_calls})
+                   "tool_calls": self._tool_calls},
+            reason_code="TOOL_LIMIT")
 
     # -- git isolation (attached-rw only) ---------------------------------
     def _security_config(self) -> Any:
@@ -465,11 +478,49 @@ class AgentRunner:
         return ""
 
     # -- lifecycle helpers ------------------------------------------------
+    async def _preflight(self) -> RunResult | None:
+        """Stop with an explicit ``blocked`` reason when the scope is not ready.
+
+        Previously an agent without a project (or with a deleted workspace)
+        burned its step budget on denied tools and ended as a generic failure
+        with no explanation.  Check the house before claiming work so the
+        roster records ``blocked`` + a stable ``error_code`` instead.
+        """
+        if not self.agent.project_id:
+            return await self._abort(
+                "未绑定项目（scope 缺失）：Agent 无法访问任何项目或工作区；"
+                "派工时必须指定 project_id。",
+                "blocked", reason_code="PROJECT_UNBOUND")
+        try:
+            project = _as_dict(await call_ok(
+                self.sys, "project.get",
+                {"project_id": self.agent.project_id}), "project")
+        except NotFound:
+            return await self._abort(
+                f"项目 {self.agent.project_id} 不存在；请检查派工参数。",
+                "blocked", reason_code="PROJECT_NOT_FOUND")
+        except SfoError as exc:
+            return await self._abort(
+                f"读取项目失败：{exc.code}: {exc.message}", "failed",
+                reason_code="PROJECT_READ_FAILED")
+        workspace = str(project.get("workspace") or "")
+        if not workspace:
+            return await self._abort(
+                f"项目 {self.agent.project_id} 没有 workspace 路径；"
+                "请先补齐项目工作区。",
+                "blocked", reason_code="WORKSPACE_MISSING")
+        if not Path(workspace).is_dir():
+            return await self._abort(
+                f"项目工作区不存在或不是目录：{workspace}",
+                "blocked", reason_code="WORKSPACE_MISSING")
+        return None
+
     async def _claim(self) -> RunResult | None:
         """Claim the assigned task if it is still ``todo``.
 
         A conflict means another agent owns it; we abort instead of taking
-        over (the task board is authoritative).
+        over (the task board is authoritative).  Missing/claimed tasks are
+        preconditions, not execution errors, so they report ``blocked``.
         """
         task_id = self.agent.task_id
         if not task_id:
@@ -478,10 +529,12 @@ class AgentRunner:
             task = _as_dict(await call_ok(self.sys, "task.get",
                                           {"task_id": task_id}), "task")
         except NotFound:
-            return await self._abort(f"任务 {task_id} 不存在。", "failed")
+            return await self._abort(f"任务 {task_id} 不存在。", "blocked",
+                                     reason_code="TASK_MISSING")
         except SfoError as exc:
             return await self._abort(f"读取任务失败：{exc.code}: {exc.message}",
-                                     "failed")
+                                     "failed",
+                                     reason_code="TASK_READ_FAILED")
         if _task_status(task) != "todo":
             return None
         try:
@@ -490,10 +543,11 @@ class AgentRunner:
         except Conflict as exc:
             return await self._abort(
                 f"认领任务 {task_id} 冲突，已被其他 Agent 持有：{exc.message}",
-                "failed")
+                "blocked", reason_code="CLAIM_CONFLICT")
         except SfoError as exc:
             return await self._abort(
-                f"认领任务 {task_id} 失败：{exc.code}: {exc.message}", "failed")
+                f"认领任务 {task_id} 失败：{exc.code}: {exc.message}",
+                "blocked", reason_code="CLAIM_FAILED")
         return None
 
     async def _mark_working(self) -> None:
@@ -535,6 +589,15 @@ class AgentRunner:
         if self.agent.project_id:
             await self._pull_events()
 
+        memory: dict = {}
+        if self.agent.project_id:
+            try:
+                payload = await call_ok(self.sys, "memory.list",
+                                        {"project_id": self.agent.project_id})
+                memory = _as_dict(payload, "memory")
+            except SfoError:
+                memory = {}
+
         return AgentView(
             agent=self.agent,
             project=project,
@@ -545,6 +608,7 @@ class AgentRunner:
             workspace=str(self.workspace),
             recent=list(self._events[-6:]),
             tool_results=list(self._tool_results),
+            memory=memory,
         )
 
     async def _pull_events(self) -> None:
@@ -570,8 +634,15 @@ class AgentRunner:
 
     # -- finish / abort ---------------------------------------------------
     async def _finish(self, summary: str, status: str, steps: int, *,
-                      extra: dict | None = None) -> RunResult:
-        """Record the outcome on the task, the agent roster and the event log."""
+                      extra: dict | None = None,
+                      reason_code: str | None = None) -> RunResult:
+        """Record the outcome on the task, the agent roster and the event log.
+
+        ``status`` is the run status (done/failed/blocked/killed/paused).
+        ``blocked`` (missing precondition or exhausted budget) is kept distinct
+        from ``failed`` (execution error) on the roster, and both always carry
+        a non-empty ``error`` plus a stable ``error_code``.
+        """
         git_info = await self._git_end(status) if status != "paused" else {}
         payload_extra = dict(extra or {})
         if git_info:
@@ -588,9 +659,11 @@ class AgentRunner:
             elif status in ("failed", "blocked"):
                 await self._block_task(summary)
         if status == "paused":
-            await self._update_agent("waiting")
+            await self._update_agent("waiting", summary=summary)
             self.agent.status = "waiting"
             self.agent.summary = summary
+            self.agent.error = None
+            self.agent.error_code = None
             self.agent.touch()
             await self._emit("agent.waiting", {
                 "agent_id": self.agent.id,
@@ -602,18 +675,32 @@ class AgentRunner:
             return RunResult(summary, status, steps)
 
         agent_state = {"done": "done", "failed": "failed",
-                       "blocked": "failed", "killed": "dead"}.get(status, "done")
-        await self._call_quiet("agent.finish",
-                               {"agent_id": self.agent.id, "summary": summary})
+                       "blocked": "blocked", "killed": "dead"}.get(status, "done")
+        if agent_state in ("blocked", "failed") and not reason_code:
+            reason_code = ("PRECONDITION" if agent_state == "blocked"
+                           else "EXECUTION")
+        error = summary if agent_state in ("blocked", "failed") else None
+        if agent_state in ("blocked", "failed") and not error:
+            error = (f"agent stopped as {agent_state} without a reason; "
+                     "inspect the event log for the last step")
+        await self._call_quiet("agent.finish", {
+            "agent_id": self.agent.id,
+            "summary": summary,
+            "status": agent_state,
+            "error": error,
+            "error_code": reason_code if error else None,
+        })
         if agent_state != "done":
-            await self._update_agent(agent_state)
+            await self._update_agent(agent_state, summary=summary, error=error,
+                                     error_code=reason_code if error else None)
         self.agent.status = agent_state
         self.agent.summary = summary
-        if status in ("failed", "blocked"):
-            self.agent.error = summary
+        self.agent.error = error
+        self.agent.error_code = reason_code if error else None
         self.agent.touch()
         event_type = {"done": "agent.finished", "failed": "agent.failed",
-                      "blocked": "agent.failed", "killed": "agent.terminated"}.get(
+                      "blocked": "agent.blocked",
+                      "killed": "agent.terminated"}.get(
             status, "agent.finished")
         payload = {
             "agent_id": self.agent.id,
@@ -622,28 +709,46 @@ class AgentRunner:
             "task_id": self.agent.task_id,
             "summary": summary,
             "status": agent_state,
+            "error": error,
+            "error_code": reason_code if error else None,
         }
         payload.update(payload_extra)
         await self._emit(event_type, payload)
-        return RunResult(summary, status, steps)
+        return RunResult(error or summary, status, steps)
 
-    async def _abort(self, summary: str, status: str) -> RunResult:
-        """Abort before owning a task (claim conflict / missing task)."""
-        await self._call_quiet("agent.finish",
-                               {"agent_id": self.agent.id, "summary": summary})
-        await self._update_agent("failed")
-        self.agent.status = "failed"
-        self.agent.error = summary
-        self.agent.summary = summary
-        self.agent.touch()
-        await self._emit("agent.failed", {
+    async def _abort(self, summary: str, status: str, *,
+                     reason_code: str | None = None) -> RunResult:
+        """Abort before owning work (scope/task/claim precondition failed)."""
+        agent_state = "failed" if status == "failed" else "blocked"
+        code = reason_code or ("EXECUTION" if agent_state == "failed"
+                               else "PRECONDITION")
+        error = summary or (f"agent stopped as {agent_state} without a reason")
+        await self._call_quiet("agent.finish", {
             "agent_id": self.agent.id,
-            "role": self.agent.role,
-            "project_id": self.agent.project_id,
-            "task_id": self.agent.task_id,
-            "summary": summary,
+            "summary": error,
+            "status": agent_state,
+            "error": error,
+            "error_code": code,
         })
-        return RunResult(summary, status, self._steps)
+        await self._update_agent(agent_state, summary=error, error=error,
+                                 error_code=code)
+        self.agent.status = agent_state
+        self.agent.error = error
+        self.agent.error_code = code
+        self.agent.summary = error
+        self.agent.touch()
+        await self._emit(
+            "agent.blocked" if agent_state == "blocked" else "agent.failed", {
+                "agent_id": self.agent.id,
+                "role": self.agent.role,
+                "project_id": self.agent.project_id,
+                "task_id": self.agent.task_id,
+                "summary": error,
+                "status": agent_state,
+                "error": error,
+                "error_code": code,
+            })
+        return RunResult(error, status, self._steps)
 
     async def _note_task(self, summary: str) -> None:
         if not self.agent.task_id:
@@ -703,11 +808,20 @@ class AgentRunner:
             "error": summary,
         })
 
-    async def _update_agent(self, status: str) -> None:
+    async def _update_agent(self, status: str, *, summary: str | None = None,
+                            error: str | None = None,
+                            error_code: str | None = None) -> None:
+        patch: dict[str, Any] = {"status": status, "last_seen": now_ms()}
+        if summary is not None:
+            patch["summary"] = summary
+        if error is not None:
+            patch["error"] = error
+        if error_code is not None:
+            patch["error_code"] = error_code
         try:
             await call_ok(self.sys, "agent.update", {
                 "agent_id": self.agent.id,
-                "patch": {"status": status, "last_seen": now_ms()},
+                "patch": patch,
             })
         except SfoError:
             self.log.debug("agent.update failed for %s", self.agent.id,

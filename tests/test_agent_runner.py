@@ -120,6 +120,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "artifacts": [], "notes": [],
         }
         self.sys = FakeSysAPI(task=self.task)
+        self.sys.project["workspace"] = str(self.ws)
         self.agent = Agent(id="agent-coder-1", role="coder",
                            project_id="p-1", task_id="t-1")
         self.executor = ToolExecutor(
@@ -156,6 +157,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sys.finished), 1)
         self.assertIn("t-1", self.sys.finished[0]["summary"])
         self.assertEqual(self.agent.status, "done")
+        self.assertIsNone(self.agent.error)
+        self.assertIsNone(self.agent.error_code)
         # Working state and step events were published.
         self.assertIn("working", [u.get("status") for u in self.sys.agent_updates])
         event_types = self.sys.event_types()
@@ -202,10 +205,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("done", statuses)
         self.assertIn("shell.exec", executor.calls)
         self.assertEqual(len(self.sys.finished), 1)
-        self.assertIn("agent.failed", self.sys.event_types())
+        self.assertIn("agent.blocked", self.sys.event_types())
+        self.assertNotIn("agent.failed", self.sys.event_types())
         self.assertIn("task.blocked", self.sys.event_types())
         self.assertNotIn("agent.finished", self.sys.event_types())
-        self.assertEqual(self.agent.status, "failed")
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "PRECONDITION")
+        self.assertTrue(self.agent.error)
 
     async def test_non_code_task_writes_markdown(self) -> None:
         self.sys.task["title"] = "整理发布说明"
@@ -220,16 +226,17 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("type") == "tool.result"
                             for event in commands))
 
-    async def test_max_steps_blocks_task_and_reports_failure(self) -> None:
+    async def test_max_steps_blocks_task_and_reports_blocked(self) -> None:
         runner = self._runner(BusyBrain(), max_steps=2)
         result = await runner.run()
-        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.status, "blocked")
         self.assertEqual(result.steps, 2)
         self.assertIn("max_steps", result.summary)
         self.assertEqual(self.sys.task["status"], "blocked")
         self.assertEqual(len(self.sys.finished), 1)
-        self.assertEqual(self.agent.status, "failed")
-        self.assertIn("agent.failed", self.sys.event_types())
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "MAX_STEPS")
+        self.assertIn("agent.blocked", self.sys.event_types())
         self.assertIn("task.blocked", self.sys.event_types())
 
     async def test_repeated_identical_failures_stop_the_run(self) -> None:
@@ -284,6 +291,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ToolError", result.summary)
         self.assertEqual(self.sys.task["status"], "blocked")
         self.assertEqual(self.agent.status, "failed")
+        self.assertEqual(self.agent.error_code, "AGENT_CRASH")
+        self.assertTrue(self.agent.error)
 
     async def test_claim_conflict_aborts_without_blocking_task(self) -> None:
         self.sys.task["status"] = "doing"
@@ -296,6 +305,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                            timeout: float | None = None) -> dict:
             payload = dict(data or {})
             self.sys.calls.append((action, payload))
+            if action == "project.get":
+                return dict(self.sys.project)
             if action == "task.get":
                 return dict(self.sys.task)
             if action == "task.claim":
@@ -312,10 +323,55 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         runner = self._runner(BusyBrain())
         self.sys.call = conflict  # type: ignore[assignment]
         result = await runner.run()
-        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.status, "blocked")
         self.assertIn("冲突", result.summary)
         self.assertEqual(len(self.sys.finished), 1)
         self.assertEqual(self.sys.task["status"], "todo")
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "CLAIM_CONFLICT")
+
+    async def test_unbound_project_is_blocked_with_explicit_reason(self) -> None:
+        """No project scope is a precondition, not an execution failure."""
+        agent = Agent(id="agent-assistant-1", role="assistant",
+                      project_id=None, task_id=None)
+        runner = AgentRunner(
+            self.sys, agent, MockBrain("assistant", max_steps=4),
+            self.executor, config=AgentsCfg(max_steps=4), workspace=self.ws)
+        result = await runner.run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("scope", result.summary)
+        self.assertEqual(agent.status, "blocked")
+        self.assertEqual(agent.error_code, "PROJECT_UNBOUND")
+        self.assertTrue(agent.error)
+        self.assertEqual(self.sys.actions("task.claim"), [])
+        events = [event for event in self.sys.events
+                  if event.get("type") == "agent.blocked"]
+        self.assertTrue(events)
+        self.assertEqual(events[-1]["data"].get("error_code"),
+                         "PROJECT_UNBOUND")
+
+    async def test_missing_workspace_is_blocked_with_explicit_reason(self) -> None:
+        self.sys.project["workspace"] = str(self.tmp / "does-not-exist")
+        result = await self._runner(MockBrain("coder", max_steps=4)).run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("工作区", result.summary)
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "WORKSPACE_MISSING")
+        self.assertEqual(self.sys.actions("task.claim"), [])
+
+    async def test_missing_task_is_blocked_not_failed(self) -> None:
+        self.sys.task = None
+        result = await self._runner(MockBrain("coder", max_steps=4)).run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("不存在", result.summary)
+        self.assertEqual(self.agent.status, "blocked")
+        self.assertEqual(self.agent.error_code, "TASK_MISSING")
+        self.assertIn("agent.blocked", self.sys.event_types())
+        self.assertNotIn("agent.failed", self.sys.event_types())
+
 
 
 if __name__ == "__main__":  # pragma: no cover

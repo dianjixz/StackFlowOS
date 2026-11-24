@@ -87,7 +87,7 @@ const EVENT_FILTERS = ['all', 'chat', 'project', 'task', 'agent', 'unit', 'appro
 const RESTART_LABELS = { 'transport.mode': '传输模式', 'web.port': 'Web 端口' };
 // Agent statuses that count as "on duty".  panel.js keeps an identical local
 // set; both must stay in sync until the vocabulary moves to a shared module.
-const ACTIVE_AGENT_STATUSES = new Set(['working', 'waiting', 'idle', 'spawning']);
+const ACTIVE_AGENT_STATUSES = new Set(['queued', 'spawning', 'idle', 'working', 'waiting']);
 
 /** @type {Record<string, HTMLElement>} */
 const els = {};
@@ -648,6 +648,72 @@ function renderNewProjectForm() {
   return form;
 }
 
+function renderHealthReport(project, report) {
+  const summary = report.summary || {};
+  const tone = report.ready ? 'ready' : 'failed';
+  const rows = (report.checks || []).map((check) => {
+    const pill = check.status === 'ok' ? 'ready'
+      : check.status === 'fail' ? 'failed' : 'degraded';
+    return el('div', { class: 'health-row' },
+      statusPill(pill),
+      el('span', { class: 'health-label' }, check.label || check.id),
+      el('span', { class: 'health-message' }, check.message || ''),
+      check.fix && check.status !== 'ok'
+        ? el('div', { class: 'health-fix mono' }, `fix: ${check.fix}`)
+        : null,
+    );
+  });
+  const actions = [];
+  if (!report.ready) {
+    const onboardBtn = el('button', { class: 'btn btn-primary btn-sm', type: 'button' },
+      icon('plus'), '补齐入住设施');
+    onboardBtn.addEventListener('click', () => {
+      withBusy(onboardBtn, async () => {
+        try {
+          await api.onboardProject(project.id);
+          toast('已补齐骨架/种子任务/记忆，重新自检中…', 'success');
+          const fresh = await api.getProjectHealth(project.id);
+          healthSlot.replaceChildren(renderHealthReport(project, fresh));
+          await Promise.all([loadState({ quiet: true }), loadTasks(project.id, { force: true })]);
+        } catch (error) {
+          toastError(error);
+        }
+      });
+    });
+    actions.push(onboardBtn);
+  }
+  const refresh = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' },
+    icon('refresh'), '重新自检');
+  refresh.addEventListener('click', () => {
+    withBusy(refresh, async () => {
+      try {
+        const fresh = await api.getProjectHealth(project.id);
+        healthSlot.replaceChildren(renderHealthReport(project, fresh));
+      } catch (error) {
+        toastError(error);
+      }
+    });
+  });
+  actions.push(refresh);
+  return el('div', { class: 'form-card health-card' },
+    el('div', { class: 'health-head' },
+      el('h3', {}, '入住自检'),
+      statusPill(tone),
+      el('span', { class: 'mono health-summary' },
+        `ok ${Number(summary.ok) || 0} · warn ${Number(summary.warn) || 0} · `
+        + `fail ${Number(summary.fail) || 0} · 未检查 ${Number(summary.unchecked) || 0}`),
+    ),
+    el('p', { class: 'form-hint' },
+      report.ready
+        ? '门牌、目录、看板、记忆和权限检查通过，Agent 可以开工。'
+        : '还有阻塞项：按 fix 补齐后重新自检；blocked 不是执行失败。'),
+    ...(report.not_ready_reasons || []).map((reason) =>
+      el('div', { class: 'health-blocker' }, `✕ ${reason}`)),
+    el('div', { class: 'health-rows' }, ...rows),
+    el('div', { class: 'form-actions' }, ...actions),
+  );
+}
+
 function renderProjectDetail(project) {
   const status = project.degraded ? 'degraded' : project.status;
   setSheetHeader(project.name || '项目详情', `项目详情 · ${statusLabel(status)}`, 'projects');
@@ -659,6 +725,7 @@ function renderProjectDetail(project) {
     .filter((agent) => !['dead', 'failed'].includes(agent.status));
 
   const wrap = el('div', {}, backButton());
+  const healthSlot = el('div', { class: 'health-slot' });
 
   const heroRight = el('div', { class: 'dh-actions' },
     ring(project.progress || 0, { size: 76, stroke: 6 }),
@@ -666,6 +733,21 @@ function renderProjectDetail(project) {
       el('b', {}, `${Math.round(project.progress || 0)}`), el('span', {}, '% 完成')),
   );
   const actionRow = el('div', { class: 'form-actions', style: { 'justify-content': 'flex-end' } });
+
+  const healthBtn = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' },
+    icon('check'), '入住自检');
+  healthBtn.addEventListener('click', () => {
+    withBusy(healthBtn, async () => {
+      try {
+        const report = await api.getProjectHealth(project.id);
+        healthSlot.replaceChildren(renderHealthReport(project, report));
+        healthSlot.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } catch (error) {
+        toastError(error);
+      }
+    });
+  });
+  actionRow.append(healthBtn);
 
   if (!['done', 'archived'].includes(project.status)) {
     const completeBtn = el('button', { class: 'btn btn-ok btn-sm', type: 'button' }, icon('check'), '完成项目');
@@ -788,6 +870,7 @@ function renderProjectDetail(project) {
     detailStat('待审', counts.review, 'is-review'),
     detailStat('完成', counts.done, 'is-done'),
   ));
+  wrap.append(healthSlot);
 
   /* agents on this project */
   const activeOnProject = agents.filter((agent) => ACTIVE_AGENT_STATUSES.has(agent.status)).length;
@@ -1206,7 +1289,7 @@ function renderAgentsApp() {
 
   const filtered = agents.filter((agent) => {
     if (view.agentFilter === 'active') return ['working', 'waiting', 'idle', 'spawning'].includes(agent.status);
-    if (view.agentFilter === 'ended') return ['done', 'failed', 'dead'].includes(agent.status);
+    if (view.agentFilter === 'ended') return ['done', 'blocked', 'failed', 'dead'].includes(agent.status);
     return true;
   });
 
@@ -1236,7 +1319,7 @@ function renderAgentsApp() {
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(agent);
     }
-    const order = { working: 0, waiting: 1, idle: 2, spawning: 3, done: 4, failed: 5, dead: 6 };
+    const order = { working: 0, waiting: 1, idle: 2, spawning: 3, queued: 4, done: 5, blocked: 6, failed: 7, dead: 8 };
     for (const [, list] of groups) list.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
     const keys = [...groups.keys()].sort((a, b) => {
       if (a === '__none__') return 1;
@@ -1261,7 +1344,7 @@ function renderAgentsApp() {
 }
 
 function agentRow(agent) {
-  const terminal = ['done', 'failed', 'dead'].includes(agent.status);
+  const terminal = ['done', 'blocked', 'failed', 'dead'].includes(agent.status);
   const open = () => openApp('agent', agent.id);
   const killBtn = terminal ? null : el('button', {
     class: 'btn btn-xs btn-danger',
@@ -1299,6 +1382,7 @@ function agentRow(agent) {
     el('div', { class: 'ar-sub' },
       agent.model ? el('span', { class: 'mono' }, agent.model) : null,
       agent.task_id ? el('span', { class: 'mono' }, `task ${agent.task_id}`) : null,
+      agent.error_code ? el('span', { class: 'mono' }, agent.error_code) : null,
       el('span', {}, `心跳 ${ago(agent.last_seen)}`),
     ),
     agent.summary ? el('div', { class: 'ar-summary', title: agent.summary }, agent.summary) : null,

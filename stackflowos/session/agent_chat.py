@@ -961,6 +961,7 @@ class AgentChatService:
         files: list[str] = []
         events: list[dict] = []
         project_info: dict[str, Any] = {}
+        memory: dict[str, str] = {}
         if project is not None:
             workspace = str(getattr(project, "workspace", "") or "")
             try:
@@ -1007,6 +1008,17 @@ class AgentChatService:
                 card = self.app.project_card(agent.project_id)
             except Exception:
                 card = {}
+            try:
+                values = self.app.memory.all(agent.project_id) or {}
+            except Exception:
+                values = {}
+            memory = {
+                str(key): _compact(
+                    value if isinstance(value, str)
+                    else json.dumps(value, ensure_ascii=False, default=str),
+                    600)
+                for key, value in list(values.items())[:20]
+            }
             project_info = {
                 "id": card.get("id"),
                 "name": card.get("name"),
@@ -1034,6 +1046,7 @@ class AgentChatService:
             "tasks": tasks[:16],
             "workspace_files": files,
             "recent_events": events,
+            "memory": memory,
             "model": str(getattr(self.provider, "model", "") or ""),
         }
 

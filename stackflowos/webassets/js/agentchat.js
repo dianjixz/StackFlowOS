@@ -30,7 +30,7 @@ import {
   toastError,
 } from './ui.js';
 
-const TERMINAL = new Set(['done', 'failed', 'dead']);
+const TERMINAL = new Set(['done', 'blocked', 'failed', 'dead']);
 const ACTIVE = new Set(['spawning', 'idle', 'working', 'waiting']);
 
 const ROLE_HINT = {
