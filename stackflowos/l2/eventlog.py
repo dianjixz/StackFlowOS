@@ -56,7 +56,10 @@ class EventLog:
     """
 
     #: Event types that are broadcast but never persisted.
-    EPHEMERAL_TYPES = {"chat.delta", "agent.chat.delta", "stream.chunk"}
+    EPHEMERAL_TYPES = {
+        "chat.delta", "agent.chat.delta", "agent.chat.tool",
+        "agent.chat.state", "stream.chunk",
+    }
 
     #: Hard upper bound for :meth:`query` (mirrors the web API limit).
     QUERY_MAX_LIMIT = 1000

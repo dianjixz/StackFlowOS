@@ -323,8 +323,8 @@ workspace 写 `brief.md`；每个项目保留最近 5 条已结束 aggregator �
 * hub 每秒跑一次维护循环：`approvals.sweep()` 把过期 pending 置 `expired`（fail
   closed），`leases.sweep()` 回收过期租约。Agent 死亡/被杀/项目归档时，其名下
   pending 审批会被系统以 `deny` 关闭，避免“人走单还挂着”。
-* `EPHEMERAL_TYPES = ("chat.delta", "agent.chat.delta", "stream.chunk")`
-  不落盘、不占 seq 持久位置
+* `EPHEMERAL_TYPES = ("chat.delta", "agent.chat.delta", "agent.chat.tool",
+  "agent.chat.state", "stream.chunk")` 不落盘、不占 seq 持久位置
   （仍递增 seq，只是不写文件；重启后 seq 从文件最大值继续）。
 
 ### 5.7 事件目录（稳定契约）
