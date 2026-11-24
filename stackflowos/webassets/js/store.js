@@ -34,6 +34,15 @@ function emit(type, detail) {
   }
 }
 
+/**
+ * Publish on the shared UI bus.  Modules that do not own DOM state (i18n,
+ * session, stream helpers) use this instead of inventing their own event
+ * emitter, so `on('lang')`/`on('stream')` behave exactly like `on('chat')`.
+ */
+export function notify(type, detail) {
+  emit(type, detail);
+}
+
 export const state = {
   loaded: false,
   loading: false,
@@ -50,7 +59,7 @@ export const state = {
   chat: [],
   config: null,
   stats: {},
-  stream: { active: false, text: '', startedAt: 0 },
+  stream: { active: false, text: '', startedAt: 0, messageId: null },
   typing: false,
 };
 
@@ -190,6 +199,7 @@ export function resetStream() {
   state.stream.active = false;
   state.stream.text = '';
   state.stream.startedAt = 0;
+  state.stream.messageId = null;
   state.typing = false;
 }
 
@@ -237,9 +247,10 @@ export function applyEvent(event) {
         state.stream.active = true;
         state.stream.startedAt = Date.now();
         state.stream.text = '';
+        state.stream.messageId = data.message_id || data.id || null;
       }
       state.stream.text += String(data.delta);
-      emit('chat', { kind: 'stream' });
+      emit('chat', { kind: 'stream', delta: String(data.delta) });
     }
     emit('event', event);
     return;
@@ -317,7 +328,16 @@ export function connectSSE() {
     everConnected = true;
     attempts = 0;
     setSse('live');
-    if (reconnected) scheduleRefresh(60); // catch up after downtime
+    if (reconnected) {
+      // Ephemeral deltas are not replayed.  A draft left over from the old
+      // connection can never complete, so drop it and let the next snapshot
+      // (or the final chat.message) render the durable message exactly once.
+      if (state.stream.active) {
+        resetStream();
+        emit('chat', { kind: 'stream-reset' });
+      }
+      scheduleRefresh(60); // catch up after downtime
+    }
   });
 
   stream.addEventListener('message', (messageEvent) => {

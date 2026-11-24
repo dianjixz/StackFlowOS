@@ -2,11 +2,14 @@
  * main.js — boot the operator console.
  */
 
-import { focusComposer, initChat } from './chat.js';
+import { focusComposer, initChat, rerenderChat } from './chat.js';
 import { initAgentChat } from './agentchat.js';
-import { initPanel } from './panel.js';
-import { closeSheet, initApps, openApp } from './apps.js';
+import { initPanel, rerenderPanel } from './panel.js';
+import { closeSheet, initApps, openApp, rerenderAfterLanguageChange } from './apps.js';
 import { connectSSE, loadState, on, state } from './store.js';
+import { initI18n, t } from './i18n.js';
+import { initSession } from './session.js';
+import { initUnits, rerenderUnits } from './units.js';
 import { fmtClock, toast } from './ui.js';
 
 const APP_SHORTCUTS = ['projects', 'agents', 'units', 'approvals', 'events', 'settings'];
@@ -39,15 +42,9 @@ function initConnectionIndicator() {
     if (!wrap) return;
     wrap.dataset.state = status;
     if (label) {
-      label.textContent = {
-        live: '实时连接',
-        connecting: '连接中',
-        reconnecting: '重连中',
-        offline: '离线',
-        snapshot: '快照模式',
-      }[status] || status;
+      label.textContent = t(`sse.${status}`, {}, status);
     }
-    wrap.title = `事件流：${label ? label.textContent : status} · lastSeq ${state.lastSeq}`;
+    wrap.title = `${t('sse.tip')}: ${label ? label.textContent : status} · lastSeq ${state.lastSeq}`;
   };
   on('sse', apply);
   apply(state.sse);
@@ -129,15 +126,26 @@ function initErrorReporting() {
 
 async function boot() {
   initErrorReporting();
+  initI18n();
   initChat();
   initAgentChat();
   initPanel();
   initApps();
+  initSession();
+  initUnits();
   initMobileTabs();
   initDelegatedClicks();
   initShortcuts();
   initClock();
   const applySse = initConnectionIndicator();
+
+  on('lang', () => {
+    rerenderChat();
+    rerenderPanel();
+    rerenderAfterLanguageChange();
+    rerenderUnits();
+    applySse(state.sse);
+  });
 
   // `?no-sse=1` is a deterministic snapshot mode for headless visual checks:
   // it skips the long-lived EventSource so Chrome's virtual time can settle.

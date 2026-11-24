@@ -56,6 +56,12 @@ async function requestJson(path, options = {}) {
   }
 
   if (response.status === 401) {
+    // A single global listener (session.js) owns the "please sign in again"
+    // screen.  Dispatching an event keeps api.js free of UI imports and makes
+    // the 401 path work for every caller, including background refreshes.
+    if (typeof document !== 'undefined' && typeof CustomEvent === 'function') {
+      document.dispatchEvent(new CustomEvent('sfo:unauthorized'));
+    }
     throw new ApiError(
       '未认证或会话已过期：请用 StackFlowOS 启动时打印的登录 URL（含 ?token=...）重新打开控制台。',
       { code: 'UNAUTHORIZED', status: 401 },
@@ -90,6 +96,33 @@ const qs = (params) => {
 };
 
 const enc = (value) => encodeURIComponent(String(value));
+
+/**
+ * True when the backend answered but does not implement this endpoint (or the
+ * whole feature is switched off).  Panels use it to show a calm "未启用" note
+ * instead of an error toast: an optional extension must not look like a bug.
+ */
+export function isUnsupported(error) {
+  if (!error) return false;
+  if (error instanceof ApiError) {
+    return error.status === 404 || error.status === 405 || error.status === 501
+      || error.code === 'HTTP_404' || error.code === 'HTTP_405'
+      || error.code === 'HTTP_501';
+  }
+  return false;
+}
+
+/** True when the answer was refused for permission reasons (403 / operator). */
+export function isForbidden(error) {
+  return Boolean(error && error instanceof ApiError
+    && (error.status === 403 || error.code === 'FORBIDDEN'));
+}
+
+/** True when the endpoint exists but the request conflicts with current state. */
+export function isConflict(error) {
+  return Boolean(error && error instanceof ApiError
+    && (error.status === 409 || error.code === 'CONFLICT'));
+}
 
 export const api = {
   /* ---- system ---- */
@@ -135,7 +168,13 @@ export const api = {
   deleteRule: (id) => requestJson(`/api/rules/${enc(id)}`, { method: 'DELETE' }),
 
   /* ---- units & agents ---- */
-  getUnits: () => requestJson('/api/units'),
+  getUnits: ({ tier = '', kind = '', state = '', projectId = '', status = '', include = '' } = {}) =>
+    requestJson('/api/units' + qs({ tier, kind, state, project_id: projectId, status, include })),
+  getUnitsSummary: () => requestJson('/api/units/summary'),
+  getUnit: (id) => requestJson(`/api/units/${enc(id)}`),
+  probeUnit: (id) => requestJson(`/api/units/${enc(id)}/probe`, { method: 'POST', body: {} }),
+  unitAction: (id, action) =>
+    requestJson(`/api/units/${enc(id)}/actions`, { method: 'POST', body: { action } }),
   killUnit: (workId) => requestJson(`/api/units/${enc(workId)}/kill`, { method: 'POST', body: {} }),
   getAgents: (projectId = '') => requestJson('/api/agents' + qs({ project_id: projectId })),
   spawnAgent: (role, projectId, taskId = null) =>
@@ -149,6 +188,42 @@ export const api = {
     requestJson(`/api/agents/${enc(id)}/chat/cancel`, { method: 'POST', body: {} }),
   clearAgentChat: (id) =>
     requestJson(`/api/agents/${enc(id)}/chat`, { method: 'DELETE' }),
+
+  /* ---- capability catalog: skills / plugins / MCP ---- */
+  getCapabilities: ({ type = '', projectId = '' } = {}) =>
+    requestJson('/api/capabilities' + qs({ type, project_id: projectId })),
+  getSkills: (projectId = '') => requestJson('/api/skills' + qs({ project_id: projectId })),
+  setSkillEnabled: (id, enabled, projectId = '') =>
+    requestJson(`/api/skills/${enc(id)}/${enabled ? 'enable' : 'disable'}`, {
+      method: 'POST',
+      body: { project_id: projectId || null },
+    }),
+  getPlugins: () => requestJson('/api/plugins'),
+  loadPlugin: (id) => requestJson(`/api/plugins/${enc(id)}/load`, { method: 'POST', body: {} }),
+  unloadPlugin: (id) => requestJson(`/api/plugins/${enc(id)}/unload`, { method: 'POST', body: {} }),
+  getMcpServers: () => requestJson('/api/mcp/servers'),
+  connectMcp: (name) =>
+    requestJson(`/api/mcp/servers/${enc(name)}/connect`, { method: 'POST', body: {} }),
+  disconnectMcp: (name) =>
+    requestJson(`/api/mcp/servers/${enc(name)}/disconnect`, { method: 'POST', body: {} }),
+  getMcpTools: (server = '') => requestJson('/api/mcp/tools' + qs({ server })),
+  callMcp: ({ server, tool, args }) =>
+    requestJson('/api/mcp/call', { method: 'POST', body: { server, tool, args } }),
+
+  /* ---- llm usage / models ---- */
+  getLlmUsage: (projectId = '') => requestJson('/api/llm/usage' + qs({ project_id: projectId })),
+  getLlmModels: () => requestJson('/api/llm/models'),
+
+  /* ---- sessions & auth ---- */
+  getSessions: () => requestJson('/api/sessions'),
+  rotateSessions: () => requestJson('/api/sessions/rotate', { method: 'POST', body: {} }),
+  revokeSession: (id) => requestJson(`/api/sessions/${enc(id)}`, { method: 'DELETE' }),
+  logout: () => requestJson('/api/logout', { method: 'POST', body: {} }),
+
+  /* ---- project workspace git ---- */
+  getProjectGit: (id) => requestJson(`/api/projects/${enc(id)}/git`),
+  rollbackProjectGit: (id, ref) =>
+    requestJson(`/api/projects/${enc(id)}/git/rollback`, { method: 'POST', body: { ref } }),
 
   /* ---- config & leases ---- */
   getConfig: () => requestJson('/api/config'),

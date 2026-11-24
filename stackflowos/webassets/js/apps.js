@@ -9,6 +9,18 @@
 import * as agentChat from './agentchat.js';
 import { api } from './api.js';
 import { applyConfig, loadState, on, state } from './store.js';
+import * as units from './units.js';
+import { renderCapabilitiesPane } from './capabilities.js';
+import { renderLlmUsagePanel, renderRoutesEditor } from './llm.js';
+import { canWrite, renderSessionPanel } from './session.js';
+import {
+  isDependencyBlocked,
+  mountGitSection,
+  renderTaskDependencySection,
+  taskDeps,
+  depBadgeText,
+} from './projectextras.js';
+import { getLang, setLang, t } from './i18n.js';
 import {
   ago,
   agoShort,
@@ -44,13 +56,15 @@ import {
 } from './ui.js';
 
 const APP_META = {
-  projects: { title: '项目', sub: '项目列表 · 任务看板 · 归档', icon: 'projects' },
-  agents: { title: 'Agent', sub: '花名册 · 派工 · 终止', icon: 'agents' },
-  units: { title: '单元', sub: '系统 · 服务 · 工人', icon: 'units' },
-  approvals: { title: '审批', sub: '风险操作的人工闸门', icon: 'approvals' },
-  events: { title: '事件', sub: '系统控制台 · 审计流', icon: 'events' },
-  settings: { title: '设置', sub: '系统 · 网络 · AI · 安全 · 存储', icon: 'settings' },
+  projects: { titleKey: 'app.projects', subKey: 'app.sub.projects', icon: 'projects' },
+  agents: { titleKey: 'app.agents', subKey: 'app.sub.agents', icon: 'agents' },
+  units: { titleKey: 'app.units', subKey: 'app.sub.units', icon: 'units' },
+  approvals: { titleKey: 'app.approvals', subKey: 'app.sub.approvals', icon: 'approvals' },
+  events: { titleKey: 'app.events', subKey: 'app.sub.events', icon: 'events' },
+  settings: { titleKey: 'app.settings', subKey: 'app.sub.settings', icon: 'settings' },
 };
+const APP_SUB_KEYS = Object.fromEntries(
+  Object.entries(APP_META).map(([key, meta]) => [key, meta.subKey]));
 
 const ROLES = ['lead', 'architect', 'coder', 'tester', 'reviewer', 'researcher'];
 const ROLE_OPTIONS = ROLES.map((role) => ({ value: role, label: roleLabel(role) }));
@@ -174,6 +188,15 @@ export function initApps() {
     if (current.name === 'approvals' && String(event.type || '').startsWith('approval.')) {
       scheduleDecisionsReload();
     }
+    if (current.name === 'units') units.noteUnitStateEvent(event);
+  });
+  on('open-settings-tab', (detail) => {
+    view.settingsTab = detail?.tab || 'security';
+    if (current?.name === 'settings') {
+      renderSheet({ preserveScroll: false });
+    } else {
+      openApp('settings');
+    }
   });
 
   window.setInterval(tickCountdowns, 1000);
@@ -242,10 +265,27 @@ export function closeSheet() {
   hideSheet({ clearHash: true });
 }
 
+/** Re-render the open app (and its header) after a language change. */
+export function rerenderAfterLanguageChange() {
+  if (!current) return;
+  const meta = APP_META[current.name];
+  if (meta) {
+    setSheetHeader(
+      current.projectId && current.name === 'projects'
+        ? (state.projects.find((project) => project.id === current.projectId)?.name || t(meta.titleKey))
+        : t(meta.titleKey),
+      t(meta.subKey),
+      meta.icon,
+    );
+  }
+  renderSheet({ preserveScroll: false });
+}
+
 function hideSheet({ clearHash }) {
   const hadCurrent = Boolean(current);
   current = null;
   pendingRender = false;
+  units.closeUnitDrawer();
   exitAgentChatMode();
   if (els.layer) els.layer.hidden = true;
   document.body.classList.remove('sheet-open');
@@ -270,7 +310,7 @@ function showApp(name, projectId = null,
   current = { name, projectId: projectId || null, agentId: agentId || null };
   els.layer.hidden = false;
   document.body.classList.add('sheet-open');
-  setSheetHeader(APP_META[name].title, APP_META[name].sub, APP_META[name].icon);
+  setSheetHeader(t(APP_META[name].titleKey), t(APP_META[name].subKey), APP_META[name].icon);
   updateDockActive();
   if (wasHidden) els.sheet.focus({ preventScroll: true });
 
@@ -329,6 +369,9 @@ function updateDockActive() {
 function onDocumentKeydown(event) {
   if (!els.layer || els.layer.hidden) return;
   if (event.key === 'Escape') {
+    // The unit drawer owns Escape while it is open; closing the whole sheet
+    // underneath it would be surprising.
+    if (document.querySelector('.unit-drawer-layer')) return;
     event.preventDefault();
     closeSheet();
     return;
@@ -799,6 +842,19 @@ function renderProjectDetail(project) {
     wrap.append(renderTaskBoard());
   }
 
+  if (!view.tasksLoading && !view.tasksError && view.projectTasks.length) {
+    wrap.append(renderTaskDependencySection(view.projectTasks, {
+      selectedId: view.selectedTaskId,
+      onSelect: (taskId) => {
+        view.selectedTaskId = taskId;
+        view.scrollToTask = true;
+        renderSheet();
+      },
+    }));
+  }
+
+  wrap.append(mountGitSection(project.id, { projectName: project.name }));
+
   wrap.append(renderAddTaskForm(project));
   return wrap;
 }
@@ -845,6 +901,8 @@ function renderTaskCard(task) {
   const selected = task.id === view.selectedTaskId;
   const checkTotal = task.checks?.length || task.check_total || 0;
   const checkDone = task.checks?.filter((item) => item.done).length ?? task.check_done ?? 0;
+  const depText = depBadgeText(task, view.projectTasks);
+  const depBlocked = isDependencyBlocked(task, view.projectTasks);
   const titleBtn = el('button', {
     class: 'tc-title-btn',
     type: 'button',
@@ -856,13 +914,18 @@ function renderTaskCard(task) {
     },
   }, el('span', { class: 'tc-title' }, task.title || task.id));
   const card = el('div', {
-    class: `task-card${selected ? ' is-selected' : ''}${task.status === 'blocked' ? ' is-blocked' : ''}`,
+    class: `task-card${selected ? ' is-selected' : ''}${task.status === 'blocked' ? ' is-blocked' : ''}`
+      + `${depBlocked ? ' is-dep-blocked' : ''}${depText ? ' has-deps' : ''}`,
     dataset: { taskId: task.id },
   }, titleBtn);
   card.append(el('div', { class: 'tc-meta' },
     task.role ? roleChip(task.role) : null,
     Number(task.priority) > 0 ? el('span', { class: 'tc-id' }, `P${task.priority}`) : null,
     checkTotal ? el('span', { class: 'tc-checks' }, `✓ ${checkDone}/${checkTotal}`) : null,
+    depText ? el('span', {
+      class: `tc-deps${depBlocked ? ' is-open' : ''}`,
+      title: taskDeps(task).join(', '),
+    }, '⛓ ', depText) : null,
     el('span', { class: 'tc-id' }, task.id),
   ));
   const statusSelect = el('select', {
@@ -1291,117 +1354,7 @@ function renderSpawnForm() {
 /* ================================================================== */
 
 function renderUnitsApp() {
-  const wrap = el('div', {});
-  const units = state.units;
-  const online = units.filter((unit) =>
-    ['online', 'suspect', 'ready', 'degraded', 'draining'].includes(unit.state || unit.status)).length;
-  const tierCount = (tier) => units.filter((unit) => (unit.tier || 'worker') === tier).length;
-  const tierLabel = { system: '系统', service: '服务', worker: '工人' };
-  wrap.append(el('div', { class: 'app-toolbar' },
-    el('div', { class: 'toolbar-left' },
-      el('span', { class: 'app-count' },
-        `${online} 在线 / ${units.length} 总计 · 系统 ${tierCount('system')} · 服务 ${tierCount('service')} · 工人 ${tierCount('worker')}`),
-    ),
-    el('div', { class: 'toolbar-right' }, refreshButton(() => loadState({ quiet: true }))),
-  ));
-  wrap.append(appNote('单元是带地址、租约与生命周期的执行体：sys.0 是 hub 本身；审批/LLM/工具/上下文/插件/技能是 hub 进程内的服务单元；worker 单元通常一个 Agent 一个进程。没有 pid/地址的服务单元不伪造字段。', { iconName: 'units' }));
-
-  if (!state.loaded) {
-    wrap.append(loadingInline('载入单元…'));
-    return wrap;
-  }
-  if (!units.length) {
-    wrap.append(emptyState({
-      iconName: 'units',
-      title: '还没有单元',
-      text: '系统单元应在 hub 启动后立即出现；若为空，查看事件流中的 sys.booted。',
-    }));
-    return wrap;
-  }
-
-  const table = el('table', { class: 'data-table units-table' });
-  table.append(el('colgroup', {},
-    el('col', { style: { width: '19%' } }),
-    el('col', { style: { width: '9%' } }),
-    el('col', { style: { width: '7%' } }),
-    el('col', { style: { width: '26%' } }),
-    el('col', { style: { width: '7%' } }),
-    el('col', { style: { width: '10%' } }),
-    el('col', { style: { width: '15%' } }),
-    el('col', { style: { width: '7%' } }),
-  ));
-  table.append(el('thead', {}, el('tr', {},
-    ...['单元', '状态', '传输', '地址', 'PID', '最近心跳', '能力', '']
-      .map((label) => el('th', { scope: 'col' }, label)),
-  )));
-  const tbody = el('tbody');
-  for (const unit of units) {
-    const isSys = unit.work_id === 'sys.0';
-    const inProcess = unit.runtime && unit.runtime.mode === 'in_process';
-    const killBtn = isSys
-      ? el('span', { class: 'muted mono' }, 'hub')
-      : inProcess
-        ? el('span', { class: 'muted mono' }, 'service')
-        : el('button', {
-          class: 'btn btn-xs btn-danger',
-          type: 'button',
-          'aria-label': `终止单元 ${unit.work_id}`,
-          onclick: () => {
-            if (!window.confirm(`终止单元 ${unit.work_id}？\n正在使用它的 Agent 会被中断。`)) return;
-            withBusy(killBtn, async () => {
-              try {
-                await api.killUnit(unit.work_id);
-                toast('终止信号已发送', 'success');
-                await loadState({ quiet: true });
-                renderSheet();
-              } catch (error) {
-                toastError(error);
-              }
-            });
-          },
-        }, '终止');
-
-    const abilities = Array.isArray(unit.abilities) ? unit.abilities : [];
-    const abilityNames = abilities.slice(0, 4).map((ability) =>
-      typeof ability === 'string' ? ability : (ability.name || ability.tool || 'ability'));
-    const address = isSys
-      ? (unit.rpc_address || unit.ref || '—')
-      : (unit.ref || unit.rpc_address || '—');
-    const transport = inProcess
-      ? 'INPROC'
-      : String(unit.transport || '—').toUpperCase();
-    const sub = [unit.label, unit.kind, tierLabel[unit.tier] || '']
-      .filter(Boolean).join(' · ');
-    tbody.append(el('tr', {},
-      el('td', {},
-        el('div', { class: 'unit-id', title: unit.work_id }, unit.work_id),
-        el('div', { class: 'unit-sub muted', title: sub },
-          sub || '—'),
-      ),
-      el('td', {}, (() => { const pill = statusPill(unit.state || unit.status); if (unit.reason) pill.title = unit.reason; return pill; })()),
-      el('td', { class: 'mono' }, transport),
-      el('td', {}, el('div', { class: 'unit-addr', title: address }, address),
-        unit.events_address
-          ? el('div', { class: 'unit-addr is-secondary', title: unit.events_address }, unit.events_address)
-          : null),
-      el('td', { class: 'mono' }, unit.pid == null ? '—' : String(unit.pid)),
-      el('td', { class: 'mono unit-last-seen', title: fmtDateTime(unit.last_seen) }, ago(unit.last_seen)),
-      el('td', {},
-        abilities.length
-          ? el('div', { class: 'ability-list' },
-            ...abilityNames.map((name) => el('span', { class: 'ability-pill' }, name)),
-            abilities.length > abilityNames.length
-              ? el('span', { class: 'ability-pill' }, `+${abilities.length - abilityNames.length}`)
-              : null,
-          )
-          : el('span', { class: 'muted' }, '—'),
-      ),
-      el('td', { class: 'cell-actions' }, killBtn),
-    ));
-  }
-  table.append(tbody);
-  wrap.append(el('div', { class: 'table-wrap' }, table));
-  return wrap;
+  return units.renderUnitsApp();
 }
 
 /* ================================================================== */
@@ -1567,13 +1520,17 @@ function renderApprovalCard(approval) {
       });
   };
 
-  actions.append(
-    el('button', { class: 'btn btn-sm btn-ok', type: 'button', onclick: () => decide('allow', 'once', '一次') }, '允许一次'),
-    el('button', { class: 'btn btn-sm', type: 'button', title: '1 小时内，同一项目里同类角色的同类操作不再询问', onclick: () => decide('allow', 'session', '1 小时') }, '允许 1 小时'),
-    el('button', { class: 'btn btn-sm btn-primary', type: 'button', title: '创建长期规则：同类角色的同类操作不再询问（可在下方规则列表删除）', onclick: () => decide('allow', 'always', '总是') }, '总是允许'),
-    el('span', { class: 'spacer' }),
-    el('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => decide('deny', 'once', '拒绝') }, '拒绝'),
-  );
+  if (!canWrite()) {
+    actions.append(el('p', { class: 'field-hint' }, t('approvals.viewer_hint')));
+  } else {
+    actions.append(
+      el('button', { class: 'btn btn-sm btn-ok', type: 'button', title: t('approvals.allow_once.tip'), onclick: () => decide('allow', 'once', t('approvals.allow_once')) }, t('approvals.allow_once')),
+      el('button', { class: 'btn btn-sm', type: 'button', title: t('approvals.allow_hour.tip'), onclick: () => decide('allow', 'session', t('approvals.allow_hour')) }, t('approvals.allow_hour')),
+      el('button', { class: 'btn btn-sm btn-primary', type: 'button', title: t('approvals.allow_always.tip'), onclick: () => decide('allow', 'always', t('approvals.allow_always')) }, t('approvals.allow_always')),
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => decide('deny', 'once', t('approvals.deny')) }, t('approvals.deny')),
+    );
+  }
 
   card.append(
     el('div', { class: 'ac-head' },
@@ -1954,12 +1911,13 @@ function renderSettingsApp() {
   }
 
   const tabs = [
-    { key: 'general', label: '常规' },
-    { key: 'network', label: '网络' },
-    { key: 'ai', label: 'AI' },
-    { key: 'security', label: '安全' },
-    { key: 'storage', label: '存储' },
-    { key: 'about', label: '关于' },
+    { key: 'general', label: t('settings.tab.general') },
+    { key: 'network', label: t('settings.tab.network') },
+    { key: 'ai', label: t('settings.tab.ai') },
+    { key: 'capabilities', label: t('settings.tab.capabilities') },
+    { key: 'security', label: t('settings.tab.security') },
+    { key: 'storage', label: t('settings.tab.storage') },
+    { key: 'about', label: t('settings.tab.about') },
   ];
   const tabBar = el('div', { class: 'settings-tabs', role: 'tablist', 'aria-label': '设置分类' });
   const panes = {};
@@ -1991,14 +1949,15 @@ function renderSettingsApp() {
   }
 
   panes.general.append(
-    formCard('系统', '显示名、主机标签与界面语言。', el('div', { class: 'form-grid' },
+    languageCard(),
+    formCard(t('settings.general.system.title'), t('settings.general.system.hint'), el('div', { class: 'form-grid' },
       cfgField('系统名称', 'system.name', 'str'),
       cfgField('主机标签', 'system.host_label', 'str'),
       cfgField('语言', 'system.language', 'select', {
         options: [{ value: 'zh-CN', label: '简体中文' }, { value: 'en-US', label: 'English' }],
       }),
     )),
-    formCard('调度与心跳', 'Agent 心跳、离线判定与重启策略。', el('div', { class: 'form-grid is-3' },
+    formCard(t('settings.general.scheduler.title'), t('settings.general.scheduler.hint'), el('div', { class: 'form-grid is-3' },
       cfgField('心跳间隔（秒）', 'agents.heartbeat_s', 'float'),
       cfgField('离线判定（秒）', 'agents.offline_after_s', 'float'),
       cfgField('最大工人数', 'agents.max_workers', 'int'),
@@ -2033,7 +1992,9 @@ function renderSettingsApp() {
   );
 
   panes.ai.append(
-    formCard('模型服务', 'provider=mock 时完全离线；openai 走兼容端点。', el('div', { class: 'form-grid' },
+    renderLlmUsagePanel(),
+    formCard(t('settings.ai.routes.title'), t('settings.ai.routes.hint'), renderRoutesEditor()),
+    formCard(t('settings.ai.models.title'), t('settings.ai.models.hint'), el('div', { class: 'form-grid' },
       cfgField('Provider', 'llm.provider', 'select', {
         options: [{ value: 'mock', label: 'mock（离线规则）' }, { value: 'openai', label: 'OpenAI 兼容' }],
       }),
@@ -2045,10 +2006,10 @@ function renderSettingsApp() {
         { hint: '由模型端点决定上限；系统不再裁剪，端点拒绝时「测试连接」会显示错误。' }),
       cfgField('超时（秒）', 'llm.timeout_s', 'float'),
     )),
-    formCard('连接测试', '用当前生效的 provider 发一个最小请求。改完设置请先保存再测试。',
+    formCard(t('settings.ai.test.title'), t('settings.ai.test.hint'),
       (() => {
         const result = el('p', { class: 'form-hint' }, '尚未测试。');
-        const button = el('button', { class: 'btn btn-sm btn-primary', type: 'button' }, '测试连接');
+        const button = el('button', { class: 'btn btn-sm btn-primary', type: 'button' }, t('settings.ai.test.title'));
         button.addEventListener('click', async () => {
           button.disabled = true;
           result.textContent = '测试中…';
@@ -2076,8 +2037,11 @@ function renderSettingsApp() {
       + '每次动作都记入事件流；工人 Agent 仍走审批口。', { iconName: 'approvals' }),
   );
 
+  panes.capabilities.append(renderCapabilitiesPane());
+
   panes.security.append(
-    formCard('默认策略', '未命中规则时的处理方式。deny 优先于 allow。', el('div', { class: 'form-grid is-3' },
+    renderSessionPanel(),
+    formCard(t('settings.security.policy.title'), t('settings.security.policy.hint'), el('div', { class: 'form-grid is-3' },
       cfgField('低风险自动放行', 'security.auto_allow_low', 'bool', { full: true }),
       cfgField('中风险默认', 'security.medium_default', 'select', {
         options: [{ value: 'ask', label: 'ask（询问）' }, { value: 'deny', label: 'deny（拒绝）' }],
@@ -2104,8 +2068,8 @@ function renderSettingsApp() {
     ));
   }
   panes.storage.append(
-    formCard('路径', '所有运行期数据都落在仓库的 .stackflowos/ 下。', pathTable),
-    formCard('事件日志', '事件是追加写的；这里只读。', el('table', { class: 'readonly-table' },
+    formCard(t('settings.storage.paths.title'), t('settings.storage.paths.hint'), pathTable),
+    formCard(t('settings.storage.events.title'), t('settings.storage.events.hint'), el('table', { class: 'readonly-table' },
       el('tr', {}, el('td', { class: 'rt-key' }, 'last_seq'), el('td', { class: 'rt-val' }, String(state.sys?.last_seq ?? '—'))),
       el('tr', {}, el('td', { class: 'rt-key' }, 'events_loaded'), el('td', { class: 'rt-val' }, String(state.events.length))),
       el('tr', {}, el('td', { class: 'rt-key' }, 'projects_dir'), el('td', { class: 'rt-val' }, String(paths.projects_dir || '—'))),
@@ -2119,24 +2083,26 @@ function renderSettingsApp() {
       el('span', { class: 'brand-glyph', 'aria-hidden': 'true' }, icon('brand')),
       el('div', {},
         el('h3', {}, `${sys.name || 'StackFlowOS'} ${sys.version || ''}`.trim()),
-        el('p', {}, 'Agent 原生的本机操作系统 · 以对话驱动项目执行。'),
+        el('p', {}, t('settings.about.tagline')),
       ),
     ),
     el('div', { class: 'about-grid' },
-      aboutItem('主机', sys.host || '—'),
-      aboutItem('PID', sys.pid ?? '—'),
-      aboutItem('传输', String(sys.transport || '—').toUpperCase()),
-      aboutItem('Web 端口', sys.web_port ?? '—'),
-      aboutItem('启动时间', fmtDateTime(sys.started_at)),
-      aboutItem('运行时长', fmtUptime(stats.uptime_s)),
-      aboutItem('系统 RPC', sys.sys_rpc || '—'),
-      aboutItem('系统事件', sys.sys_events || '—'),
-      aboutItem('事件序号', sys.last_seq ?? '—'),
-      aboutItem('项目 / Agent', `${stats.projects ?? 0} / ${(state.agents.length)}`),
+      aboutItem(t('settings.about.host'), sys.host || '—'),
+      aboutItem(t('settings.about.pid'), sys.pid ?? '—'),
+      aboutItem(t('settings.about.transport'), String(sys.transport || '—').toUpperCase()),
+      aboutItem(t('settings.about.web_port'), sys.web_port ?? '—'),
+      aboutItem(t('settings.about.started'), fmtDateTime(sys.started_at)),
+      aboutItem(t('settings.about.uptime'), fmtUptime(stats.uptime_s)),
+      aboutItem(t('settings.about.sys_rpc'), sys.sys_rpc || '—'),
+      aboutItem(t('settings.about.sys_events'), sys.sys_events || '—'),
+      aboutItem(t('settings.about.seq'), sys.last_seq ?? '—'),
+      aboutItem(t('settings.about.projects_agents'), `${stats.projects ?? 0} / ${(state.agents.length)}`),
     ),
   );
 
-  const save = el('button', { class: 'btn btn-primary', type: 'submit' }, icon('check'), '保存更改');
+  const save = el('button', { class: 'btn btn-primary', type: 'submit' }, icon('check'), t('common.save'));
+  const writable = canWrite();
+  if (!writable) save.hidden = true;
   const reload = el('button', {
     class: 'btn btn-ghost',
     type: 'button',
@@ -2145,26 +2111,30 @@ function renderSettingsApp() {
         try {
           await loadState({ quiet: true });
           view.settingsNotice = [];
-          toast('配置已重新载入', 'success');
+          toast(t('settings.reloaded'), 'success');
           renderSheet();
         } catch (error) {
           toastError(error);
         }
       });
     },
-  }, icon('refresh'), '重新载入');
+  }, icon('refresh'), t('common.reload'));
 
   const form = el('form', { id: 'settings-form' },
     tabBar,
     ...Object.values(panes),
     el('div', { class: 'settings-actions' },
-      el('span', { class: 'sa-note' }, '保存只会提交改动过的字段。'),
+      el('span', { class: 'sa-note' }, writable ? t('settings.save_hint') : t('settings.viewer_hint')),
       el('div', { class: 'sa-buttons' }, reload, save),
     ),
   );
 
   form.addEventListener('submit', (event) => {
     event.preventDefault();
+    if (!canWrite()) {
+      toast(t('settings.viewer_hint'), 'error');
+      return;
+    }
     withBusy(save, async () => {
       let patch;
       try {
@@ -2174,14 +2144,14 @@ function renderSettingsApp() {
         return;
       }
       if (!Object.keys(patch).length) {
-        toast('没有需要保存的更改', 'info');
+        toast(t('settings.save_nothing'), 'info');
         return;
       }
       try {
         const data = await api.patchConfig(patch);
         applyConfig(data.config);
         view.settingsNotice = Array.isArray(data.restart_required) ? data.restart_required : [];
-        toast(view.settingsNotice.length ? '配置已保存，部分更改需重启' : '配置已保存', 'success');
+        toast(view.settingsNotice.length ? t('settings.saved_restart') : t('settings.saved'), 'success');
         view.settingsReady = Boolean(data.config);
         renderSheet();
       } catch (error) {
@@ -2192,6 +2162,31 @@ function renderSettingsApp() {
 
   wrap.append(form);
   return wrap;
+}
+
+function languageCard() {
+  const row = el('div', { class: 'lang-switch', role: 'group', 'aria-label': t('settings.language.title') });
+  const current = getLang();
+  for (const option of ['zh', 'en']) {
+    const button = el('button', {
+      class: `lang-btn${current === option ? ' is-active' : ''}`,
+      type: 'button',
+      'aria-pressed': String(current === option),
+      lang: option === 'zh' ? 'zh-CN' : 'en',
+      onclick: () => {
+        if (getLang() === option) return;
+        setLang(option);
+        toast(t('settings.language.changed', {
+          lang: t(option === 'zh' ? 'settings.language.zh' : 'settings.language.en'),
+        }), 'success');
+      },
+    },
+    el('span', { class: 'lang-code mono' }, option.toUpperCase()),
+    el('span', {}, t(option === 'zh' ? 'settings.language.zh' : 'settings.language.en')),
+    );
+    row.append(button);
+  }
+  return formCard(t('settings.language.title'), t('settings.language.hint'), row);
 }
 
 function formCard(title, hint, content) {
@@ -2307,10 +2302,30 @@ function collectConfigPatch(form) {
       if (control.value === '***') continue;
       value = control.value;
       changed = value !== initial;
+    } else if (kind === 'json') {
+      const source = control.value.trim();
+      let parsed;
+      if (!source) {
+        parsed = [];
+      } else {
+        try {
+          parsed = JSON.parse(source);
+        } catch (error) {
+          throw new Error(t('settings.ai.routes.invalid', { label, message: error.message || String(error) }));
+        }
+      }
+      if (!Array.isArray(parsed)) {
+        throw new Error(t('settings.ai.routes.invalid', { label, message: 'array expected' }));
+      }
+      value = parsed;
+      let before = [];
+      try {
+        before = JSON.parse(initial || '[]');
+      } catch {
+        before = [];
+      }
+      changed = JSON.stringify(value) !== JSON.stringify(before);
     } else if (kind === 'nullable') {
-      value = control.value.trim() === '' ? null : control.value;
-      changed = String(value ?? '') !== initial;
-    } else {
       value = control.value;
       changed = value !== initial;
     }
@@ -2324,7 +2339,7 @@ function collectConfigPatch(form) {
 /* ================================================================== */
 
 function refreshButton(onClick) {
-  const button = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' }, icon('refresh'), '刷新');
+  const button = el('button', { class: 'btn btn-ghost btn-sm', type: 'button' }, icon('refresh'), t('common.refresh'));
   button.addEventListener('click', () => withBusy(button, async () => {
     try {
       await onClick();

@@ -6,6 +6,8 @@
  * the only SVG markup lives in the static sprite inside index.html.
  */
 
+import { getLang, t } from './i18n.js';
+
 /** @typedef {string|Node|number|null|undefined|false} Child */
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -108,19 +110,20 @@ export function fmtDateTime(ts) {
     `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
 }
 
-/** Verbose Chinese relative time. */
+/** Verbose relative time in the active UI language. */
 export function ago(ts, now = Date.now()) {
   const date = toDate(ts);
   if (!date) return '—';
+  const english = getLang() === 'en';
   const seconds = Math.max(0, Math.round((now - date.getTime()) / 1000));
-  if (seconds < 10) return '刚刚';
-  if (seconds < 60) return `${seconds} 秒前`;
+  if (seconds < 10) return english ? 'just now' : '刚刚';
+  if (seconds < 60) return english ? `${seconds}s ago` : `${seconds} 秒前`;
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 60) return english ? `${minutes}m ago` : `${minutes} 分钟前`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 小时前`;
+  if (hours < 24) return english ? `${hours}h ago` : `${hours} 小时前`;
   const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} 天前`;
+  if (days < 30) return english ? `${days}d ago` : `${days} 天前`;
   return fmtDateTime(date.getTime());
 }
 
@@ -152,16 +155,17 @@ export function fmtCountdown(targetTs, now = Date.now()) {
   };
 }
 
-/** Uptime seconds → "3 小时 12 分". */
+/** Uptime seconds → "3 小时 12 分" / "3h 12m". */
 export function fmtUptime(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const english = getLang() === 'en';
   const days = Math.floor(total / 86400);
   const hours = Math.floor((total % 86400) / 3600);
   const minutes = Math.floor((total % 3600) / 60);
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${minutes} 分`;
-  if (minutes > 0) return `${minutes} 分钟`;
-  return `${total} 秒`;
+  if (days > 0) return english ? `${days}d ${hours}h` : `${days} 天 ${hours} 小时`;
+  if (hours > 0) return english ? `${hours}h ${minutes}m` : `${hours} 小时 ${minutes} 分`;
+  if (minutes > 0) return english ? `${minutes}m` : `${minutes} 分钟`;
+  return english ? `${total}s` : `${total} 秒`;
 }
 
 /** Truncate a long single-line string. */
@@ -231,9 +235,18 @@ const APP_LABELS = {
   settings: '设置',
 };
 
-export const statusLabel = (status) => STATUS_LABELS[String(status || '')] || String(status || '未知');
-export const roleLabel = (role) => ROLE_LABELS[String(role || '')] || String(role || '—');
-export const appLabel = (app) => APP_LABELS[String(app || '')] || String(app || '');
+export const statusLabel = (status) => {
+  const key = String(status || '');
+  return t(`status.${key}`, {}, STATUS_LABELS[key] || key || '未知');
+};
+export const roleLabel = (role) => {
+  const key = String(role || '');
+  return t(`role.${key}`, {}, ROLE_LABELS[key] || key || '—');
+};
+export const appLabel = (app) => {
+  const key = String(app || '');
+  return t(`app.${key}`, {}, APP_LABELS[key] || key);
+};
 
 /** @param {string} status */
 export function statusPill(status, label = null) {
@@ -442,8 +455,8 @@ export function spinner() {
   return el('span', { class: 'spinner', 'aria-hidden': 'true' });
 }
 
-export function loadingInline(text = '载入中…') {
-  return el('div', { class: 'loading-inline' }, spinner(), text);
+export function loadingInline(text = null) {
+  return el('div', { class: 'loading-inline' }, spinner(), text ?? t('common.loading'));
 }
 
 /**
@@ -453,7 +466,7 @@ export function loadingInline(text = '载入中…') {
 export function emptyState({ iconName = 'projects', title, text = '', actions = [] } = {}) {
   return el('div', { class: 'empty-state' },
     el('div', { class: 'empty-glyph' }, icon(iconName)),
-    el('h4', {}, title || '暂无数据'),
+    el('h4', {}, title || t('common.empty')),
     text ? el('p', {}, text) : null,
     actions.length ? el('div', { class: 'suggestion-row' }, ...actions) : null,
   );
@@ -506,11 +519,11 @@ const TOAST_ICONS = { error: 'alert', success: 'check', info: 'events' };
 export function toast(message, kind = 'error', timeout = 4600) {
   const host = document.getElementById('toast-stack');
   if (!host) return;
-  const text = String(message || '未知错误');
+  const text = String(message || t('toast.unknown_error'));
   const node = el('div', { class: 'toast', dataset: { kind }, role: kind === 'error' ? 'alert' : 'status' },
     el('span', { class: 'toast-icon' }, icon(TOAST_ICONS[kind] || 'events', 'ico ico-sm')),
     el('span', { class: 'toast-msg' }, text),
-    el('button', { class: 'toast-close', type: 'button', 'aria-label': '关闭提示' },
+    el('button', { class: 'toast-close', type: 'button', 'aria-label': t('toast.close') },
       icon('close', 'ico ico-sm')),
   );
   const close = () => {
@@ -527,7 +540,7 @@ export function toast(message, kind = 'error', timeout = 4600) {
 
 /** Turn an API/other error into a toast. */
 export function toastError(error) {
-  const message = error && error.message ? error.message : String(error || '操作失败');
+  const message = error && error.message ? error.message : String(error || t('toast.unknown_error'));
   toast(message, 'error');
 }
 

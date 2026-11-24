@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0b0c10">
-  <title>StackFlow OS · 操作台</title>
+  <title data-i18n="app.title">StackFlow OS · 操作台</title>
   <link rel="stylesheet" href="/css/os.css">
 </head>
 <body>
@@ -96,7 +96,7 @@
     </defs>
   </svg>
 
-  <a class="skip-link" href="#chat-log">跳到对话</a>
+  <a class="skip-link" href="#chat-log" data-i18n="shell.skip">跳到对话</a>
 
   <div class="os-shell" id="os-shell">
     <header class="topbar">
@@ -105,23 +105,28 @@
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-brand"></use></svg>
         </span>
         <span class="brand-text">STACKFLOW <b>OS</b></span>
-        <span class="brand-host mono" id="sys-host" title="主机">—</span>
+        <span class="brand-host mono" id="sys-host" title="主机" data-i18n-title="top.brand_host">—</span>
       </div>
 
       <div class="topbar-right">
-        <span class="transport-pill" id="transport-pill" title="传输模式">
+        <span class="transport-pill" id="transport-pill" title="传输模式" data-i18n-title="shell.transport">
           <span class="transport-dot" aria-hidden="true"></span><span id="transport-label">IPC</span>
         </span>
-        <span class="stat-chip" title="在线单元">
-          <span class="status-dot is-online" aria-hidden="true"></span><span class="mono" id="stat-units">—</span><span class="chip-label">单元</span>
+        <span class="stat-chip" title="在线单元" data-i18n-title="shell.units">
+          <span class="status-dot is-online" aria-hidden="true"></span><span class="mono" id="stat-units">—</span><span class="chip-label" data-i18n="shell.units">单元</span>
         </span>
-        <span class="stat-chip" title="活跃租约">
+        <span class="stat-chip" title="活跃租约" data-i18n-title="shell.leases">
           <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-clock"></use></svg>
-          <span class="mono" id="stat-leases">—</span><span class="chip-label">租约</span>
+          <span class="mono" id="stat-leases">—</span><span class="chip-label" data-i18n="shell.leases">租约</span>
         </span>
-        <button class="approval-badge" id="topbar-approvals" type="button" aria-label="打开审批中心" title="审批中心">
+        <button class="approval-badge" id="topbar-approvals" type="button" aria-label="打开审批中心" data-i18n-aria-label="shell.approvals" title="审批中心" data-i18n-title="shell.approvals">
           <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-approvals"></use></svg>
           <span class="mono" id="topbar-approval-count">0</span>
+        </button>
+        <button class="session-chip" id="session-chip" type="button" title="会话与登录" hidden>
+          <span class="status-dot is-online" aria-hidden="true"></span>
+          <span class="mono" id="session-user">—</span>
+          <span class="chip-label" id="session-role">—</span>
         </button>
         <time class="clock mono" id="clock" datetime="">--:--</time>
       </div>
@@ -131,11 +136,11 @@
       <section class="pane chat-pane" id="chat-pane" aria-labelledby="chat-heading">
         <header class="pane-head">
           <div class="pane-title">
-            <h1 id="chat-heading">对话</h1>
-            <p class="pane-sub" id="chat-sub">系统助手 · 待命</p>
+            <h1 id="chat-heading" data-i18n="chat.heading">对话</h1>
+            <p class="pane-sub" id="chat-sub" data-i18n="chat.sub.waiting">系统助手 · 待命</p>
           </div>
-          <span class="stream-state" id="sse-state" data-state="connecting" title="事件流状态">
-            <span class="status-dot" aria-hidden="true"></span><span id="sse-label">连接中</span>
+          <span class="stream-state" id="sse-state" data-state="connecting" title="事件流状态" data-i18n-title="sse.tip">
+            <span class="status-dot" aria-hidden="true"></span><span id="sse-label" data-i18n="sse.connecting">连接中</span>
           </span>
         </header>
 
@@ -144,42 +149,42 @@
         <div class="chat-scroll" id="chat-scroll">
           <ol class="chat-log" id="chat-log" aria-live="polite" aria-relevant="additions text"></ol>
           <div class="chat-loading" id="chat-loading" hidden>
-            <span class="spinner" aria-hidden="true"></span><span>正在载入会话…</span>
+            <span class="spinner" aria-hidden="true"></span><span data-i18n="chat.loading">正在载入会话…</span>
           </div>
-          <button class="scroll-bottom" id="scroll-bottom" type="button" aria-label="回到底部" hidden>
+          <button class="scroll-bottom" id="scroll-bottom" type="button" aria-label="回到底部" data-i18n-aria-label="chat.scroll_bottom" hidden>
             <svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-arrow-down"></use></svg>
           </button>
         </div>
 
         <div class="composer-wrap">
-          <div class="suggestions" id="suggestions" aria-label="快捷建议"></div>
+          <div class="suggestions" id="suggestions" aria-label="快捷建议" data-i18n-aria-label="chat.suggestions"></div>
           <form class="composer" id="composer-form" autocomplete="off">
-            <label class="sr-only" for="composer-input">对系统说点什么</label>
+            <label class="sr-only" for="composer-input" data-i18n="chat.input.label">对系统说点什么</label>
             <textarea id="composer-input" class="composer-input" rows="1" maxlength="8000"
-                      placeholder="对系统说点什么…（Enter 发送）"></textarea>
-            <button class="send-btn" id="send-btn" type="submit" aria-label="发送消息">
+                      placeholder="对系统说点什么…（Enter 发送）" data-i18n-placeholder="chat.input.placeholder"></textarea>
+            <button class="send-btn" id="send-btn" type="submit" aria-label="发送消息" data-i18n-aria-label="chat.send">
               <svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-send"></use></svg>
             </button>
           </form>
-          <p class="composer-hint">Enter 发送 · Shift+Enter 换行 · 高风险动作需人工审批</p>
+          <p class="composer-hint" data-i18n="chat.hint">Enter 发送 · Shift+Enter 换行 · 高风险动作需人工审批</p>
         </div>
       </section>
 
       <section class="pane work-pane" id="work-pane" aria-labelledby="work-heading">
         <header class="pane-head">
           <div class="pane-title">
-            <h2 id="work-heading">工作面板</h2>
-            <p class="pane-sub">项目 · 在岗 Agent · 事件流</p>
+            <h2 id="work-heading" data-i18n="work.heading">工作面板</h2>
+            <p class="pane-sub" data-i18n="work.sub">项目 · 在岗 Agent · 事件流</p>
           </div>
           <button class="ghost-btn" type="button" data-open-app="projects">
-            全部项目<svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chevron"></use></svg>
+            <span data-i18n="work.all_projects">全部项目</span><svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chevron"></use></svg>
           </button>
         </header>
 
         <div class="work-scroll" id="work-scroll">
           <section class="block projects-block" aria-labelledby="projects-label">
             <div class="section-label">
-              <h3 id="projects-label">项目</h3>
+              <h3 id="projects-label" data-i18n="projects.label">项目</h3>
               <span class="muted mono" id="project-count"></span>
             </div>
             <div class="project-grid" id="project-grid"></div>
@@ -187,7 +192,7 @@
 
           <section class="block agents-block" aria-labelledby="agents-label">
             <div class="section-label">
-              <h3 id="agents-label">在岗 Agent</h3>
+              <h3 id="agents-label" data-i18n="agents.label">在岗 Agent</h3>
               <span class="muted mono" id="agent-count"></span>
             </div>
             <div class="agent-strip" id="agent-strip"></div>
@@ -195,9 +200,9 @@
 
           <section class="block events-block" aria-labelledby="events-label">
             <div class="section-label">
-              <h3 id="events-label">实时事件</h3>
+              <h3 id="events-label" data-i18n="events.label">实时事件</h3>
               <button class="text-btn" type="button" data-open-app="events">
-                全部<svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chevron"></use></svg>
+                <span data-i18n="events.all">全部</span><svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chevron"></use></svg>
               </button>
             </div>
             <ul class="event-ticker" id="event-ticker"></ul>
@@ -209,41 +214,41 @@
     <div class="mobile-tabs" role="tablist" aria-label="主视图切换">
       <button class="mobile-tab is-active" type="button" role="tab" aria-selected="true"
               aria-controls="chat-pane" data-mobile-view="chat">
-        <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chat"></use></svg>对话
+        <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-chat"></use></svg><span data-i18n="mobile.chat">对话</span>
       </button>
       <button class="mobile-tab" type="button" role="tab" aria-selected="false"
               aria-controls="work-pane" data-mobile-view="work">
-        <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-panel"></use></svg>工作面板
+        <svg class="ico ico-sm" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-panel"></use></svg><span data-i18n="mobile.work">工作面板</span>
       </button>
     </div>
 
     <nav class="dock" id="dock" aria-label="应用坞">
-      <button class="dock-btn" type="button" data-open-app="projects" aria-label="打开项目">
+      <button class="dock-btn" type="button" data-open-app="projects" aria-label="打开项目" data-i18n-aria-label="dock.aria.projects">
         <span class="dock-icon"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-projects"></use></svg></span>
-        <span class="dock-label">项目</span>
+        <span class="dock-label" data-i18n="dock.projects">项目</span>
       </button>
-      <button class="dock-btn" type="button" data-open-app="agents" aria-label="打开 Agent 花名册">
+      <button class="dock-btn" type="button" data-open-app="agents" aria-label="打开 Agent 花名册" data-i18n-aria-label="dock.aria.agents">
         <span class="dock-icon"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-agents"></use></svg></span>
-        <span class="dock-label">Agent</span>
+        <span class="dock-label" data-i18n="dock.agents">Agent</span>
       </button>
-      <button class="dock-btn" type="button" data-open-app="units" aria-label="打开单元列表">
+      <button class="dock-btn" type="button" data-open-app="units" aria-label="打开单元列表" data-i18n-aria-label="dock.aria.units">
         <span class="dock-icon"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-units"></use></svg></span>
-        <span class="dock-label">单元</span>
+        <span class="dock-label" data-i18n="dock.units">单元</span>
       </button>
-      <button class="dock-btn" id="dock-approvals" type="button" data-open-app="approvals" aria-label="打开审批中心">
+      <button class="dock-btn" id="dock-approvals" type="button" data-open-app="approvals" aria-label="打开审批中心" data-i18n-aria-label="dock.aria.approvals">
         <span class="dock-icon">
           <svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-approvals"></use></svg>
           <span class="dock-badge" id="dock-approval-badge" hidden>0</span>
         </span>
-        <span class="dock-label">审批</span>
+        <span class="dock-label" data-i18n="dock.approvals">审批</span>
       </button>
-      <button class="dock-btn" type="button" data-open-app="events" aria-label="打开事件控制台">
+      <button class="dock-btn" type="button" data-open-app="events" aria-label="打开事件控制台" data-i18n-aria-label="dock.aria.events">
         <span class="dock-icon"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-events"></use></svg></span>
-        <span class="dock-label">事件</span>
+        <span class="dock-label" data-i18n="dock.events">事件</span>
       </button>
-      <button class="dock-btn" type="button" data-open-app="settings" aria-label="打开设置">
+      <button class="dock-btn" type="button" data-open-app="settings" aria-label="打开设置" data-i18n-aria-label="dock.aria.settings">
         <span class="dock-icon"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-settings"></use></svg></span>
-        <span class="dock-label">设置</span>
+        <span class="dock-label" data-i18n="dock.settings">设置</span>
       </button>
     </nav>
   </div>
@@ -255,11 +260,11 @@
         <div class="sheet-title-wrap">
           <span class="sheet-icon" id="sheet-icon" aria-hidden="true"></span>
           <div>
-            <h2 class="sheet-title" id="sheet-title">应用</h2>
+            <h2 class="sheet-title" id="sheet-title" data-i18n="sheet.title">应用</h2>
             <p class="sheet-sub" id="sheet-sub"></p>
           </div>
         </div>
-        <button class="icon-btn sheet-close" id="sheet-close" type="button" aria-label="关闭应用">
+        <button class="icon-btn sheet-close" id="sheet-close" type="button" aria-label="关闭应用" data-i18n-aria-label="sheet.close">
           <svg class="ico" aria-hidden="true" viewBox="0 0 24 24"><use href="#i-close"></use></svg>
         </button>
       </header>
@@ -270,9 +275,10 @@
   <div class="toast-stack" id="toast-stack" role="status" aria-live="assertive"></div>
 
   <noscript>
-    <div class="noscript">StackFlowOS 操作台需要启用 JavaScript。</div>
+    <div class="noscript" data-i18n="shell.noscript">StackFlowOS 操作台需要启用 JavaScript。</div>
   </noscript>
 
+  <script type="module" src="/js/i18n.js"></script>
   <script type="module" src="/js/main.js"></script>
 </body>
 </html>

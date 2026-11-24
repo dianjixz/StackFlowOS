@@ -13,8 +13,10 @@ import {
   addLocalChat,
   on,
   removeChatMessage,
+  resetStream,
   state,
 } from './store.js';
+import { t } from './i18n.js';
 import {
   el,
   fmtDateTime,
@@ -89,10 +91,52 @@ function onState() {
     renderAll();
     renderEmptyIfNeeded();
   } else {
+    syncMessages();
     renderEmptyIfNeeded();
   }
   updateSub();
   updateContext();
+}
+
+/**
+ * Fold messages that arrived through a full snapshot (reconnect, polling) into
+ * the existing DOM without re-rendering history.  This is what keeps a final
+ * assistant message after a dropped SSE connection from being lost, and what
+ * de-duplicates it when the durable `chat.message` shows up as well.
+ */
+function syncMessages() {
+  const messages = [...state.chat].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  let appended = false;
+  for (const message of messages) {
+    if (!message || !message.id) continue;
+    const existing = rendered.get(message.id);
+    if (!existing) {
+      const node = buildMessage(message, { instant: true });
+      rendered.set(message.id, node);
+      els.log.querySelector('.chat-empty-wrap')?.remove();
+      els.log.append(node);
+      appended = true;
+      continue;
+    }
+    if (message.text && existing.dataset.text !== message.text) {
+      const bubble = existing.querySelector('.bubble');
+      if (bubble) {
+        bubble.replaceChildren(richText(message.text));
+        existing.dataset.text = message.text;
+      }
+    }
+  }
+  if (state.stream.active) {
+    const started = state.stream.startedAt || 0;
+    const final = messages.some((message) => message.role === 'assistant'
+      && Number(message.ts || 0) >= started);
+    if (final) {
+      // The durable message is here; the ephemeral draft is now a duplicate.
+      clearStream();
+      resetStream();
+    }
+  }
+  if (appended && isNearBottom()) scrollToBottom('auto');
 }
 
 function onChat(detail) {
@@ -104,6 +148,11 @@ function onChat(detail) {
   if (detail.kind === 'stream') {
     showTyping(false);
     updateStream();
+    return;
+  }
+  if (detail.kind === 'stream-reset') {
+    showTyping(false);
+    clearStream();
     return;
   }
   if (detail.kind === 'final') {
@@ -170,8 +219,8 @@ function renderEmptyIfNeeded() {
   const node = el('li', { class: 'chat-empty-wrap' },
     el('div', { class: 'chat-empty' },
       el('div', { class: 'empty-glyph' }, icon('chat')),
-      el('h3', {}, '从一句话开始'),
-      el('p', {}, '告诉系统要做什么，它会创建项目、派工并实时汇报。'),
+      el('h3', {}, t('chat.empty.title')),
+      el('p', {}, t('chat.empty.text')),
       el('div', { class: 'suggestion-row' }, ...prompts),
     ),
   );
@@ -237,7 +286,7 @@ function showTyping(show) {
     el('span', { class: 'msg-avatar', 'aria-hidden': 'true' }, icon('brand', 'ico ico-sm')),
     el('div', { class: 'msg-body' },
       el('div', { class: 'bubble typing-bubble' },
-        el('span', {}, '正在思考'),
+        el('span', {}, t('chat.typing')),
         el('span', { class: 'typing-dots', 'aria-hidden': 'true' }, el('i'), el('i'), el('i')),
       ),
     ),
@@ -352,24 +401,24 @@ async function sendMessage(rawText) {
 function updateSub() {
   if (!els.sub) return;
   if (sending) {
-    els.sub.textContent = '系统助手 · 发送中';
+    els.sub.textContent = t('chat.sub.sending');
     return;
   }
   const config = state.config;
   const provider = config?.llm?.provider;
   if (provider === 'openai') {
-    const model = config?.llm?.model || 'OpenAI 兼容';
-    els.sub.textContent = `系统助手 · ${model} · 操作员`;
+    const model = config?.llm?.model || 'OpenAI';
+    els.sub.textContent = t('chat.sub.openai', { model });
   } else if (provider === 'mock') {
-    els.sub.textContent = '系统助手 · 离线规则 · 操作员';
+    els.sub.textContent = t('chat.sub.mock');
   } else {
-    els.sub.textContent = '系统助手 · 待命';
+    els.sub.textContent = t('chat.sub.waiting');
   }
 }
 
 function updateConnectionLabel(status = state.sse) {
   if (!els.sub || state.loaded === false) return;
-  if (status === 'reconnecting') els.sub.textContent = '系统助手 · 事件流重连中';
+  if (status === 'reconnecting') els.sub.textContent = t('chat.sub.reconnecting');
   else if (status === 'live') updateSub();
 }
 
@@ -388,7 +437,7 @@ function updateContext() {
     ? state.agents.filter((agent) => agent.project_id === project.id &&
         ['working', 'waiting', 'idle', 'spawning'].includes(agent.status)).length
     : 0;
-  const nodes = [el('span', { class: 'ctx-label' }, '上下文')];
+  const nodes = [el('span', { class: 'ctx-label' }, t('chat.ctx.label'))];
   if (project) {
     nodes.push(el('button', {
       class: 'ctx-chip',
@@ -399,15 +448,17 @@ function updateContext() {
     el('span', { class: 'ctx-dot', 'aria-hidden': 'true' }),
     `${project.name} · ${statusLabel(project.status)} · ${Math.round(project.progress || 0)}%`));
     const counts = project.counts || {};
-    nodes.push(el('span', {}, `待审 ${Number(counts.review) || 0} · 在岗 ${activeAgents}`));
+    nodes.push(el('span', {}, t('chat.ctx.review_agents', {
+      review: Number(counts.review) || 0, agents: activeAgents,
+    })));
     if (openProjects.length > 1) {
-      nodes.push(el('span', {}, `另有 ${openProjects.length - 1} 个项目`));
+      nodes.push(el('span', {}, t('chat.ctx.more_projects', { n: openProjects.length - 1 })));
     }
   } else {
-    nodes.push(el('span', {}, '全系统'));
+    nodes.push(el('span', {}, t('chat.ctx.all')));
   }
-  nodes.push(el('span', {}, `单元 ${online}/${state.units.length}`));
-  nodes.push(el('span', {}, `待审批 ${state.approvals.length}`));
+  nodes.push(el('span', {}, t('chat.ctx.units', { online, total: state.units.length })));
+  nodes.push(el('span', {}, t('chat.ctx.approvals', { n: state.approvals.length })));
   els.context.replaceChildren(...nodes);
   els.context.hidden = false;
 }
@@ -449,6 +500,19 @@ function onScroll() {
 function updateScrollButton() {
   if (!els.scrollBottom) return;
   els.scrollBottom.hidden = distanceFromBottom() < 140;
+}
+
+/** Re-render the copy that lives outside the static markup (language change). */
+export function rerenderChat() {
+  renderSuggestions();
+  updateSub();
+  updateContext();
+  els.log.querySelector('.chat-empty-wrap')?.remove();
+  renderEmptyIfNeeded();
+  if (typingNode) {
+    removeTyping();
+    if (state.typing) showTyping(true);
+  }
 }
 
 function hideLoading() {

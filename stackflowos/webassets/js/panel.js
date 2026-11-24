@@ -5,6 +5,7 @@
 
 import { on, state } from './store.js';
 import { openApp } from './apps.js';
+import { t } from './i18n.js';
 import { sendPrompt } from './chat.js';
 import {
   agoShort,
@@ -27,6 +28,11 @@ let tickerFrame = null;
 let lastErrorToast = 0;
 
 const ACTIVE_AGENT_STATUSES = new Set(['working', 'waiting', 'idle', 'spawning']);
+
+/** Re-render every panel copy (used after a language change). */
+export function rerenderPanel() {
+  render();
+}
 
 export function initPanel() {
   els.grid = document.getElementById('project-grid');
@@ -116,8 +122,8 @@ function renderStatus() {
   }
   if (els.workHeading) {
     els.workHeading.textContent = state.loaded
-      ? `工作面板 · ${Number(stats.active_projects) || 0} 个项目`
-      : '工作面板';
+      ? t('work.heading.count', { n: Number(stats.active_projects) || 0 })
+      : t('work.heading');
   }
 }
 
@@ -153,11 +159,11 @@ function renderProjects() {
       ['active', 'degraded'].includes(project.status)).length;
     const review = projects.filter((project) => project.status === 'review').length;
     const bits = [];
-    if (active) bits.push(`${active} 进行中`);
-    if (review) bits.push(`${review} 待验收`);
+    if (active) bits.push(t('projects.count.active', { n: active }));
+    if (review) bits.push(t('projects.count.review', { n: review }));
     els.projectCount.textContent = bits.length
-      ? `${bits.join(' · ')} / ${projects.length} 总计`
-      : `${projects.length} 总计`;
+      ? `${bits.join(' · ')} / ${t('projects.count', { n: projects.length })}`
+      : t('projects.count', { n: projects.length });
   }
 
   if (!projects.length) {
@@ -180,8 +186,8 @@ function projectEmptyState() {
   ];
   return el('div', { class: 'empty-state' },
     el('div', { class: 'empty-glyph' }, icon('projects')),
-    el('h4', {}, '还没有项目'),
-    el('p', {}, '在左侧跟系统说一句话就能开工。它会拆任务、派 Agent，并在卡片上实时汇报进度。'),
+    el('h4', {}, t('projects.empty.title')),
+    el('p', {}, t('projects.empty.text')),
     el('div', { class: 'suggestion-row' },
       ...examples.map((text) => el('button', {
         class: 'suggestion-chip',
@@ -222,15 +228,15 @@ function projectCard(project, index) {
     el('div', { class: 'pc-mid' },
       ring(project.progress || 0, { size: index === 0 ? 56 : 52 }),
       el('div', { class: 'pc-counts' },
-        countCell('待办', counts.todo, ''),
-        countCell('进行', counts.doing, 'is-doing'),
-        countCell('待审', counts.review, 'is-review'),
-        countCell('完成', counts.done, 'is-done'),
+        countCell(t('status.todo'), counts.todo, ''),
+        countCell(t('status.doing'), counts.doing, 'is-doing'),
+        countCell(t('status.review'), counts.review, 'is-review'),
+        countCell(t('status.done'), counts.done, 'is-done'),
       ),
     ),
     el('div', { class: 'pc-task' },
       icon('terminal', 'ico ico-xs'),
-      el('span', { class: 'pc-task-label' }, currentTask ? '当前' : '状态'),
+      el('span', { class: 'pc-task-label' }, currentTask ? t('projects.current') : t('projects.status')),
       el('span', { title: currentTask?.title || '' },
         currentTask?.title || projectStateHint(project)),
     ),
@@ -253,12 +259,12 @@ function projectCard(project, index) {
 }
 
 function projectStateHint(project) {
-  if (project.status === 'done') return '已完成';
-  if (project.status === 'archived') return '已归档';
-  if (project.status === 'review') return '等待验收';
-  if (project.status === 'planning') return '规划中';
-  if (project.degraded) return '需要关注';
-  return '等待派工';
+  if (project.status === 'done') return t('projects.state.done');
+  if (project.status === 'archived') return t('projects.state.archived');
+  if (project.status === 'review') return t('projects.state.review');
+  if (project.status === 'planning') return t('projects.state.planning');
+  if (project.degraded) return t('projects.state.degraded');
+  return t('projects.state.waiting');
 }
 
 function countCell(label, value, tone) {
@@ -283,11 +289,10 @@ function renderAgents() {
   const active = state.agents
     .filter((agent) => ACTIVE_AGENT_STATUSES.has(agent.status))
     .sort((a, b) => statusRank(a.status) - statusRank(b.status));
-  if (els.agentCount) els.agentCount.textContent = `${active.length} 在岗`;
+  if (els.agentCount) els.agentCount.textContent = t('agents.count', { n: active.length });
 
   if (!active.length) {
-    els.agents.replaceChildren(el('p', { class: 'events-empty' },
-      '暂无在岗 Agent · 在「Agent」里手动派工'));
+    els.agents.replaceChildren(el('p', { class: 'events-empty' }, t('agents.empty')));
     return;
   }
 
@@ -331,7 +336,7 @@ function renderEvents() {
     .sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0))
     .slice(0, 40);
   if (!events.length) {
-    els.ticker.replaceChildren(el('li', { class: 'events-empty' }, '事件流待命中'));
+    els.ticker.replaceChildren(el('li', { class: 'events-empty' }, t('events.empty')));
     return;
   }
   els.ticker.replaceChildren(...events.map((event) => el('li', {
