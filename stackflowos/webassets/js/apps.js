@@ -648,7 +648,7 @@ function renderNewProjectForm() {
   return form;
 }
 
-function renderHealthReport(project, report) {
+function renderHealthReport(project, report, healthSlot) {
   const summary = report.summary || {};
   const tone = report.ready ? 'ready' : 'failed';
   const rows = (report.checks || []).map((check) => {
@@ -673,7 +673,7 @@ function renderHealthReport(project, report) {
           await api.onboardProject(project.id);
           toast('已补齐骨架/种子任务/记忆，重新自检中…', 'success');
           const fresh = await api.getProjectHealth(project.id);
-          healthSlot.replaceChildren(renderHealthReport(project, fresh));
+          healthSlot.replaceChildren(renderHealthReport(project, fresh, healthSlot));
           await Promise.all([loadState({ quiet: true }), loadTasks(project.id, { force: true })]);
         } catch (error) {
           toastError(error);
@@ -688,7 +688,7 @@ function renderHealthReport(project, report) {
     withBusy(refresh, async () => {
       try {
         const fresh = await api.getProjectHealth(project.id);
-        healthSlot.replaceChildren(renderHealthReport(project, fresh));
+        healthSlot.replaceChildren(renderHealthReport(project, fresh, healthSlot));
       } catch (error) {
         toastError(error);
       }
@@ -740,7 +740,7 @@ function renderProjectDetail(project) {
     withBusy(healthBtn, async () => {
       try {
         const report = await api.getProjectHealth(project.id);
-        healthSlot.replaceChildren(renderHealthReport(project, report));
+        healthSlot.replaceChildren(renderHealthReport(project, report, healthSlot));
         healthSlot.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       } catch (error) {
         toastError(error);
