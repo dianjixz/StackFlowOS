@@ -391,7 +391,12 @@ def _make_skill_renderer(cfg: Config):
 
 
 def _make_brain(role: str, cfg: Config):
-    if cfg.llm.provider != "mock":
+    # A router/fallback configuration is meaningful even when the primary
+    # provider is still the offline mock (e.g. only some roles use a real
+    # model), so do not gate solely on the primary provider name.
+    if (cfg.llm.provider != "mock"
+            or getattr(cfg.llm, "routes", None)
+            or getattr(cfg.llm, "fallback", None)):
         try:
             from ..ai.llm import LLMBrain
             provider = make_provider(cfg.llm)
