@@ -323,7 +323,8 @@ workspace 写 `brief.md`；每个项目保留最近 5 条已结束 aggregator �
 * hub 每秒跑一次维护循环：`approvals.sweep()` 把过期 pending 置 `expired`（fail
   closed），`leases.sweep()` 回收过期租约。Agent 死亡/被杀/项目归档时，其名下
   pending 审批会被系统以 `deny` 关闭，避免“人走单还挂着”。
-* `EPHEMERAL_TYPES = ("chat.delta", "stream.chunk")` 不落盘、不占 seq 持久位置
+* `EPHEMERAL_TYPES = ("chat.delta", "agent.chat.delta", "stream.chunk")`
+  不落盘、不占 seq 持久位置
   （仍递增 seq，只是不写文件；重启后 seq 从文件最大值继续）。
 
 ### 5.7 事件目录（稳定契约）
@@ -345,6 +346,7 @@ rule.created / rule.updated / rule.deleted
 tool.invoked / tool.result / tool.denied / tool.failed
 failure.detected / failure.action
 chat.message / chat.delta / chat.typing
+agent.chat.message / agent.chat.delta / agent.chat.tool / agent.chat.state / agent.chat.thread
 memory.updated / demo.seeded
 ```
 
@@ -599,6 +601,36 @@ class Brain(Protocol):
 * 助手对话：provider=mock 时用规则意图（查状态/建项目/派工/审批提示）；
   provider=openai 时走模型，但工具仍受审批约束。
 
+### 8.5 Agent 对话（per-agent conversation）
+
+「Agent」花名册里的每个成员都是对话入口：点击后进入 `#agent/<id>`，由
+`AgentChatService`（`session/agent_chat.py`）托管该 Agent 的独立线程。
+
+* **线程**：一个 Agent 一个线程，持久化在
+  `<state>/state/agent-chat/<agent_id>.json`（最多 400 条，消息角色
+  `user|assistant|system`；assistant 的 `meta.tools` 保存工具卡片）。
+* **一轮**：用户消息先落盘并广播 → 组装 system prompt（OS 协议 + 角色职责 +
+  角色工具目录 + 项目/任务/工作区/近期事件）→ LLM 工具循环（最多 8 步）→
+  分块流式输出 → assistant 消息落盘。同一 Agent 同时只允许一轮（409）；
+  刷新页面或从另一标签页打开时，`GET .../chat` 会带上正在执行轮的 `draft`
+  （工具卡片正在等待审批也能看到）。
+* **工具与权限**：工具集来自该角色；`ToolExecutor` 在项目 workspace 内执行。
+  `_AgentSys` 用 `agent_id`/project/task 构造一个合成 unit principal，所有
+  `task.*`/`project.*`/`agent.*` 调用仍走
+  `App.handle_rpc_action(external=True)` 的作用域检查，审批请求的 owner 是该
+  Agent，事件由 hub 以 `agent:<id>` 盖章。因此**角色工具、workspace 限制、
+  审批队列和审计与 worker 进程一致**；附着的只读项目或已归档项目不能写文件/跑命令。
+* **停止/清空**：取消当前 turn 时会拒绝该轮创建的待审批请求，避免审批中心出现
+  “执行者已经不在”的悬挂项；清空线程会先停止本轮再删除线程文件。
+* **事件**：`agent.chat.message`（完整消息）、`agent.chat.delta`（流式/typing，
+  ephemeral）、`agent.chat.tool`（工具卡状态 running/ok/failed/denied）、
+  `agent.chat.state`（busy）、`agent.chat.thread`（清空）。
+* **边界（有意的取舍）**：对话轮运行在 hub 内，不复活也不中断该 Agent 的
+  worker 进程；它让已结束的 Agent 仍可被人类点名继续工作，代价是这一轮的工具
+  执行不在独立进程里。高风险动作仍必须经审批，作用域检查不变。若 Agent 的
+  worker 正在执行任务，对话不会抢占它的 task；两者对同一 workspace 的写操作
+  由审批/规则和人工协调。
+
 ---
 
 ## 9. Web 与 UI
@@ -636,6 +668,10 @@ loopback 地址，除非显式设置 `web.allow_remote = true`（CLI 对应
 | GET | `/api/agents` | Agent 列表 |
 | POST | `/api/agents` | `{role, project_id, task_id?}` 手动派工 |
 | DELETE | `/api/agents/{id}` | 杀 Agent |
+| GET | `/api/agents/{id}/chat` | 该 Agent 的线程 + 实时 `draft`（工具卡/typing） |
+| POST | `/api/agents/{id}/chat` | `{text}` → 202，回复走 `agent.chat.*` SSE |
+| POST | `/api/agents/{id}/chat/cancel` | 停止当前轮并拒绝该轮的待审批 |
+| DELETE | `/api/agents/{id}/chat` | 清空该 Agent 的线程 |
 | GET/PATCH | `/api/config` | 系统设置 |
 | GET | `/api/console` | 审计/事件（按类型过滤） |
 | POST | `/api/system/complete/{project_id}` | 人工确认项目完成 |
@@ -685,10 +721,11 @@ stackflowos/
   projects/        models.py store.py          [C]
   agents/          models.py roles.py tools.py brain.py runner.py supervisor.py api.py [C]
   ai/              llm.py prompts.py           [C]
-  session/         chat.py                     [C/lead]
+  session/         chat.py agent_chat.py       [C/lead]
   app.py           sys 单元装配（RPC 动作表 + 服务接线）           [lead]
   units/           worker.py（每 Agent 一进程）                    [lead]
-  session/         chat.py（对话、流式、助手）                       [lead]
+  session/         chat.py（系统助手对话、流式）                      [lead]
+  session/         agent_chat.py（每个 Agent 的对话与工具轮）          [lead]
   web/             server.py api.py            [D/lead]
   webassets/       index.html css/ js/         [D]
 tests/
@@ -746,3 +783,6 @@ tests/
 9. **Web**：SSE 断线按 `since` 续传；静态页支持 `?no-sse=1` 快照模式（截图/测试用）。
 10. **测试目录**：IPC socket 受 ~100 字节路径限制，集成测试把 state_dir 放在
     浅层临时目录；正常仓库路径 `<repo>/.stackflowos/run` 足够短。
+11. **Agent 对话是 hub 侧会话**：`session/agent_chat.py` 让已结束的 Agent 仍可被
+    对话调用；工具经合成 unit principal 走同一作用域/审批路径，但不运行在独立
+    worker 进程里。若要“每轮对话一个进程”的强隔离，是后续独立设计。

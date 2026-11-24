@@ -139,31 +139,34 @@ def _compact(text: Any, limit: int = 160) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def _parse_action(raw: str) -> dict | None:
-    """Parse a chat action.
+_TOOL_TAG = re.compile(
+    r"<tool\s+name=[\"']([^\"']+)[\"']\s*>(.*?)</tool>", re.S)
+_TOOL_CALL_TAG = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
 
-    Unlike the task brain parser this is strict: the *whole* reply must be one
-    JSON object (or one fenced JSON block).  A normal answer that merely
-    mentions JSON must never be executed as a tool call.
-    """
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    fenced = re.fullmatch(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)\n?```", text, re.S)
-    if fenced:
-        text = fenced.group(1).strip()
-    if not text.startswith("{"):
-        return None
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        return None
+
+def _action_from_payload(payload: Any) -> dict | None:
+    """Normalise the three tool-call shapes local models actually emit."""
     if not isinstance(payload, dict):
         return None
     tool = payload.get("tool")
+    args = payload.get("args")
+    if not isinstance(tool, str) or not tool.strip():
+        # OpenAI function-call shape: {"name": "...", "arguments": "{...}"}.
+        tool = payload.get("name")
+        args = payload.get("arguments", args)
+        if not isinstance(tool, str) or not tool.strip():
+            # {"function": {"name": "...", "arguments": {...}}}
+            function = payload.get("function")
+            if isinstance(function, dict):
+                tool = function.get("name")
+                args = function.get("arguments", args)
     if not isinstance(tool, str) or not tool.strip():
         return None
-    args = payload.get("args")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = None
     if args is None:
         args = {}
     if not isinstance(args, dict):
@@ -173,6 +176,111 @@ def _parse_action(raw: str) -> dict | None:
     if isinstance(say, str) and say.strip():
         action["say"] = _compact(say, 300)
     return action
+
+
+#: DeepSeek's native tool tags are occasionally emitted even when the prompt
+#: asks for JSON.  The token has unicode vertical bars around "DSML", so match
+#: the tag shape rather than the exact spelling.
+_DSML_INVOKE = re.compile(
+    r"<[^>]*?DSML[^>]*?\s+invoke\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)"
+    r"</[^>]*?DSML[^>]*?\s+invoke\s*>", re.S)
+_DSML_PARAM = re.compile(
+    r"<[^>]*?DSML[^>]*?\s+parameter\s+name=[\"']([^\"']+)[\"']"
+    r"(?:\s+string=[\"'](true|false)[\"'])?[^>]*>(.*?)"
+    r"</[^>]*?DSML[^>]*?\s+parameter\s*>", re.S)
+_GENERIC_INVOKE = re.compile(
+    r"<invoke\s+name=[\"']([^\"']+)[\"']\s*>(.*?)</invoke>", re.S)
+_GENERIC_PARAM = re.compile(
+    r"<parameter\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>", re.S)
+
+
+def _params_from_tags(body: str, pattern: re.Pattern) -> dict:
+    args: dict[str, Any] = {}
+    for match in pattern.finditer(body):
+        name = match.group(1)
+        raw_value = match.group(3) if pattern is _DSML_PARAM else match.group(2)
+        string_flag = match.group(2) if pattern is _DSML_PARAM else None
+        value: Any = raw_value.strip()
+        if string_flag == "false" or (string_flag is None and str(value).startswith(("{", "["))):
+            try:
+                value = json.loads(str(value))
+            except ValueError:
+                pass
+        args[str(name)] = value
+    return args
+
+
+def _action_from_native_tags(text: str) -> dict | None:
+    """Parse DSML / Anthropic-style <invoke>/<parameter> tool tags."""
+    for pattern, param_pattern in ((_DSML_INVOKE, _DSML_PARAM),
+                                   (_GENERIC_INVOKE, _GENERIC_PARAM)):
+        match = pattern.search(text)
+        if match is None:
+            continue
+        name = match.group(1).strip()
+        args = _params_from_tags(match.group(2), param_pattern)
+        if not name:
+            continue
+        if "args" in args and isinstance(args["args"], dict):
+            args = dict(args["args"])
+        return {"tool": name, "args": args}
+    return None
+
+
+def _parse_action(raw: str) -> dict | None:
+    """Parse a chat action from the model reply.
+
+    The documented protocol is one JSON object.  Local models also wrap the
+    call in a fenced block, an XML ``<tool name="...">...</tool>`` tag or an
+    OpenAI function-call shape; all of those are accepted.  A normal answer
+    that merely *mentions* JSON must never be executed as a tool call, so the
+    reply has to be essentially just the call.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    fenced = re.fullmatch(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)\n?```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        action = _action_from_payload(payload)
+        if action is not None:
+            return action
+    # <tool name="shell.exec">{"command": "..."}</tool>
+    tagged = _TOOL_TAG.search(text)
+    if tagged is not None:
+        name = tagged.group(1).strip()
+        body = tagged.group(2).strip()
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            payload = None
+        if payload is None:
+            return None
+        if isinstance(payload, dict) and "args" in payload:
+            candidate = _action_from_payload(payload)
+            if candidate is not None:
+                candidate["tool"] = name or candidate["tool"]
+                return candidate
+        # The tag name is authoritative; the body is the args object.
+        if isinstance(payload, dict):
+            return {"tool": name, "args": payload}
+        return None
+    # <tool_call>{"tool": "...", "args": {...}}</tool_call>
+    call = _TOOL_CALL_TAG.search(text)
+    if call is not None:
+        body = call.group(1).strip()
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            return None
+        return _action_from_payload(payload)
+    # DeepSeek DSML / Anthropic <invoke> tool tags.
+    return _action_from_native_tags(text)
 
 
 class _AgentSys:
@@ -222,6 +330,12 @@ class AgentChatService:
         self.log = logger or get_logger("agent_chat")
         self._threads: dict[str, list[AgentChatMessage]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        #: Live (in-flight) turn snapshot so a chat opened mid-turn can show
+        #: the tool call that is currently waiting for approval.
+        self._drafts: dict[str, dict] = {}
+        #: When the current turn started, used to cancel only the approvals
+        #: that belong to that turn (not a live worker's older request).
+        self._turn_started: dict[str, int] = {}
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -249,6 +363,18 @@ class AgentChatService:
     def busy(self, agent_id: str) -> bool:
         task = self._tasks.get(str(agent_id))
         return task is not None and not task.done()
+
+    def draft(self, agent_id: str) -> dict | None:
+        """Snapshot of the running turn (tool cards / typing), if any."""
+        value = self._drafts.get(str(agent_id))
+        if not value:
+            return None
+        return {
+            "message_id": value.get("message_id"),
+            "typing": bool(value.get("typing")),
+            "text": value.get("text") or "",
+            "tools": [dict(item) for item in value.get("tools") or []],
+        }
 
     def history(self, agent_id: str, limit: int = 200) -> list[dict]:
         thread = self._thread(agent_id)
@@ -290,6 +416,7 @@ class AgentChatService:
         self._emit(agent, "agent.chat.state",
                     {"agent_id": agent_id, "busy": True})
 
+        self._turn_started[agent_id] = now_ms()
         task = asyncio.create_task(self._reply(agent, message),
                                    name=f"agent-chat-{agent_id}")
         self._tasks[agent_id] = task
@@ -297,6 +424,7 @@ class AgentChatService:
         def _done(finished: asyncio.Task, aid: str = agent_id) -> None:
             if self._tasks.get(aid) is finished:
                 self._tasks.pop(aid, None)
+                self._turn_started.pop(aid, None)
             if not finished.cancelled():
                 try:
                     finished.exception()
@@ -318,21 +446,31 @@ class AgentChatService:
         return message.to_dict()
 
     def cancel(self, agent_id: str) -> bool:
-        """Ask the running turn (if any) to stop.  Returns True when cancelled."""
+        """Ask the running turn (if any) to stop.  Returns True when cancelled.
+
+        Pending approvals created by this turn are denied too: leaving them in
+        the queue would show an actionable approval whose executor is gone.
+        """
         agent_id = self._validate_id(agent_id)
         task = self._tasks.get(agent_id)
         if task is None or task.done():
             return False
+        started = self._turn_started.get(agent_id)
         task.cancel()
+        self._deny_turn_approvals(agent_id, started,
+                                  "agent chat turn stopped")
         return True
 
     async def clear(self, agent_id: str) -> bool:
         """Stop the current turn (if any) and forget the thread."""
         agent_id = self._validate_id(agent_id)
         task = self._tasks.get(agent_id)
+        started = self._turn_started.get(agent_id)
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        self._deny_turn_approvals(agent_id, started, "agent chat cleared")
+        self._turn_started.pop(agent_id, None)
         self._threads[agent_id] = []
         path = self._thread_path(agent_id)
         try:
@@ -350,12 +488,35 @@ class AgentChatService:
                        {"agent_id": agent_id, "busy": False})
         return True
 
+    def _deny_turn_approvals(self, agent_id: str, started: int | None,
+                             reason: str) -> None:
+        try:
+            requests = self.app.approvals.list(status="pending")
+        except Exception:
+            return
+        for request in requests:
+            if str(getattr(request, "principal", "")) != agent_id:
+                continue
+            created = int(getattr(request, "created_at", 0) or 0)
+            if started is not None and created < int(started):
+                continue
+            try:
+                self.app.approvals.decide(
+                    request.id, decision="deny", by="human:operator",
+                    note=reason)
+            except Exception:
+                self.log.debug("could not deny chat approval %s",
+                               getattr(request, "id", "?"), exc_info=True)
+
     # ------------------------------------------------------------------
     # one reply turn
     # ------------------------------------------------------------------
     async def _reply(self, agent: Agent, user_msg: AgentChatMessage) -> None:
         reply_id = _mid()
         tools_used: list[dict] = []
+        self._drafts[agent.id] = {
+            "message_id": reply_id, "typing": True, "text": "", "tools": [],
+        }
         try:
             project = self._project(agent)
             executor = self._executor(agent, project)
@@ -399,6 +560,8 @@ class AgentChatService:
                 self._emit(agent, "agent.chat.message", message.to_dict())
             except Exception:  # pragma: no cover - never mask the original error
                 self.log.exception("could not persist failed chat reply")
+        finally:
+            self._drafts.pop(agent.id, None)
 
     async def _tool_loop(self, agent: Agent, project: Any,
                          messages: list[dict], tools: list[Any],
@@ -430,6 +593,7 @@ class AgentChatService:
                 await self._typing(agent, reply_id, False)
                 record = self._run_tool_record(agent, action, reply_id)
                 records.append(record)
+                self._draft_upsert_tool(agent.id, record)
                 await self._emit_tool(agent, reply_id, record)
                 try:
                     result = await executor.run(action["tool"], action["args"])
@@ -437,6 +601,7 @@ class AgentChatService:
                     result = ToolResult(ok=False,
                                         error=f"{type(exc).__name__}: {exc}")
                 self._finish_tool_record(record, result)
+                self._draft_upsert_tool(agent.id, record)
                 await self._emit_tool(agent, reply_id, record)
                 messages.append({"role": "assistant", "content": text[:4000]})
                 messages.append({"role": "user", "content": (
@@ -510,9 +675,41 @@ class AgentChatService:
         record["ok"] = bool(result.ok)
         if result.preview:
             record["preview"] = str(result.preview)[:MAX_TOOL_PREVIEW]
+        if result.ok:
+            output = self._tool_output(result)
+            if output:
+                record["output"] = output
         if error:
             record["error"] = _compact(error, 600)
         record["finished_at"] = now_ms()
+
+    @staticmethod
+    def _tool_output(result: ToolResult, limit: int = 1200) -> str:
+        """A short, human-useful rendering of a tool result for the tool card."""
+        data = result.data if isinstance(result.data, dict) else {}
+        for key in ("stdout", "content"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value if len(value) <= limit else value[:limit] + "…"
+                return text
+        entries = data.get("entries")
+        if isinstance(entries, list):
+            lines = []
+            for item in entries[:60]:
+                if not isinstance(item, dict):
+                    continue
+                suffix = "/" if item.get("type") == "dir" else ""
+                size = item.get("size")
+                lines.append(f"{item.get('name')}{suffix}"
+                             + (f"  ({size} B)" if isinstance(size, int) else ""))
+            if lines:
+                return "\n".join(lines)[:limit]
+        if data:
+            try:
+                return json.dumps(data, ensure_ascii=False, default=str)[:limit]
+            except (TypeError, ValueError):
+                return ""
+        return ""
 
     @staticmethod
     def _result_payload(result: ToolResult) -> dict:
@@ -608,6 +805,8 @@ class AgentChatService:
             "- 需要动手时，只输出一个 JSON 对象："
             '{"tool": "工具名", "args": {...}}；不要加 Markdown 代码块，'
             "不要一次输出多个 JSON。\n"
+            "- 不要使用 DSML、XML、<tool>、<invoke> 或函数调用标签；"
+            "系统只认 JSON 动作对象。\n"
             "- 每次只调用一个工具；文件路径只能位于项目 workspace 内。\n"
             "- 中高风险动作会进入审批，等待操作员放行；被拒绝时如实说明，"
             "不要换路径或命令绕过。\n"
@@ -765,7 +964,23 @@ class AgentChatService:
         except Exception:  # pragma: no cover - telemetry is best effort
             self.log.debug("cannot emit %s", type, exc_info=True)
 
+    def _draft_upsert_tool(self, agent_id: str, record: dict) -> None:
+        draft = self._drafts.get(agent_id)
+        if draft is None:
+            return
+        item = {key: value for key, value in record.items()
+                if key != "message_id"}
+        tools = draft.setdefault("tools", [])
+        for index, existing in enumerate(tools):
+            if existing.get("id") == item.get("id"):
+                tools[index] = item
+                return
+        tools.append(item)
+
     async def _typing(self, agent: Agent, message_id: str, on: bool) -> None:
+        draft = self._drafts.get(agent.id)
+        if draft is not None:
+            draft["typing"] = bool(on)
         self._emit(agent, "agent.chat.delta", {
             "message_id": message_id,
             "delta": "",
@@ -778,9 +993,14 @@ class AgentChatService:
         for index in range(0, len(text), _STREAM_CHUNK):
             if self._closed:
                 return
+            chunk = text[index:index + _STREAM_CHUNK]
+            draft = self._drafts.get(agent.id)
+            if draft is not None:
+                draft["text"] = str(draft.get("text") or "") + chunk
+                draft["typing"] = False
             self._emit(agent, "agent.chat.delta", {
                 "message_id": message_id,
-                "delta": text[index:index + _STREAM_CHUNK],
+                "delta": chunk,
                 "role": "assistant",
             })
             await asyncio.sleep(_STREAM_DELAY_S)

@@ -12,10 +12,39 @@ from pathlib import Path
 from stackflowos.app import App
 from stackflowos.config import Config, default_root
 from stackflowos.errors import Conflict, NotFound
-from stackflowos.session.agent_chat import AgentChatService
+from stackflowos.session.agent_chat import AgentChatService, _parse_action
 from stackflowos.web.api import WebAPI
 
 REPO = default_root()
+
+
+class ActionParserTests(unittest.TestCase):
+    def test_accepts_documented_and_native_shapes(self) -> None:
+        cases = {
+            '{"tool": "fs.list", "args": {"path": "."}}':
+                {"tool": "fs.list", "args": {"path": "."}},
+            '```json\n{"tool": "fs.read", "args": {"path": "a"}}\n```':
+                {"tool": "fs.read", "args": {"path": "a"}},
+            '<tool name="shell.exec">{"command": "echo hi"}</tool>':
+                {"tool": "shell.exec", "args": {"command": "echo hi"}},
+            '<tool name="fs.list">{"path": "."}</tool>':
+                {"tool": "fs.list", "args": {"path": "."}},
+            '<tool_call>{"name": "fs.list", "arguments": {"path": "."}}</tool_call>':
+                {"tool": "fs.list", "args": {"path": "."}},
+            '<｜｜DSML｜｜ invoke name="shell.exec"><｜｜DSML｜｜ '
+            'parameter name="command" string="true">echo hi</｜｜DSML｜｜ parameter>'
+            '</｜｜DSML｜｜ invoke>':
+                {"tool": "shell.exec", "args": {"command": "echo hi"}},
+            '<invoke name="fs.list"><parameter name="path">.</parameter></invoke>':
+                {"tool": "fs.list", "args": {"path": "."}},
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(_parse_action(raw), expected)
+
+    def test_plain_prose_is_not_an_action(self) -> None:
+        self.assertIsNone(_parse_action("工作区里有 README.md，我读过了。"))
+        self.assertIsNone(_parse_action("JSON 示例：{\"tool\": \"fs.list\"}"))
 
 
 class ScriptedProvider:
@@ -205,6 +234,32 @@ class AgentChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[-1]["role"], "system")
         self.assertIn("本轮已停止", history[-1]["text"])
         self.assertFalse(self.app.agent_chat.busy(self.agent.id))
+
+    async def test_cancel_denies_turn_approvals(self) -> None:
+        provider = ScriptedProvider([
+            json.dumps({"tool": "fs.write", "args": {
+                "path": "notes/b.txt", "content": "should not be written"}}),
+        ])
+        self.use(provider)
+        await self.app.agent_chat.send_user(self.agent.id, "写一个文件")
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if self.app.approvals.list(status="pending"):
+                break
+            await asyncio.sleep(0.03)
+        pending = self.app.approvals.list(status="pending")
+        self.assertTrue(pending, "fs.write should park for approval")
+        self.assertEqual(pending[0].principal, self.agent.id)
+        self.assertTrue(self.app.agent_chat.cancel(self.agent.id))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.app.agent_chat.busy(self.agent.id):
+            await asyncio.sleep(0.03)
+        self.assertFalse(self.app.agent_chat.busy(self.agent.id))
+        self.assertEqual(self.app.approvals.list(status="pending"), [])
+        history = self.app.agent_chat.history(self.agent.id)
+        self.assertEqual(history[-1]["role"], "system")
+        self.assertIn("本轮已停止", history[-1]["text"])
+        self.assertFalse((self.workspace / "notes" / "b.txt").exists())
 
     async def test_clear_removes_thread(self) -> None:
         self.use(ScriptedProvider(["好的。"]))

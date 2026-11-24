@@ -13,6 +13,8 @@
 - 每个工人 Agent 是一个独立进程；危险动作走审批；放行规则由人定义，审计只读、不可改
 - **系统助手是操作员代理**：通过对话下达的管理指令直接执行（含审批放行/拒绝、
   改配置、归档/删除项目），每次动作写入 `operator.action` 审计；工人仍受审批约束
+- **每个 Agent 也能单独对话**：在「Agent」里点成员进入 `#agent/<id>`，用它的角色、
+  项目工作区和工具直接干活；一个对话线程按 Agent 持久保存，流式回复与工具调用可见
 
 > 设计与判断的完整推导见 [docs/vision.md](docs/vision.md)，
 > 实现契约见 [docs/architecture.md](docs/architecture.md)，
@@ -59,7 +61,7 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 | App | 内容 |
 |---|---|
 | 项目 | 项目列表与创建；**接入已有目录**；项目详情（任务看板、产物、Agent、里程碑）；归档 / 永久删除（输入项目名二次确认） |
-| Agent | 花名册、按角色派工、终止 |
+| Agent | 花名册、按角色派工、终止；**点成员进入对话**（角色工具 + 项目现场 + 流式工具卡片） |
 | 单元 | 进程表：work_id、地址、状态、能力、心跳 |
 | 审批 | 待审批队列（风险 / 范围 / 预览 / TTL）、放行规则编辑器、审计 |
 | 事件 | 全量事件流（可过滤、可展开原始 JSON） |
@@ -76,6 +78,24 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 | 手机宽度 | 设置 |
 |---|---|
 | ![移动端](docs/img/mobile.png) | ![设置](docs/img/settings.png) |
+
+### Agent 对话
+
+「Agent」应用里的每一行都是入口：点进去会打开这个 Agent 的独立对话。
+
+- **用它的身份工作**：system prompt 是该角色的职责与工具集，工具在项目 workspace 内执行；
+  文件/命令/任务动作仍走同一套能力审批，审批卡片会直接出现在对话上方。
+- **有现场**：右侧同时显示项目进度、当前任务、任务列表、最近活动、Agent 元数据与工作区。
+- **是会话，不是回放**：每个 Agent 一个线程，持久化在
+  `.stackflowos/state/agent-chat/<agent_id>.json`；SSE 流式回复、工具调用状态、
+  「停止本轮」和「清空对话」都实时生效。`#agent/<id>` 可直接深链。
+- **已结束的 Agent 也能继续对话**：线程属于 Agent 记录；进程退出不会丢掉对话，
+  继续对话会以同一角色身份工作（动作仍受审批约束）。
+- 一次只跑一轮：同一 Agent 的并发消息返回 409；停止本轮会把它自己创建的待审批请求一并拒绝。
+
+![Agent 对话（桌面）](docs/img/agent-chat.png)
+
+![Agent 对话（手机）](docs/img/agent-chat-mobile.png)
 
 
 ---

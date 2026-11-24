@@ -1137,7 +1137,7 @@ table { border-collapse: collapse; }
   font-family: var(--mono); font-size: 9.5px; color: var(--text-4);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ac-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
+.ac-head-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
 .ac-banner {
   flex: none; display: flex; align-items: center; gap: 8px;
   padding: 7px 18px; border-bottom: 1px solid var(--line-faint);
@@ -1363,7 +1363,7 @@ table { border-collapse: collapse; }
     border-radius: 0; border-left: 0; border-right: 0;
   }
   .ac-topbar { flex-wrap: wrap; padding: 18px 12px 8px; gap: 8px; }
-  .ac-actions { width: 100%; justify-content: flex-end; }
+  .ac-head-actions { width: 100%; justify-content: flex-end; }
   .ac-identity .avatar { width: 30px; height: 30px; }
   .ac-banner { padding: 7px 12px; }
   .ac-banner .text-btn { margin-left: 0; }

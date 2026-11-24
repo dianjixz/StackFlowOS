@@ -218,7 +218,7 @@ function createView(agentId, agent) {
       avatar(view.agent, { large: true }),
       el('div', { class: 'ac-identity-text' }, nameEl, metaEl),
     ),
-    el('div', { class: 'ac-actions' },
+    el('div', { class: 'ac-head-actions' },
       status, refreshBtn, clearBtn, killBtn, closeBtn),
   );
 
@@ -320,6 +320,10 @@ function fallbackAgent(agentId) {
 
 async function load(view) {
   const token = ++view.token;
+  // A refresh re-fetches the authoritative thread and draft; drop the current
+  // (possibly detached) draft so restoreDraft builds fresh nodes.
+  clearDraft(view);
+  view.pendingUser = null;
   view.loading = true;
   view.els.loading.hidden = false;
   view.els.loading.replaceChildren(spinner(), el('span', {}, '正在载入对话…'));
@@ -340,6 +344,7 @@ async function load(view) {
     syncHeader();
     syncAside();
     syncComposer();
+    if (data && data.draft && data.busy) restoreDraft(view, data.draft);
     if (view.busy && !view.draft) showTyping(view);
     renderEmptyIfNeeded(view);
     scrollToBottom('auto');
@@ -397,6 +402,10 @@ function upsertMessage(view, message, { instant = false } = {}) {
   if (message.role === 'assistant' && view.draft
       && (!view.draft.id || view.draft.id === message.id)) {
     clearDraft(view);
+  }
+  if (message.role === 'system' && message.meta
+      && message.meta.reason === 'cancelled') {
+    stopDraft(view, '本轮已停止');
   }
   const node = buildMessage(view, message, { instant });
   view.seen.set(message.id, node);
@@ -536,7 +545,7 @@ function syncSuggestions(view) {
   if (!view || !view.els.suggestions) return;
   // The empty state already offers role-specific prompts; keep the composer
   // strip for follow-up turns so the two do not repeat the same chips.
-  view.els.suggestions.hidden = view.messages.length > 0;
+  view.els.suggestions.hidden = view.messages.length === 0 || view.busy;
 }
 
 /* ------------------------------------------------------------------ */
@@ -581,6 +590,14 @@ function ensureDraft(view, messageId = null) {
   return view.draft;
 }
 
+function restoreDraft(view, draft) {
+  const node = ensureDraft(view, draft.message_id || null);
+  node.text = String(draft.text || '');
+  node.typing = Boolean(draft.typing) && !node.text;
+  node.tools = Array.isArray(draft.tools) ? draft.tools.slice(0, 20) : [];
+  renderDraft(view);
+}
+
 function showTyping(view, messageId = null) {
   ensureDraft(view, messageId);
   if (view.draft) view.draft.typing = true;
@@ -622,6 +639,22 @@ function clearDraft(view) {
   view.draft = null;
 }
 
+function stopDraft(view, reason) {
+  const draft = view.draft;
+  if (!draft) return;
+  for (const tool of draft.tools) {
+    if (tool.state === 'running') {
+      tool.state = 'failed';
+      tool.error = tool.error || reason;
+    }
+  }
+  draft.typing = false;
+  renderDraft(view);
+  draft.bubble.classList.remove('is-streaming');
+  draft.node.classList.add('is-stopped');
+  view.draft = null;
+}
+
 function updateTool(view, payload) {
   if (!payload || !payload.tool) return;
   const draft = ensureDraft(view, payload.message_id || null);
@@ -633,6 +666,7 @@ function updateTool(view, payload) {
     state: payload.state || 'running',
     args: payload.args || {},
     preview: payload.preview || '',
+    output: payload.output || '',
     error: payload.error || '',
     ts: payload.ts || Date.now(),
   };
@@ -682,11 +716,14 @@ function buildToolCard(tool) {
   if (argText) card.append(el('div', { class: 'ac-tool-args' }, argText));
   if (tool.error) {
     card.append(el('div', { class: 'ac-tool-out is-error' }, String(tool.error)));
-  } else if (tool.preview) {
-    card.append(el('details', { class: 'ac-tool-details' },
-      el('summary', {}, '查看输出'),
-      el('pre', {}, clip(String(tool.preview), 2000)),
-    ));
+  } else {
+    const detail = String(tool.output || tool.preview || '');
+    if (detail) {
+      card.append(el('details', { class: 'ac-tool-details' },
+        el('summary', {}, '查看输出'),
+        el('pre', {}, clip(detail, 2000)),
+      ));
+    }
   }
   return card;
 }
@@ -761,13 +798,10 @@ function setBusy(view, busy) {
     if (!view.draft) showTyping(view);
   } else if (view.draft) {
     // The final message (or the stop note) normally arrives first.  If the
-    // turn ended without one, do not leave an animated typing bubble behind.
+    // turn ended without one, freeze the partial card instead of leaving an
+    // animated spinner that will never update again.
     if (!view.draft.text && !view.draft.tools.length) clearDraft(view);
-    else {
-      view.draft.typing = false;
-      renderDraft(view);
-      view.draft = null;
-    }
+    else stopDraft(view, '本轮已结束');
   }
 }
 

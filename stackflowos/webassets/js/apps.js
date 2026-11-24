@@ -1159,7 +1159,12 @@ function renderAgentsApp() {
     wrap.append(emptyState({
       iconName: 'agents',
       title: '没有符合条件的 Agent',
-      text: '换个筛选条件看看。',
+      text: '换个筛选条件看看；已结束的 Agent 也能点进对话。',
+      actions: view.agentFilter !== 'all' ? [el('button', {
+        class: 'suggestion-chip',
+        type: 'button',
+        onclick: () => { view.agentFilter = 'all'; renderSheet(); },
+      }, '查看全部 Agent')] : [],
     }));
   } else {
     const groups = new Map();
