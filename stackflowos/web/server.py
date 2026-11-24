@@ -29,6 +29,7 @@ from ..errors import BadRequest, SfoError, Unavailable
 from ..protocol import dumps
 from ..util.logging import get_logger
 from .auth import WebAuth, security_headers
+from .api import WebReply
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
 MAX_BODY = 1024 * 1024
@@ -205,8 +206,14 @@ class WebServer:
                 await self._serve_sse(writer, query)
                 return
             if path.startswith("/api/"):
-                status, payload = await self.api.handle(method, path, query, body, headers)
-                await self._send_json(writer, status, payload)
+                status, payload = await self.api.handle(
+                    method, path, query, body, headers, decision)
+                if isinstance(payload, WebReply):
+                    await self._send_raw(writer, payload.status or status,
+                                         payload.body, payload.content_type,
+                                         extra_headers=payload.headers)
+                else:
+                    await self._send_json(writer, status, payload)
                 return
             await self._serve_static(writer, method, path)
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
@@ -335,6 +342,35 @@ class WebServer:
             "\r\n"
         ).encode("latin-1")
         writer.write(header + (body if include_body else b""))
+        await writer.drain()
+
+    async def _send_raw(self, writer: asyncio.StreamWriter, status: int,
+                        body: bytes, content_type: str, *,
+                        extra_headers: dict[str, str] | None = None) -> None:
+        """Send a non-JSON response (Prometheus text, download, ...).
+
+        ``WebReply`` headers are restricted to a safe prefix set: a feature
+        handler must not be able to inject its own framing or security-header
+        overrides.
+        """
+        safe_prefixes = ("content-disposition", "x-", "cache-control")
+        extra = ""
+        for key, value in (extra_headers or {}).items():
+            name = str(key).strip().lower()
+            text = str(value).replace("\r", "").replace("\n", "")
+            if not name or name not in safe_prefixes and not name.startswith(("x-", "content-disposition")):
+                continue
+            extra += f"{name.title()}: {text}\r\n"
+        header = (
+            f"HTTP/1.1 {status} {_reason(status)}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            + extra
+            + security_headers(cache="no-store")
+            + "Connection: close\r\n"
+            "\r\n"
+        ).encode("latin-1")
+        writer.write(header + body)
         await writer.drain()
 
     async def _serve_liveness(self, writer: asyncio.StreamWriter, method: str) -> None:

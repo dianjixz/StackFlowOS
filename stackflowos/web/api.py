@@ -8,15 +8,49 @@ why something was refused.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import re
 import secrets
 from typing import Any, Awaitable, Callable
 
 from ..errors import BadRequest, SfoError
+from ..extensions import extension_routes
 from ..util.logging import get_logger
 
 Handler = Callable[[re.Match, dict, dict], Awaitable[tuple[int, Any]]]
+
+#: Admission decision of the request currently being routed (set per task by
+#: :meth:`WebAPI.handle`).  Handlers that need the authenticated role/user read
+#: it through :func:`current_auth` instead of trusting headers or the query
+#: string.  A context variable keeps concurrent requests isolated.
+_current_auth: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "sfo_web_auth", default=None)
+
+
+def current_auth() -> Any:
+    """The :class:`web.auth.AdmissionDecision` for this request, if any."""
+    return _current_auth.get()
+
+
+class WebReply:
+    """A raw (non-JSON) HTTP response produced by an API handler.
+
+    Used by ``/api/metrics`` (Prometheus text) and other endpoints whose
+    payload is not JSON.  Security headers are still applied by the server.
+    """
+
+    __slots__ = ("body", "content_type", "status", "headers")
+
+    def __init__(self, body: str | bytes, *,
+                 content_type: str = "text/plain; charset=utf-8",
+                 status: int = 200,
+                 headers: dict[str, str] | None = None) -> None:
+        self.body = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+        self.content_type = str(content_type)
+        self.status = int(status)
+        self.headers = dict(headers or {})
+
 
 _INTEGER = re.compile(r"^[+-]?[0-9]+$")
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -95,33 +129,38 @@ class WebAPI:
         self._build_routes()
 
     async def handle(self, method: str, path: str, query: dict, body: bytes,
-                     headers: dict | None = None) -> tuple[int, dict]:
+                     headers: dict | None = None,
+                     auth: Any = None) -> tuple[int, Any]:
         try:
             payload = _decode_body(body)
         except ValueError as exc:
             return 400, {"ok": False, "error": {"code": "BAD_REQUEST",
                                                 "message": str(exc)}}
-        for route_method, pattern, handler in self._routes:
-            if route_method != method:
-                continue
-            match = pattern.fullmatch(path)
-            if not match:
-                continue
-            try:
-                status, result = await handler(match, query, payload)
-                return status, result
-            except SfoError as exc:
-                return exc.http_status, {"ok": False, "error": exc.to_dict()}
-            except Exception:
-                # Never leak exception text (paths, internals) to the client;
-                # the traceback goes to the log under a correlation id.
-                request_id = secrets.token_hex(8)
-                self.log.exception(
-                    "api handler failed: %s %s (request_id=%s)",
-                    method, path, request_id)
-                return 500, {"ok": False, "error": {
-                    "code": "INTERNAL", "message": "internal server error",
-                    "request_id": request_id}}
+        auth_token = _current_auth.set(auth)
+        try:
+            for route_method, pattern, handler in self._routes:
+                if route_method != method:
+                    continue
+                match = pattern.fullmatch(path)
+                if not match:
+                    continue
+                try:
+                    status, result = await handler(match, query, payload)
+                    return status, result
+                except SfoError as exc:
+                    return exc.http_status, {"ok": False, "error": exc.to_dict()}
+                except Exception:
+                    # Never leak exception text (paths, internals) to the client;
+                    # the traceback goes to the log under a correlation id.
+                    request_id = secrets.token_hex(8)
+                    self.log.exception(
+                        "api handler failed: %s %s (request_id=%s)",
+                        method, path, request_id)
+                    return 500, {"ok": False, "error": {
+                        "code": "INTERNAL", "message": "internal server error",
+                        "request_id": request_id}}
+        finally:
+            _current_auth.reset(auth_token)
         return 404, {"ok": False, "error": {"code": "NOT_FOUND",
                                             "message": f"no route {method} {path}"}}
 
@@ -179,6 +218,17 @@ class WebAPI:
         r("PATCH", r"/api/config", self.config_patch)
         r("GET", r"/api/leases", self.leases_list)
         r("POST", r"/api/system/complete/([^/]+)", self.project_complete)
+
+        # Optional subsystems expose their own routes through the extension
+        # contract, so app.py/web/api.py stay a composition root rather than a
+        # switchboard that every feature has to edit.
+        for method, pattern, handler in extension_routes(
+                getattr(self.app, "extensions", [])):
+            try:
+                self._route(method, pattern, handler)
+            except Exception:
+                self.log.exception("invalid extension route %s %s",
+                                   method, pattern)
 
     # ------------------------------------------------------------------
     async def health(self, match, query, body):
@@ -428,6 +478,7 @@ class WebAPI:
             "project": project,
             "messages": self.app.agent_chat.history(agent_id, limit=limit),
             "busy": self.app.agent_chat.busy(agent_id),
+            "draft": self.app.agent_chat.draft(agent_id),
             "provider": getattr(provider, "name", ""),
             "model": getattr(provider, "model", ""),
         })

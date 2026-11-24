@@ -22,9 +22,12 @@ from typing import Any, Callable
 
 from .agents import AgentSupervisor, TASK_ROLES, ToolExecutor
 from .ai import make_provider
-from .config import Config
+from .config import Config, redact_secrets
 from .errors import (BadRequest, Conflict, Denied, NotFound, SfoError,
                      Unauthorized, Unavailable, ValidationError)
+from .extensions import (extension_health, extension_units, load_extensions,
+                         maybe_await, notify_config, start_extensions,
+                         stop_extensions)
 from .kernel import Context
 from .l2 import EventLog, FailureManager, FailurePolicy, LeaseManager, Scheduler, UnitInfo, UnitRegistry
 from .memory import MemoryStore
@@ -140,6 +143,10 @@ class App:
         self._assistant_executor: ToolExecutor | None = None
         self._assistant_agent = None
         self.operator = OperatorTools(self)
+        # Optional subsystems (capabilities, skills, plugins, MCP, unit
+        # control, observability, discovery).  ``load_extensions`` runs after
+        # the core services exist; see stackflowos/extensions.py.
+        self.extensions: list[Any] = []
         self.log = get_logger("app")
         # Protocol v2 credentials: unit tokens are issued for every spawned
         # worker; operator tokens exist only in this process' memory.
@@ -283,6 +290,12 @@ class App:
         )
         await self.agent_chat.start()
 
+        # Optional subsystems are built after the core services exist and
+        # before the hub announces readiness.  A broken extension is logged
+        # and skipped instead of blocking boot (extensions.load_extensions).
+        self.extensions = load_extensions(self)
+        await start_extensions(self.extensions)
+
         self._cancel_orphan_approvals()
         self.eventlog.append("sys.booted", {
             "version": self.version,
@@ -392,6 +405,10 @@ class App:
                 await self.agent_chat.stop()
             except Exception:
                 self.log.exception("agent chat stop failed")
+        try:
+            await stop_extensions(self.extensions)
+        except Exception:
+            self.log.exception("extension shutdown failed")
         try:
             self.eventlog.append("sys.shutdown", {}, source="sys")
         except Exception:
@@ -1962,6 +1979,23 @@ class App:
         if getattr(self, "agent_chat", None) is not None:
             # A live model switch must reach the next agent-chat turn too.
             self.agent_chat.provider = new_provider
+        # Live config fan-out: the supervisor re-reads limits/models for the
+        # next worker, extensions reconcile their own state.  A subsystem that
+        # cannot apply a field reports it through its own event/health entry;
+        # the persisted config remains the source of truth.
+        for target in (self.supervisor, self.chat, self.agent_chat):
+            hook = getattr(target, "on_config", None)
+            if hook is None:
+                continue
+            try:
+                await maybe_await(hook(cfg))
+            except Exception:
+                self.log.exception("live config application failed for %s",
+                                   getattr(target, "name", type(target).__name__))
+        try:
+            await notify_config(self.extensions, cfg)
+        except Exception:
+            self.log.exception("extension config fan-out failed")
         if getattr(new_provider, "name", "") != previous_provider:
             self.eventlog.append("sys.llm.updated", {
                 "provider": getattr(new_provider, "name", ""),
@@ -1976,7 +2010,7 @@ class App:
         if cfg.web.port != previous_port:
             restart_required.append("web.port")
         self.eventlog.append("sys.config.updated", {
-            "patch": patch, "restart_required": restart_required,
+            "patch": redact_secrets(patch), "restart_required": restart_required,
         }, source="operator")
         return {"config": cfg.public_dict(), "restart_required": restart_required}
 
@@ -2009,7 +2043,7 @@ class App:
 
     def health(self) -> dict:
         transport_ok = bool(getattr(self.transport, "running", False))
-        return {
+        payload = {
             "status": "ok" if transport_ok else "degraded",
             "http": "ok",
             "transport": "ok" if transport_ok else "down",
@@ -2017,6 +2051,9 @@ class App:
             "uptime_s": int(time.time() - self.started_at / 1000),
             "units": self.stats().get("units", {}),
         }
+        if getattr(self, "extensions", None):
+            payload["extensions"] = extension_health(self.extensions)
+        return payload
 
     def stats(self) -> dict:
         cards = self.unit_cards()
@@ -2278,8 +2315,28 @@ class App:
             ["mcp.connect", "mcp.list_tools", "mcp.call_tool"],
             provides={"servers": 0},
             requires=("approval.0", "tool.0"),
-            metadata={"description": "MCP server 连接器；每个已配置 server 将登记为 mcp.<name>（协议接入 Phase 2）"},
+            metadata={"description": "MCP server 连接器；每个已配置 server 登记为 mcp.<name>"},
         ))
+        # Let optional subsystems contribute or replace descriptors.  The
+        # guard prevents a contributor that inspects the unit list from
+        # recursing into this method.
+        if getattr(self, "extensions", None) and not getattr(
+                self, "_describing_units", False):
+            self._describing_units = True
+            try:
+                contributed = extension_units(self.extensions)
+            finally:
+                self._describing_units = False
+            if contributed:
+                merged: dict[str, dict] = {
+                    str(unit.get("unit_id") or unit.get("work_id")): unit
+                    for unit in units
+                }
+                for unit in contributed:
+                    key = str(unit.get("unit_id") or unit.get("work_id"))
+                    if key:
+                        merged[key] = unit
+                units = list(merged.values())
         return units
 
     def unit_cards(self) -> list[dict]:
