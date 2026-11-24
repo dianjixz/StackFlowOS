@@ -229,6 +229,11 @@ class App:
             rules_path=self.paths.state_dir / "state" / "rules.json",
             config=cfg.security,
             projects_root=self.paths.projects_dir,
+            # Attached projects live outside projects_root.  Risk and approval
+            # path scopes must use the project's recorded workspace, not the
+            # managed path that was never created (otherwise every read in an
+            # attached workspace escalates to high risk).
+            workspace_resolver=self._resolve_project_workspace,
         )
         self.approvals = ApprovalBroker(
             self.ctx, self.policy, self.eventlog,
@@ -1771,6 +1776,16 @@ class App:
             "by": by,
         }, source="operator", project_id=project.id)
         return self.project_card(project.id)
+
+    def _resolve_project_workspace(self, project_id: str) -> str:
+        """Trusted project workspace lookup for policy/approval risk scopes.
+
+        Managed projects resolve under ``projects_root``; attached projects
+        resolve to the operator-chosen directory.  Unknown ids raise
+        :class:`NotFound`; the policy engine then falls back to the managed
+        path (which does not exist), keeping the request fail-closed.
+        """
+        return self.projects.get(str(project_id)).workspace
 
     def _validate_attach_path(self, path: str) -> Path:
         raw = str(path or "").strip()

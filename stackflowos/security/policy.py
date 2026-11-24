@@ -27,7 +27,7 @@ import threading
 from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from ..errors import BadRequest, NotFound, ValidationError
@@ -43,6 +43,7 @@ from .capabilities import (
     normalize_path,
     project_workspace,
     risk_of,
+    validate_project_id,
 )
 
 
@@ -311,7 +312,8 @@ class PolicyEngine:
 
     def __init__(self, ctx: Context, eventlog: EventLog, *, rules_path: Path,
                  config: Any = None,
-                 projects_root: Path | None = None) -> None:
+                 projects_root: Path | None = None,
+                 workspace_resolver: Callable[[str], Any] | None = None) -> None:
         self.ctx = ctx
         self.eventlog = eventlog
         self.rules_path = Path(rules_path)
@@ -325,6 +327,13 @@ class PolicyEngine:
             projects_dir = getattr(paths, "projects_dir", None)
             projects_root = projects_dir if projects_dir is not None else Path.cwd()
         self.projects_root = Path(projects_root)
+        #: Optional trusted resolver ``project_id -> workspace path``.  Managed
+        #: projects live under :attr:`projects_root`; attached projects live at
+        #: an operator-chosen path.  ``App`` injects the project store lookup so
+        #: a worker's real boundary is used for dynamic risk and approval path
+        #: scopes instead of the never-created managed path (the old behaviour
+        #: escalated every attached-workspace read to high risk).
+        self.workspace_resolver = workspace_resolver
         self._rules: dict[str, Rule] = {}
         self._lock = threading.RLock()
         self._warned: set[tuple] = set()
@@ -535,8 +544,41 @@ class PolicyEngine:
                                 "one-shot grant already spent", rule)
             return decision
 
+    def workspace_for(self, project_id: str) -> Path:
+        """Return the workspace boundary of one project.
+
+        The injected resolver wins (attached projects live outside
+        ``projects_root``); managed and unknown projects fall back to
+        ``<projects_root>/<project_id>/workspace``.  An unknown id therefore
+        resolves to a path that does not exist, so requests inside the real
+        directory still escalate to high risk (fail closed) instead of being
+        silently widened.
+
+        ``project_id`` is validated first (M9): a non-string or hostile id such
+        as ``../../etc`` raises :class:`ValidationError` and can never move the
+        boundary.
+        """
+        pid = validate_project_id(project_id)
+        resolver = self.workspace_resolver
+        if resolver is not None:
+            try:
+                resolved = resolver(pid)
+            except ValidationError:
+                # Invalid ids must keep the fail-closed validation error shape.
+                raise
+            except (NotFound, KeyError, ValueError):
+                resolved = None
+            except Exception:  # noqa: BLE001 - a resolver bug must not widen scope
+                self.log.warning("workspace resolver failed for project %r; "
+                                 "falling back to the managed path", pid,
+                                 exc_info=True)
+                resolved = None
+            if resolved:
+                return Path(str(resolved))
+        return project_workspace(self.projects_root, pid)
+
     def risk(self, capability: str, scope: dict) -> str:
-        """Dynamic risk for a capability under the configured project root.
+        """Dynamic risk for a capability under the project's real workspace.
 
         ``scope["project_id"]`` is validated before the workspace join (M9):
         a hostile id such as ``../../etc`` must raise :class:`ValidationError`
@@ -545,7 +587,7 @@ class PolicyEngine:
         workspace = None
         project_id = (scope or {}).get("project_id")
         if project_id is not None:
-            workspace = project_workspace(self.projects_root, project_id)
+            workspace = self.workspace_for(project_id)
         return risk_of(capability, scope, projects_root=self.projects_root,
                        workspace=workspace)
 

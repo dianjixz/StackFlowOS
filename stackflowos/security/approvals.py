@@ -30,7 +30,7 @@ from ..kernel import Context
 from ..l2.eventlog import EventLog, emit_both
 from ..protocol import new_id, now_ms as _now_ms
 from ..util.jsonio import read_json, write_json
-from .capabilities import project_workspace, risk_of
+from .capabilities import risk_of
 from .policy import PolicyEngine
 
 _MODE_CHOICES = ("once", "session", "always")
@@ -382,18 +382,22 @@ class ApprovalBroker:
         return pattern
 
     def _workspace_root(self, raw: Any, project_id: str | None) -> str | None:
-        """The project workspace when ``raw`` is inside it, else ``None``."""
-        projects_root = getattr(self.policy, "projects_root", None)
-        if not (project_id and projects_root):
+        """The project workspace when ``raw`` is inside it, else ``None``.
+
+        Resolved through the policy engine so attached projects (whose
+        workspace is outside ``projects_root``) get a real ``path_prefix``
+        grant instead of an exact-path grant that never repeats.
+        """
+        if not project_id:
             return None
         try:
-            workspace = project_workspace(projects_root, project_id)
+            workspace = self.policy.workspace_for(project_id)
         except ValidationError:
             # M9: an unusable id must never widen a standing grant; fall back
             # to the exact path (fail closed) instead.
             return None
         try:
-            Path(str(raw)).resolve().relative_to(workspace)
+            Path(str(raw)).resolve().relative_to(workspace.resolve())
         except (ValueError, OSError):
             return None
         return str(workspace)
@@ -649,8 +653,9 @@ class ApprovalBroker:
             getattr(self.policy, "projects_root", None) or Path.cwd())
         workspace = None
         if project_id is not None:
-            # M9: validate the id before joining it into the boundary.
-            workspace = project_workspace(projects_root, project_id)
+            # M9: validate the id before joining it into the boundary.  The
+            # policy engine resolves attached workspaces as well.
+            workspace = self.policy.workspace_for(project_id)
         return risk_of(capability, scope, projects_root=projects_root,
                        workspace=workspace)
 
