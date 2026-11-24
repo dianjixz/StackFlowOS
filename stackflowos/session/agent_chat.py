@@ -937,7 +937,12 @@ class AgentChatService:
         if project is None:
             return None
         workspace = Path(str(getattr(project, "workspace", "") or ""))
-        if not workspace:
+        # ToolExecutor resolves a relative path against the hub's cwd.  A
+        # malformed/legacy project record must not turn into "run in the hub".
+        try:
+            if not workspace.is_absolute() or not workspace.is_dir():
+                return None
+        except OSError:
             return None
         read_only = (getattr(project, "workspace_mode", "") == "attached-ro"
                      or getattr(project, "status", "") == "archived")
