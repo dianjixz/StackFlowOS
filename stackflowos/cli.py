@@ -95,6 +95,39 @@ def _parser() -> argparse.ArgumentParser:
     url.add_argument("--status", action="store_true",
                      help="print control-socket status instead of a URL")
 
+    autonomy = sub.add_parser(
+        "autonomy", help="自治闭环：巡检、自主派工、代理审批（HTTP 控制面）")
+    autonomy.add_argument("--url", default=None,
+                          help="hub base URL (default: config web host/port)")
+    autonomy.add_argument("--token", default=None,
+                          help="web token (default: $SFO_WEB_TOKEN)")
+    autonomy_sub = autonomy.add_subparsers(dest="autonomy_command")
+    autonomy_status = autonomy_sub.add_parser(
+        "status", help="show patrol findings, dispatches and self-approvals")
+    autonomy_status.add_argument("--json", action="store_true")
+    autonomy_patrol = autonomy_sub.add_parser(
+        "patrol", help="run one patrol now (respects the current policy)")
+    autonomy_patrol.add_argument("--dry-run", action="store_true",
+                                 help="report only, never dispatch/approve")
+    autonomy_patrol.add_argument("--json", action="store_true")
+    autonomy_set = autonomy_sub.add_parser(
+        "set", help="update the autonomy policy (persisted)")
+    autonomy_set.add_argument("--enabled", dest="enabled",
+                              action="store_true", default=None)
+    autonomy_set.add_argument("--disabled", dest="disabled",
+                              action="store_true", default=None)
+    autonomy_set.add_argument("--dispatch", choices=("off", "tasks", "agents"),
+                              default=None)
+    autonomy_set.add_argument("--approve",
+                              choices=("off", "observe", "enforce"),
+                              default=None)
+    autonomy_set.add_argument("--risk", choices=("low", "medium", "high"),
+                              default=None,
+                              help="approve_risk_max")
+    autonomy_set.add_argument("--interval", type=float, default=None,
+                              help="patrol interval in seconds")
+    autonomy_set.add_argument("--json", action="store_true")
+
     backup = sub.add_parser("backup", help="create a state archive")
     _add_common(backup)
     backup.add_argument("--dest", default=None, help="target directory/file")
@@ -206,6 +239,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_cli(lambda: _doctor(args))
     if args.command == "status":
         return _run_cli(lambda: _status(args))
+    if args.command == "autonomy":
+        return _run_cli(lambda: _autonomy_cmd(args))
     if args.command == "url":
         return _run_cli(lambda: _url(args))
     if args.command == "backup":
@@ -923,6 +958,134 @@ def _url(args) -> int:
         return 0
     print(reply.get("url", ""))
     return 0
+
+
+def _autonomy_cmd(args) -> int:
+    """``sfo autonomy``: inspect/run/configure the autonomy loop over HTTP."""
+    cfg = _build_config(args, for_web=False)
+    scheme = "https" if cfg.web.tls_cert else "http"
+    base = getattr(args, "url", None) or f"{scheme}://{cfg.web.host}:{cfg.web.port}"
+    token = getattr(args, "token", None) or os.environ.get("SFO_WEB_TOKEN")
+    action = getattr(args, "autonomy_command", None) or "status"
+    method, path, body = "GET", "/api/autonomy/status", None
+    if action == "patrol":
+        method, path = "POST", "/api/autonomy/patrol"
+        body = {"dry_run": bool(getattr(args, "dry_run", False))}
+    elif action == "set":
+        patch: dict = {}
+        if getattr(args, "enabled", None):
+            patch["enabled"] = True
+        if getattr(args, "disabled", None):
+            patch["enabled"] = False
+        if getattr(args, "dispatch", None):
+            patch["dispatch_mode"] = args.dispatch
+        if getattr(args, "approve", None):
+            patch["approve_mode"] = args.approve
+        if getattr(args, "risk", None):
+            patch["approve_risk_max"] = args.risk
+        if getattr(args, "interval", None) is not None:
+            patch["interval_s"] = float(args.interval)
+        if not patch:
+            print("autonomy set: pass at least one of --enabled/--disabled/"
+                  "--dispatch/--approve/--risk/--interval", file=sys.stderr)
+            return 2
+        method, path, body = "PATCH", "/api/autonomy/policy", patch
+    try:
+        payload = _http_json(base, token, method, path, body)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error", {}).get(
+                "message", "")
+        except Exception:  # noqa: BLE001 - best-effort human hint
+            pass
+        print(f"autonomy request failed: HTTP {exc.code}"
+              + (f" ({detail})" if detail else ""), file=sys.stderr)
+        if exc.code == 401:
+            print("pass --token <login token> or set SFO_WEB_TOKEN",
+                  file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"cannot reach hub at {base}: {exc}", file=sys.stderr)
+        return 1
+    if not payload.get("ok"):
+        err = payload.get("error") or {}
+        print(f"autonomy request failed: {err.get('code')} {err.get('message')}",
+              file=sys.stderr)
+        return 1
+    data = payload.get("data") or {}
+    # ``patrol`` returns the report itself; ``status``/``set`` return the view.
+    if isinstance(data.get("report"), dict) or "findings" in data:
+        view = data
+    else:
+        view = (data.get("report") or data)
+    if getattr(args, "json", False):
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    if action == "patrol":
+        print(f"[patrol] {view.get('headline') or '完成'}")
+        summary = view.get("summary") or {}
+        print(f"  critical={summary.get('critical', 0)} "
+              f"warn={summary.get('warn', 0)} info={summary.get('info', 0)} "
+              f"total={summary.get('total', 0)}")
+        for item in view.get("findings") or []:
+            print(f"  [{item.get('severity')}] {item.get('check')} "
+                  f"{item.get('title')}")
+        for record in view.get("dispatched") or []:
+            print(f"  dispatched {record.get('action')} "
+                  f"{record.get('status')} {record.get('role') or ''} "
+                  f"{record.get('agent_id') or ''}")
+        for record in view.get("approvals") or []:
+            print(f"  approval {record.get('decision')} "
+                  f"{record.get('capability')} "
+                  f"{record.get('principal')}")
+        return 0
+    policy = view.get("policy") or {}
+    counts = view.get("counts") or {}
+    print(f"autonomy {'enabled' if view.get('enabled') else 'disabled'}"
+          f"  running={bool(view.get('running'))}"
+          f"  interval={policy.get('interval_s', 0)}s"
+          f"  next={view.get('next_run_in_s')}s")
+    print(f"  dispatch={policy.get('dispatch_mode')} "
+          f"approve={policy.get('approve_mode')} "
+          f"risk_max={policy.get('approve_risk_max')}")
+    print(f"  patrols={counts.get('patrols', 0)} "
+          f"findings={counts.get('findings', 0)} "
+          f"dispatched={counts.get('dispatched', 0)} "
+          f"approvals={counts.get('approvals', 0)} "
+          f"errors={counts.get('errors', 0)}")
+    if view.get("last_run"):
+        print(f"  last_run={time.strftime('%Y-%m-%d %H:%M:%S',
+                                          time.localtime(view['last_run'] / 1000))}")
+    for item in view.get("findings") or []:
+        print(f"  [{item.get('severity')}] {item.get('check')} "
+              f"{item.get('title')}")
+    for record in (view.get("dispatches") or [])[:5]:
+        print(f"  dispatch {record.get('status')} "
+              f"{record.get('action')} {record.get('role') or ''} "
+              f"project={record.get('project_id') or '-'} "
+              f"task={record.get('task_id') or '-'}")
+    for record in (view.get("approvals") or [])[:5]:
+        print(f"  approval {record.get('decision')} "
+              f"{record.get('capability')} "
+              f"principal={record.get('principal')} "
+              f"risk={record.get('risk')}")
+    return 0
+
+
+def _http_json(base: str, token: str | None, method: str, path: str,
+               body: dict | None = None) -> dict:
+    """One authenticated JSON request against the hub API."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(f"{base.rstrip('/')}{path}", data=data,
+                                     method=method)
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+        request.add_header("X-SFO-Request", "1")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def _status(args) -> int:

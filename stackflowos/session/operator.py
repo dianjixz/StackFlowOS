@@ -144,6 +144,18 @@ OPERATOR_TOOLS: dict[str, OperatorTool] = {
         {"since": "integer?", "limit": "integer?", "project_id": "string?"}),
     "llm.test": OperatorTool(
         "llm.test", "llm.chat", "测试当前模型连接", {}),
+    "autonomy.status": OperatorTool(
+        "autonomy.status", "data.read",
+        "查看自治闭环：开关、上次巡检、发现、自主派工/审批记录、策略", {}),
+    "autonomy.patrol": OperatorTool(
+        "autonomy.patrol", "task.manage",
+        "立即巡一遍系统并按当前策略自主派工/代理审批（dry_run=true 只巡检不动手）",
+        {"dry_run": "boolean?"}),
+    "autonomy.configure": OperatorTool(
+        "autonomy.configure", "sys.config",
+        "调整自治策略（enabled、dispatch_mode、approve_mode、配额、能力白名单等；"
+        "confirm 必须是 autonomy 或 true）",
+        {"patch": "object", "confirm": "string"}),
 }
 
 #: Friendly aliases the model may emit. Unknown names are rejected with the
@@ -165,6 +177,11 @@ ALIASES: dict[str, str] = {
     "agent.stop": "agent.kill",
     "unit.stop": "unit.kill",
     "task.get": "task.list",
+    "autonomy.run": "autonomy.patrol",
+    "autonomy.check": "autonomy.patrol",
+    "autonomy.scan": "autonomy.patrol",
+    "autonomy.policy": "autonomy.configure",
+    "autonomy.set": "autonomy.configure",
 }
 
 
@@ -688,6 +705,35 @@ class OperatorTools:
         result = await provider.ping()
         return {**result, "provider": getattr(provider, "name", ""),
                 "model": getattr(provider, "model", "")}
+
+    # -- autonomy --------------------------------------------------------
+    def _autonomy_service(self):
+        service = getattr(self.app, "autonomy", None)
+        if service is None or getattr(service, "name", "") != "autonomy":
+            raise BadRequest(
+                "自治子系统未加载（autonomy extension unavailable）",
+                detail={"fix": "确认 stackflowos.extensions 已注册 "
+                               "stackflowos.autonomy"})
+        return service
+
+    async def _autonomy_status(self, args: dict) -> dict:
+        return self._autonomy_service().status()
+
+    async def _autonomy_patrol(self, args: dict) -> dict:
+        dry_run = bool(args.get("dry_run", False))
+        return await self._autonomy_service().run_patrol(
+            trigger="operator", dry_run=dry_run)
+
+    async def _autonomy_configure(self, args: dict) -> dict:
+        patch = args.get("patch")
+        if not isinstance(patch, dict) or not patch:
+            raise BadRequest("autonomy.configure requires a patch object")
+        confirm = str(args.get("confirm") or "").strip().lower()
+        if confirm not in ("autonomy", "true", "yes", "1"):
+            raise BadRequest(
+                "autonomy.configure requires confirm=autonomy (or true)",
+                detail={"fields": sorted(patch)})
+        return await self._autonomy_service().configure(patch)
 
 
 __all__ = ["OPERATOR_TOOLS", "ALIASES", "OperatorTools", "catalog_text"]

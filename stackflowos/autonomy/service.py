@@ -479,7 +479,14 @@ class AutonomyService:
     # persistence / events
     # ------------------------------------------------------------------
     def _load_state(self) -> dict:
-        raw = read_json(self.state_path, default=None)
+        try:
+            raw = read_json(self.state_path, default=None)
+        except (OSError, ValueError):
+            # A corrupt state file must not stop the hub from booting or from
+            # starting the loop: quarantine it by resetting to a blank state.
+            self.log.warning("autonomy state is unreadable; starting fresh",
+                             exc_info=True)
+            return _blank_state()
         state = _blank_state()
         if not isinstance(raw, dict):
             return state

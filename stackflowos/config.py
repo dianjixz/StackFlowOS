@@ -881,7 +881,12 @@ def _validate_autonomy(section: AutonomyCfg) -> None:
         if not isinstance(project_id, str):
             raise ConfigError(
                 "autonomy.approve_projects entries must be project ids")
-        validate_project_id(project_id)
+        try:
+            validate_project_id(project_id)
+        except Exception as exc:
+            raise ConfigError(
+                f"autonomy.approve_projects: invalid project id "
+                f"{project_id!r}") from exc
     if not isinstance(section.approve_roles, list) or not all(
             isinstance(item, str) and item for item in section.approve_roles):
         raise ConfigError(
