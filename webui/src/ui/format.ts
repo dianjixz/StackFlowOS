@@ -168,9 +168,11 @@ export function eventSummary(evt: SfoEvent): string {
   const head = type.split('.')[0];
   const parts: string[] = [];
   const push = (value: unknown): void => {
-    if (value !== undefined && value !== null && String(value).trim() !== '') {
-      parts.push(clip(value, 140));
-    }
+    if (value === undefined || value === null) return;
+    // Event payloads carry objects (patrol reports, scopes).  Never let them
+    // stringify into "[object Object]" in the ticker.
+    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    if (text.trim() !== '') parts.push(clip(text, 140));
   };
 
   if (head === 'chat') {
@@ -234,6 +236,10 @@ export function eventSummary(evt: SfoEvent): string {
   } else if (head === 'sys') {
     push(data.message || data.summary);
     if (data.patch) push(JSON.stringify(data.patch));
+  } else if (head === 'autonomy') {
+    push(data.headline || data.summary || data.message || data.reason);
+    if (data.findings !== undefined && typeof data.findings === 'number') push(t('event.findings', { n: data.findings }));
+    if (data.project_id) push(data.project_id);
   }
 
   if (!parts.length) {

@@ -87,6 +87,7 @@ export const zh: Record<string, string> = {
     'event.risk': '风险 {risk}',
     'event.allowed': '已允许',
     'event.denied': '已拒绝',
+    'event.findings': '{n} 条发现',
 
     /* app routing */
     'route.unknown': '页面不存在',
@@ -176,6 +177,7 @@ export const en: Record<string, string> = {
     'event.risk': 'risk {risk}',
     'event.allowed': 'allowed',
     'event.denied': 'denied',
+    'event.findings': '{n} findings',
 
     /* app routing */
     'route.unknown': 'Page not found',
