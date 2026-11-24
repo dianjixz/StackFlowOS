@@ -84,7 +84,7 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 「Agent」应用里的每一行都是入口：点进去会打开这个 Agent 的独立对话。
 
 - **用它的身份工作**：system prompt 是该角色的职责与工具集，工具在项目 workspace 内执行；
-  文件/命令/任务动作仍走同一套能力审批，审批卡片会直接出现在对话上方。
+  文件/命令/任务动作仍走同一套能力审批，审批提醒会直接出现在对话上方。
 - **有现场**：右侧同时显示项目进度、当前任务、任务列表、最近活动、Agent 元数据与工作区。
 - **是会话，不是回放**：每个 Agent 一个线程，持久化在
   `.stackflowos/state/agent-chat/<agent_id>.json`；SSE 流式回复、工具调用状态、
@@ -92,6 +92,8 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 - **已结束的 Agent 也能继续对话**：线程属于 Agent 记录；进程退出不会丢掉对话，
   继续对话会以同一角色身份工作（动作仍受审批约束）。
 - 一次只跑一轮：同一 Agent 的并发消息返回 409；停止本轮会把它自己创建的待审批请求一并拒绝。
+- **实现边界**：对话轮在 hub 内以该 Agent 身份运行，不会复活它已退出的 worker 进程；
+  角色工具、workspace 限制、审批 owner 与审计和 worker 保持一致。
 
 ![Agent 对话（桌面）](docs/img/agent-chat.png)
 

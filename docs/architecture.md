@@ -628,7 +628,7 @@ class Brain(Protocol):
 * **边界（有意的取舍）**：对话轮运行在 hub 内，不复活也不中断该 Agent 的
   worker 进程；它让已结束的 Agent 仍可被人类点名继续工作，代价是这一轮的工具
   执行不在独立进程里。高风险动作仍必须经审批，作用域检查不变。若 Agent 的
-  worker 正在执行任务，对话不会抢占它的 task；两者对同一 workspace 的写操作
+  worker 正在执行任务，对话轮不会替它领取 task；两者对同一 workspace/任务的写操作
   由审批/规则和人工协调。
 
 ---
