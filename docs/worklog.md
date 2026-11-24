@@ -67,3 +67,11 @@
   replay filters`；`6f99e86` 文档；`3768e0d` 统一 `agent.spawn` RPC 的项目 scope 守卫；
   `906351b` `fix(agents): use the LLM brain when routes or fallback are configured`
   （并行阶段遗留的 5 行修复）。
+
+### 10:20–10:30 最终验收
+- 全量测试：`/tmp/sfo-venv/bin/python -m pytest -q` → **1151 passed, 2 skipped, 623 subtests passed**（~96s；2 skipped 为真实组播/pyzmq 可选路径）。
+- `python3 -m compileall -q stackflowos tests`、`git diff --check`、所有 `webassets/js/*.js` 的 `node --check` 通过。
+- 端到端：`stackflowos demo --until-done --no-web` 在临时 state 下完成 7 个任务并产出 workspace 文件。
+- 远程/TLS：本机自签证书启动 `hub --tls-cert/--tls-key --port 18999`，`stackflowos url` 经 control socket 铸造一次性 URL → HTTPS `?token=` 兑换 303 + HttpOnly cookie → `/api/health` 200；第二次兑换被拒绝。
+- 清理：停止遗留的仓库 `.stackflowos` hub 进程，避免占用 17800；工作树只保留文档变更。
+- 团队看板：task-1…task-7 全部 completed；7 个 teammate 已停止，无后台任务。
