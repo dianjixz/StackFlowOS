@@ -30,6 +30,7 @@ from typing import Any
 
 from ..errors import Conflict, NotFound, ValidationError
 from ..kernel.context import Context
+from ..storage import StorageBackend, backend_from_env
 from ..util.jsonio import now_ms, read_json, write_json
 from ..util.logging import get_logger
 from .models import (
@@ -131,6 +132,7 @@ class ProjectStore:
         counter_path: Path,
         events: Any = None,
         workspace_root: Path | None = None,
+        backend: StorageBackend | None = None,
     ) -> None:
         self.ctx = ctx
         self.state_path = Path(state_path)
@@ -140,6 +142,14 @@ class ProjectStore:
             else self.state_path.parent / "projects"
         self.workspace_root = base
         self._log = ctx.log if ctx is not None else get_logger("projects")
+        #: Optional backend used for the id counters only (``state/counters``).
+        #: The project/task domain itself stays in ``state/projects.json``:
+        #: rewriting the 950-line store to be fully transactional is out of
+        #: scope for this phase (see docs/team/dist.md).  ``None`` is selected
+        #: from ``SFO_STORAGE_BACKEND=sqlite`` so an env-only deployment can
+        #: move counters without code changes; JSON remains the default.
+        self._backend = backend if backend is not None else backend_from_env(
+            self.state_path.parent.parent)
         self._projects: dict[str, Project] = {}
         self._tasks: dict[str, Task] = {}
         self._counters: dict[str, int] = self._read_counters()
@@ -190,7 +200,16 @@ class ProjectStore:
         write_json(self.state_path, {"projects": projects, "version": 1})
 
     def _read_counters(self) -> dict[str, int]:
-        raw = read_json(self.counter_path, default=None)
+        raw = None
+        if self._backend is not None:
+            try:
+                raw = self._backend.get("state", "counters")
+            except Exception:  # noqa: BLE001 - fall back to the JSON file
+                self._log.warning("could not read counters from backend; "
+                                  "falling back to %s", self.counter_path,
+                                  exc_info=True)
+        if raw is None:
+            raw = read_json(self.counter_path, default=None)
         counters = {kind: 0 for kind in _COUNTER_KINDS}
         if isinstance(raw, dict):
             for kind in _COUNTER_KINDS:
@@ -201,6 +220,14 @@ class ProjectStore:
         return counters
 
     def _write_counters(self) -> None:
+        if self._backend is not None:
+            try:
+                self._backend.set("state", "counters", dict(self._counters))
+                return
+            except Exception:  # noqa: BLE001 - keep the hub running
+                self._log.warning("could not persist counters to backend; "
+                                  "falling back to %s", self.counter_path,
+                                  exc_info=True)
         write_json(self.counter_path, dict(self._counters))
 
     def _sync_counters(self) -> None:

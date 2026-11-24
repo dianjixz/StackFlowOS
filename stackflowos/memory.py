@@ -31,6 +31,7 @@ from typing import Any
 
 from .errors import ValidationError
 from .security.capabilities import validate_project_id
+from .storage import StorageBackend, backend_from_env
 from .util.jsonio import _default as _json_default
 from .util.jsonio import write_json
 from .util.logging import get_logger
@@ -77,6 +78,7 @@ class MemoryStore:
         max_projects: int = DEFAULT_MAX_PROJECTS,
         legacy_path: Path | None = None,
         logger=None,
+        backend: StorageBackend | None = None,
     ) -> None:
         raw_path = Path(path)
         if raw_path.suffix == ".json":
@@ -92,6 +94,10 @@ class MemoryStore:
         self.max_projects = max(1, int(max_projects))
         self.log = logger or get_logger("memory")
         self._lock = threading.RLock()
+        #: Optional storage backend (SQLite).  ``None`` keeps the JSON files;
+        #: ``SFO_STORAGE_BACKEND=sqlite`` selects one without code changes.
+        self._backend = backend if backend is not None else backend_from_env(
+            self.path.parent)
         #: In-memory copy of the store; ``len(data)`` is the project count.
         self.data: dict[str, dict] = {}
         self._sizes: dict[str, int] = {}
@@ -99,8 +105,9 @@ class MemoryStore:
         #: Quarantine reports collected while loading (drained by ``App``).
         self.corruptions: list[dict] = []
 
-        self._ensure_dir()
-        self._migrate_legacy()
+        if self._backend is None:
+            self._ensure_dir()
+            self._migrate_legacy()
         self._load_projects()
 
     # ------------------------------------------------------------------
@@ -149,6 +156,24 @@ class MemoryStore:
         with self._lock:
             return dict(self.data.get(pid) or {})
 
+    def health(self) -> dict:
+        """Small status payload for ``/api/health`` (never raises)."""
+        with self._lock:
+            backend = getattr(self._backend, "name", "json")
+            payload = {
+                "backend": backend,
+                "projects": len(self.data),
+                "total_bytes": self._total_bytes,
+                "max_project_bytes": self.max_project_bytes,
+                "max_total_bytes": self.max_total_bytes,
+            }
+            if self._backend is not None:
+                try:
+                    payload["storage"] = self._backend.health()
+                except Exception:  # noqa: BLE001 - health must never raise
+                    payload["storage"] = {"writable": False}
+            return payload
+
     # ------------------------------------------------------------------
     # additions used by App lifecycle
     # ------------------------------------------------------------------
@@ -160,6 +185,13 @@ class MemoryStore:
             self.data.pop(pid, None)
             size = self._sizes.pop(pid, 0)
             self._total_bytes = max(0, self._total_bytes - size)
+            if self._backend is not None:
+                try:
+                    self._backend.delete("memory", pid)
+                except Exception as exc:  # noqa: BLE001 - deletion is best effort
+                    self.log.warning("could not delete memory row %s: %s",
+                                     pid, exc)
+                return existed
             path = self._file_for(pid)
             try:
                 path.unlink()
@@ -196,6 +228,9 @@ class MemoryStore:
                            exc_info=True)
 
     def _write_project(self, project_id: str, project: dict) -> None:
+        if self._backend is not None:
+            self._backend.set("memory", project_id, project)
+            return
         # Atomic replace; the temp file is created 0600 by write_json and we
         # chmod explicitly in case an existing file had looser permissions.
         if not self.path.is_dir():
@@ -300,6 +335,9 @@ class MemoryStore:
             self.log.exception("legacy memory migration failed; kept %s", legacy)
 
     def _load_projects(self) -> None:
+        if self._backend is not None:
+            self._load_from_backend()
+            return
         if not self.path.is_dir():
             return
         try:
@@ -338,6 +376,39 @@ class MemoryStore:
                 "memory store has %d projects, over the %d project cap; "
                 "new projects will be rejected", len(self.data),
                 self.max_projects)
+
+    def _load_from_backend(self) -> None:
+        """Warm the store from the KV backend (``memory`` namespace)."""
+        try:
+            entries = self._backend.items("memory")  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001 - a broken backend shouldn't stop boot
+            self.log.warning("could not read memory from backend: %s", exc)
+            return
+        for raw_pid, payload in entries:
+            try:
+                pid = validate_project_id(raw_pid)
+            except ValidationError:
+                self.log.warning("ignoring memory row with unsafe project id: %r",
+                                 raw_pid)
+                continue
+            if not isinstance(payload, dict):
+                self.log.warning("ignoring memory row %s: not an object", pid)
+                continue
+            project = {str(key): value for key, value in payload.items()}
+            size = _encoded_size(pid, project)
+            if size > self.max_project_bytes:
+                self.log.warning(
+                    "memory row %s is %d bytes > the %d byte cap; ignored",
+                    pid, size, self.max_project_bytes)
+                continue
+            self.data[pid] = project
+            self._sizes[pid] = size
+            self._total_bytes += size
+        if self._total_bytes > self.max_total_bytes:
+            self.log.warning(
+                "memory store in backend is over the total cap (%d > %d bytes); "
+                "new writes will be rejected until it shrinks",
+                self._total_bytes, self.max_total_bytes)
 
     def _read_project(self, project_id: str, path: Path) -> dict | None:
         try:

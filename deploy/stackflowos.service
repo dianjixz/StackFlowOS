@@ -1,0 +1,61 @@
+# StackFlowOS hub -- systemd *user* unit.
+#
+# Install (per-user, no root required):
+#
+#   mkdir -p ~/.config/systemd/user ~/.config/stackflowos
+#   cp deploy/stackflowos.service ~/.config/systemd/user/
+#   # optional persistent login token / secrets (mode 0600):
+#   install -m 0600 /dev/null ~/.config/stackflowos/hub.env
+#   #   SFO_WEB_TOKEN=<random launch token>       # browser login
+#   #   SFO_STATE_DIR=/absolute/path/to/state     # override state dir
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now stackflowos.service
+#   journalctl --user -u stackflowos.service -f
+#
+# If StackFlowOS is installed in a virtualenv, point ExecStart at
+# /path/to/venv/bin/stackflowos instead of %h/.local/bin/stackflowos.
+#
+# The hub writes ONLY under the state directory (SFO_STATE_DIR); StateDirectory
+# makes systemd create/manage it (~/.local/state/stackflowos for user units).
+# Browser authentication: SFO_WEB_TOKEN pins the login token for headless
+# deployments; without it a fresh single-use token is printed on a TTY and
+# `stackflowos status --token <token>` mints another. Never commit the token.
+
+[Unit]
+Description=StackFlowOS hub (agent-native OS control plane)
+Documentation=file://%h/stackflowos/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SFO_STATE_DIR=%S/stackflowos
+# Persistent secrets/token override; keep the file 0600. The '-' makes it
+# optional so a fresh install boots without it.
+EnvironmentFile=-%h/.config/stackflowos/hub.env
+# Loopback-only by default; see deploy/README.md before exposing the console.
+# Add --host 0.0.0.0 (and web.allow_remote) only behind TLS / an SSH tunnel.
+ExecStart=%h/.local/bin/stackflowos hub --host 127.0.0.1
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+# Hardening: the hub is a single user-space process and does not need to
+# modify the system. Agent shells run as this same user by design; the
+# security model is cooperative (docs/architecture.md §6), not a kernel jail.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=default.target
