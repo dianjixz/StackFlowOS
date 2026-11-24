@@ -1,0 +1,32 @@
+/* App-level layout only.  Colors, spacing, type and radius come from the
+   Astryx theme tokens — never hard-code a hex value or a pixel radius here. */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background-surface);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+}
+
+/* Blocking overlay for an expired session (the shell renders it above the app). */
+.sfo-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: var(--spacing-6);
+  background: color-mix(in srgb, var(--color-background-surface) 88%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+/* Dense rows: keep the last column from collapsing in narrow panels. */
+.sfo-nowrap {
+  white-space: nowrap;
+}
