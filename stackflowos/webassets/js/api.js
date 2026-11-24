@@ -141,6 +141,14 @@ export const api = {
   spawnAgent: (role, projectId, taskId = null) =>
     requestJson('/api/agents', { method: 'POST', body: { role, project_id: projectId, task_id: taskId } }),
   killAgent: (id) => requestJson(`/api/agents/${enc(id)}`, { method: 'DELETE' }),
+  getAgentChat: (id, limit = 200) =>
+    requestJson(`/api/agents/${enc(id)}/chat` + qs({ limit })),
+  sendAgentChat: (id, text) =>
+    requestJson(`/api/agents/${enc(id)}/chat`, { method: 'POST', body: { text } }),
+  cancelAgentChat: (id) =>
+    requestJson(`/api/agents/${enc(id)}/chat/cancel`, { method: 'POST', body: {} }),
+  clearAgentChat: (id) =>
+    requestJson(`/api/agents/${enc(id)}/chat`, { method: 'DELETE' }),
 
   /* ---- config & leases ---- */
   getConfig: () => requestJson('/api/config'),

@@ -3,6 +3,7 @@
  */
 
 import { focusComposer, initChat } from './chat.js';
+import { initAgentChat } from './agentchat.js';
 import { initPanel } from './panel.js';
 import { closeSheet, initApps, openApp } from './apps.js';
 import { connectSSE, loadState, on, state } from './store.js';
@@ -129,6 +130,7 @@ function initErrorReporting() {
 async function boot() {
   initErrorReporting();
   initChat();
+  initAgentChat();
   initPanel();
   initApps();
   initMobileTabs();

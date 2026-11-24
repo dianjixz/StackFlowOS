@@ -272,6 +272,22 @@ export function eventSummary(evt) {
     else if (data.delta) push(data.delta);
     else if (data.typing) push('助手正在思考');
     else if (data.message_id) push(String(data.message_id));
+  } else if (type.startsWith('agent.chat.')) {
+    if (type === 'agent.chat.tool') {
+      push(data.tool || '工具');
+      push(data.state || '');
+      if (data.error) push(data.error);
+    } else if (type === 'agent.chat.message') {
+      push(data.text);
+    } else if (type === 'agent.chat.state') {
+      push(data.busy ? 'Agent 开始回复' : 'Agent 回复结束');
+    } else if (type === 'agent.chat.thread') {
+      push('对话已清空');
+    } else if (data.typing) {
+      push('Agent 正在思考');
+    } else if (data.delta) {
+      push(data.delta);
+    }
   } else if (head === 'project') {
     push(data.name || data.title);
     if (data.status) push(statusLabel(data.status));

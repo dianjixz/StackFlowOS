@@ -252,6 +252,15 @@ export function applyEvent(event) {
     return;
   }
 
+  // Per-agent conversations have their own live reducer in agentchat.js.
+  // They must not schedule a full /api/state refresh on every streaming
+  // chunk (the global chat has the same shape), and their deltas are
+  // ephemeral anyway.
+  if (type.startsWith('agent.chat.')) {
+    emit('event', event);
+    return;
+  }
+
   emit('event', event);
   if (STRUCTURAL.has(head)) scheduleRefresh(head === 'sys' ? 400 : 300);
 }

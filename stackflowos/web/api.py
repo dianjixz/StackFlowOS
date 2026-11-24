@@ -167,6 +167,10 @@ class WebAPI:
         r("POST", r"/api/units/([^/]+)/kill", self.unit_kill)
         r("GET", r"/api/agents", self.agents_list)
         r("POST", r"/api/agents", self.agents_spawn)
+        r("GET", r"/api/agents/([^/]+)/chat", self.agent_chat_history)
+        r("POST", r"/api/agents/([^/]+)/chat", self.agent_chat_send)
+        r("POST", r"/api/agents/([^/]+)/chat/cancel", self.agent_chat_cancel)
+        r("DELETE", r"/api/agents/([^/]+)/chat", self.agent_chat_clear)
         r("DELETE", r"/api/agents/([^/]+)", self.agent_kill)
 
         r("GET", r"/api/llm/test", self.llm_test)
@@ -405,9 +409,47 @@ class WebAPI:
     async def agent_kill(self, match, query, body):
         return _ok({"ok": await self.app.kill_agent(match.group(1))})
 
+    async def agent_chat_history(self, match, query, body):
+        """One agent's thread + the live roster/project view for the chat UI."""
+        agent_id = match.group(1)
+        limit = _int_query(query, "limit", 200, 1, 400)
+        agent = self.app.supervisor.get(agent_id).to_dict()
+        project = None
+        project_id = agent.get("project_id")
+        if project_id:
+            try:
+                project = self.app.project_card(str(project_id))
+            except SfoError:
+                project = None
+        provider = getattr(getattr(self.app, "agent_chat", None),
+                           "provider", None) or getattr(self.app, "provider", None)
+        return _ok({
+            "agent": agent,
+            "project": project,
+            "messages": self.app.agent_chat.history(agent_id, limit=limit),
+            "busy": self.app.agent_chat.busy(agent_id),
+            "provider": getattr(provider, "name", ""),
+            "model": getattr(provider, "model", ""),
+        })
+
+    async def agent_chat_send(self, match, query, body):
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise BadRequest("text required")
+        message = await self.app.agent_chat.send_user(match.group(1), text)
+        return _ok({"message": message, "busy": True}, 202)
+
+    async def agent_chat_cancel(self, match, query, body):
+        return _ok({"canceled": self.app.agent_chat.cancel(match.group(1))})
+
+    async def agent_chat_clear(self, match, query, body):
+        return _ok({"cleared": await self.app.agent_chat.clear(
+            match.group(1))})
+
     async def llm_test(self, match, query, body):
         """Round-trip a tiny completion against the *live* provider."""
-        provider = getattr(self.app, "provider", None)
+        provider = getattr(getattr(self.app, "agent_chat", None),
+                           "provider", None) or getattr(self.app, "provider", None)
         if provider is None:
             raise BadRequest("no llm provider configured")
         result = await provider.ping()

@@ -32,6 +32,7 @@ from .protocol import PROTOCOL_VERSION
 from .projects import ProjectStore, plan_for
 from .security import (ApprovalBroker, PolicyEngine, Principal,
                        RpcAuthRegistry, project_workspace)
+from .session.agent_chat import AgentChatService
 from .session.chat import ChatService
 from .session.operator import OperatorTools
 from .transport import AddressAllocator, HubTransport, socket_dir_for
@@ -271,6 +272,17 @@ class App:
         )
         await self.chat.start()
 
+        # Per-agent conversations (opened from the Agent app).  They share the
+        # live provider, role prompts, tool executor and approval broker with
+        # worker agents, but persist a thread per roster agent instead of
+        # running a second process.
+        self.agent_chat = AgentChatService(
+            self.ctx, self.eventlog, app=self, provider=self.provider,
+            state_dir=self.paths.state_dir,
+            logger=get_logger("agent_chat"),
+        )
+        await self.agent_chat.start()
+
         self._cancel_orphan_approvals()
         self.eventlog.append("sys.booted", {
             "version": self.version,
@@ -375,6 +387,11 @@ class App:
             await self.chat.stop()
         except Exception:
             self.log.exception("chat stop failed")
+        if getattr(self, "agent_chat", None) is not None:
+            try:
+                await self.agent_chat.stop()
+            except Exception:
+                self.log.exception("agent chat stop failed")
         try:
             self.eventlog.append("sys.shutdown", {}, source="sys")
         except Exception:
@@ -1942,6 +1959,9 @@ class App:
         self.provider = new_provider
         if getattr(self, "chat", None) is not None:
             self.chat.provider = new_provider
+        if getattr(self, "agent_chat", None) is not None:
+            # A live model switch must reach the next agent-chat turn too.
+            self.agent_chat.provider = new_provider
         if getattr(new_provider, "name", "") != previous_provider:
             self.eventlog.append("sys.llm.updated", {
                 "provider": getattr(new_provider, "name", ""),

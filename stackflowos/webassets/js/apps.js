@@ -6,6 +6,7 @@
  *   #projects #agents #units #approvals #events #settings #project/<id>
  */
 
+import * as agentChat from './agentchat.js';
 import { api } from './api.js';
 import { applyConfig, loadState, on, state } from './store.js';
 import {
@@ -70,6 +71,9 @@ const TASK_COLUMNS = [
 ];
 const EVENT_FILTERS = ['all', 'chat', 'project', 'task', 'agent', 'unit', 'approval', 'rule', 'tool', 'failure', 'sys'];
 const RESTART_LABELS = { 'transport.mode': '传输模式', 'web.port': 'Web 端口' };
+// Agent statuses that count as "on duty".  panel.js keeps an identical local
+// set; both must stay in sync until the vocabulary moves to a shared module.
+const ACTIVE_AGENT_STATUSES = new Set(['working', 'waiting', 'idle', 'spawning']);
 
 /** @type {Record<string, HTMLElement>} */
 const els = {};
@@ -153,6 +157,9 @@ export function initApps() {
 
   on('state', () => {
     if (!current) return;
+    // The agent conversation has its own reducer (agentchat.js) and must not
+    // be torn down by the roster's state re-render.
+    if (current.name === 'agents' && current.agentId) return;
     if (current.name === 'settings' && view.settingsReady) return;
     if (current.name === 'approvals' && sheetSignature() === lastSheetSignature) return;
     if (isFormFocused() || pointerDown) {
@@ -181,8 +188,15 @@ function parseHash() {
   if (name === 'project' && parts[1]) {
     return { app: 'projects', projectId: decodeURIComponent(parts.slice(1).join('/')) };
   }
+  if (name === 'agent' && parts[1]) {
+    return {
+      app: 'agents',
+      projectId: null,
+      agentId: decodeURIComponent(parts.slice(1).join('/')),
+    };
+  }
   if (Object.prototype.hasOwnProperty.call(APP_META, name)) {
-    return { app: name, projectId: null };
+    return { app: name, projectId: null, agentId: null };
   }
   return null;
 }
@@ -193,14 +207,27 @@ function applyHash() {
     if (current) hideSheet({ clearHash: false });
     return;
   }
-  showApp(route.app, route.projectId, { fromHash: true });
+  showApp(route.app, route.projectId, {
+    fromHash: true,
+    agentId: route.agentId || null,
+  });
 }
 
-/** Open an app (or a project detail) and reflect it in the URL hash. */
-export function openApp(name, projectId = null) {
+/**
+ * Open an app, a project detail, or one agent's conversation, reflecting it
+ * in the URL hash (`#agent/<id>` is deep-linkable).
+ */
+export function openApp(name, targetId = null) {
   if (name === 'project') {
-    if (!projectId) return;
-    const target = `#project/${encodeURIComponent(projectId)}`;
+    if (!targetId) return;
+    const target = `#project/${encodeURIComponent(targetId)}`;
+    if (location.hash === target) applyHash();
+    else location.hash = target;
+    return;
+  }
+  if (name === 'agent') {
+    if (!targetId) return;
+    const target = `#agent/${encodeURIComponent(targetId)}`;
     if (location.hash === target) applyHash();
     else location.hash = target;
     return;
@@ -219,6 +246,7 @@ function hideSheet({ clearHash }) {
   const hadCurrent = Boolean(current);
   current = null;
   pendingRender = false;
+  exitAgentChatMode();
   if (els.layer) els.layer.hidden = true;
   document.body.classList.remove('sheet-open');
   updateDockActive();
@@ -230,7 +258,8 @@ function hideSheet({ clearHash }) {
   }
 }
 
-function showApp(name, projectId = null, { fromHash = false } = {}) {
+function showApp(name, projectId = null,
+                   { fromHash = false, agentId = null } = {}) {
   if (!APP_META[name]) return;
   if (!fromHash) {
     openApp(name, projectId);
@@ -238,7 +267,7 @@ function showApp(name, projectId = null, { fromHash = false } = {}) {
   }
   const wasHidden = els.layer.hidden;
   if (wasHidden) lastFocused = document.activeElement;
-  current = { name, projectId: projectId || null };
+  current = { name, projectId: projectId || null, agentId: agentId || null };
   els.layer.hidden = false;
   document.body.classList.add('sheet-open');
   setSheetHeader(APP_META[name].title, APP_META[name].sub, APP_META[name].icon);
@@ -262,6 +291,23 @@ function showApp(name, projectId = null, { fromHash = false } = {}) {
   }
   if (name === 'events') loadConsole();
   renderSheet({ preserveScroll: false });
+}
+
+function renderAgentChatSheet() {
+  els.body.classList.add('is-agent-chat');
+  els.sheet.classList.add('is-agent-chat');
+  const agent = state.agents.find((item) => item.id === current.agentId) || null;
+  const root = agentChat.mount({ agentId: current.agentId, agent });
+  if (root.parentElement !== els.body || els.body.children.length !== 1) {
+    els.body.replaceChildren(root);
+  }
+}
+
+function exitAgentChatMode() {
+  if (!els.body) return;
+  els.body.classList.remove('is-agent-chat');
+  if (els.sheet) els.sheet.classList.remove('is-agent-chat');
+  agentChat.unmount();
 }
 
 function setSheetHeader(title, sub, iconName) {
@@ -335,6 +381,11 @@ function scheduleSheetRender() {
 
 function renderSheet({ preserveScroll = true } = {}) {
   if (!current) return;
+  if (current.name === 'agents' && current.agentId) {
+    renderAgentChatSheet();
+    return;
+  }
+  exitAgentChatMode();
   const scrollTop = preserveScroll ? els.body.scrollTop : 0;
   lastSheetSignature = sheetSignature();
   els.body.replaceChildren();
@@ -705,8 +756,8 @@ function renderProjectDetail(project) {
       ...agents.map((agent) => el('button', {
         class: 'agent-chip',
         type: 'button',
-        title: `${agent.display_name || agent.id} · ${statusLabel(agent.status)}`,
-        onclick: () => openApp('agents'),
+        title: `与 ${agent.display_name || agent.id} 对话`,
+        onclick: () => openApp('agent', agent.id),
       },
       avatar(agent),
       el('div', { class: 'agent-chip-body' },
@@ -1068,6 +1119,10 @@ function renderAgentsApp() {
     ),
   ));
 
+  wrap.append(appNote(
+    '点击任一 Agent 进入对话：它的角色、项目工作区和工具都在；'
+    + '高风险动作仍会进入审批。对话记录按 Agent 持久保存。',
+    { iconName: 'chat' }));
   wrap.append(renderSpawnForm());
 
   const filters = [
@@ -1139,6 +1194,7 @@ function renderAgentsApp() {
 
 function agentRow(agent) {
   const terminal = ['done', 'failed', 'dead'].includes(agent.status);
+  const open = () => openApp('agent', agent.id);
   const killBtn = terminal ? null : el('button', {
     class: 'btn btn-xs btn-danger',
     type: 'button',
@@ -1158,23 +1214,32 @@ function agentRow(agent) {
     },
   }, icon('close'), '终止');
 
-  return el('div', { class: 'agent-row' },
-    avatar(agent, { large: true }),
-    el('div', { class: 'ar-main' },
-      el('div', { class: 'ar-name-line' },
-        el('span', { class: 'ar-name' }, agent.display_name || agent.id),
-        roleChip(agent.role),
-        statusPill(agent.status),
-        el('span', { class: 'ar-id' }, agent.id),
-      ),
-      el('div', { class: 'ar-sub' },
-        agent.model ? el('span', { class: 'mono' }, agent.model) : null,
-        agent.task_id ? el('span', { class: 'mono' }, `task ${agent.task_id}`) : null,
-        el('span', {}, `心跳 ${ago(agent.last_seen)}`),
-      ),
-      agent.summary ? el('div', { class: 'ar-summary', title: agent.summary }, agent.summary) : null,
-      agent.error ? el('div', { class: 'ar-summary', style: { color: 'var(--danger)' } }, agent.error) : null,
+  const main = el('button', {
+    class: 'agent-row-main',
+    type: 'button',
+    title: `与 ${agent.display_name || agent.id} 对话`,
+    onclick: open,
+  },
+  avatar(agent, { large: true }),
+  el('div', { class: 'ar-main' },
+    el('div', { class: 'ar-name-line' },
+      el('span', { class: 'ar-name' }, agent.display_name || agent.id),
+      roleChip(agent.role),
+      statusPill(agent.status),
+      el('span', { class: 'ar-id' }, agent.id),
     ),
+    el('div', { class: 'ar-sub' },
+      agent.model ? el('span', { class: 'mono' }, agent.model) : null,
+      agent.task_id ? el('span', { class: 'mono' }, `task ${agent.task_id}`) : null,
+      el('span', {}, `心跳 ${ago(agent.last_seen)}`),
+    ),
+    agent.summary ? el('div', { class: 'ar-summary', title: agent.summary }, agent.summary) : null,
+    agent.error ? el('div', { class: 'ar-summary', style: { color: 'var(--danger)' } }, agent.error) : null,
+  ),
+  icon('chat', 'ico ico-sm ar-chat-ico'),
+  );
+  return el('div', { class: 'agent-row' },
+    main,
     el('div', { class: 'ar-side' },
       el('span', { class: 'ar-time' }, agoShort(agent.created_at)),
       killBtn,

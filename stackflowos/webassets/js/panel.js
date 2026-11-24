@@ -295,8 +295,8 @@ function renderAgents() {
   els.agents.replaceChildren(...active.slice(0, 16).map((agent) => el('button', {
     class: 'agent-chip',
     type: 'button',
-    title: `${agent.display_name || agent.id} · ${agent.status}`,
-    onclick: () => openApp('agents'),
+    title: `与 ${agent.display_name || agent.id} 对话`,
+    onclick: () => openApp('agent', agent.id),
   },
   avatar(agent),
   el('div', { class: 'agent-chip-body' },
@@ -325,7 +325,9 @@ function statusRank(status) {
 function renderEvents() {
   if (!els.ticker) return;
   const events = [...state.events]
-    .filter((event) => event.type !== 'chat.delta' && event.type !== 'chat.typing')
+    .filter((event) => ![
+      'chat.delta', 'chat.typing', 'agent.chat.delta', 'agent.chat.typing',
+    ].includes(event.type))
     .sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0))
     .slice(0, 40);
   if (!events.length) {
