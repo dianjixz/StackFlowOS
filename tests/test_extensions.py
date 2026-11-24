@@ -241,3 +241,103 @@ class AppExtensionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             extensions.EXTENSION_MODULES = old
             sys.modules.pop(module_name, None)
             tmp.cleanup()
+
+
+class StandbyLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standby_waits_for_hub_lock(self):
+        import asyncio
+        import fcntl
+        import os
+
+        from stackflowos.app import App
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Config.load(state_dir=Path(tmp.name)).with_overrides({
+            "cluster": {"standby": True, "standby_poll_s": 0.05},
+        })
+        lock_path = cfg.paths.run_dir / "hub.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            app = App(cfg)
+            task = asyncio.create_task(app._acquire_hub_lock())
+            await asyncio.sleep(0.15)
+            self.assertFalse(task.done(), "standby must not steal an active lock")
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            await asyncio.wait_for(task, timeout=2)
+            self.assertIsNotNone(app._lock_fd)
+            app._release_hub_lock()
+        finally:
+            try:
+                fcntl.flock(holder, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(holder)
+
+    async def test_non_standby_fails_fast(self):
+        import fcntl
+        import os
+
+        from stackflowos.app import App
+        from stackflowos.errors import Unavailable
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Config.load(state_dir=Path(tmp.name))
+        lock_path = cfg.paths.run_dir / "hub.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.assertRaises(Unavailable):
+                await App(cfg)._acquire_hub_lock()
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            os.close(holder)
+
+
+class RawReplyServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_metrics_style_text_response(self):
+        import asyncio
+        import json
+        import urllib.request
+
+        from stackflowos.web.server import WebServer
+        from tests.test_web import FakeApp
+
+        async def metrics(match, query, body):
+            from stackflowos.web.api import WebReply
+
+            return 200, WebReply("sfo_up 1\n# HELP x\n", content_type=(
+                "text/plain; version=0.0.4; charset=utf-8"))
+
+        class Ext:
+            name = "metrics"
+
+            def routes(self):
+                return [("GET", r"/api/metrics", metrics)]
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = FakeApp(Path(tmp.name))
+        app.extensions = [Ext()]
+        server = WebServer(app, host="127.0.0.1", port=0,
+                           assets_dir=Path(tmp.name))
+        url = await server.start()
+        try:
+            def fetch():
+                req = urllib.request.Request(url + "/api/metrics")
+                req.add_header("Authorization",
+                               f"Bearer {server.launch_token}")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status, resp.headers.get("Content-Type"), resp.read()
+
+            status, ctype, body = await asyncio.to_thread(fetch)
+            self.assertEqual(status, 200)
+            self.assertIn("text/plain", ctype)
+            self.assertEqual(body, b"sfo_up 1\n# HELP x\n")
+        finally:
+            await server.stop()
+            await app.eventlog.close()

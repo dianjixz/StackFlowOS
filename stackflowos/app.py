@@ -79,6 +79,9 @@ PRINCIPAL_ACTIONS = frozenset({
     # ``event.append`` binds the audit provenance to the authenticated unit
     # itself (X2): a caller-supplied ``source`` is never persisted.
     "event.append",
+    # ``capability.call`` forwards the live principal so the extension can run
+    # the same approval/audit path as an in-process tool call.
+    "capability.call",
 })
 
 #: Event types a remote RPC caller may append (X2, plan §5.2.7).  Workers and
@@ -169,8 +172,23 @@ class App:
                  cfg.system.name, self.version, cfg.transport.mode, self.paths.state_dir)
 
         self.ctx = Context(name="root")
-        self._acquire_hub_lock()
-        self.eventlog = EventLog(self.paths.events_dir, logger=get_logger("events"))
+        await self._acquire_hub_lock()
+        # Optional transactional backend: when configured, the event log,
+        # memory and id counters share one SQLite database (WAL).  JSON stays
+        # the default and keeps the historical JSONL/rotation path.
+        self.storage_backend = None
+        if str(getattr(cfg.storage, "backend", "json")).lower() == "sqlite":
+            from .storage import open_backend
+
+            self.storage_backend = open_backend(
+                "sqlite", state_dir=self.paths.state_dir,
+                sqlite_path=cfg.storage.sqlite_path or None)
+        self.eventlog = EventLog(
+            self.paths.events_dir, logger=get_logger("events"),
+            rotation_bytes=cfg.storage.eventlog_rotate_bytes,
+            rotate_keep=cfg.storage.eventlog_rotate_keep,
+            backend=self.storage_backend,
+        )
         self.allocator = AddressAllocator(
             mode=cfg.transport.mode,
             host=cfg.transport.host,
@@ -192,13 +210,19 @@ class App:
         self.registry = UnitRegistry(self.ctx, self.eventlog,
                                      offline_after_s=cfg.agents.offline_after_s,
                                      logger=get_logger("registry"))
-        self.leases = LeaseManager(self.ctx, self.eventlog)
+        self.leases = LeaseManager(
+            self.ctx, self.eventlog,
+            fencing=cfg.cluster.lease_fencing,
+            clock_skew_s=cfg.cluster.lease_clock_skew_s,
+            fencing_path=self.paths.state_dir / "state" / "lease_fencing.json",
+        )
         self.projects = ProjectStore(
             self.ctx,
             state_path=self.paths.state_dir / "state" / "projects.json",
             counter_path=self.paths.state_dir / "state" / "counters.json",
             events=self.eventlog,
             workspace_root=self.paths.projects_dir,
+            backend=self.storage_backend,
         )
         self.policy = PolicyEngine(
             self.ctx, self.eventlog,
@@ -219,6 +243,7 @@ class App:
             max_total_bytes=cfg.security.memory_max_total_bytes,
             max_projects=cfg.security.memory_max_projects,
             logger=get_logger("memory"),
+            backend=self.storage_backend,
         )
         # A corrupt project file (or the legacy memory.json) is quarantined by
         # the store instead of aborting startup; surface it as an audit event.
@@ -305,7 +330,13 @@ class App:
             "sys_rpc": self.sys_addresses.rpc,
             "sys_events": self.sys_addresses.events,
         }, source="sys")
-        self.eventlog.append("sys.ready", {"units": 0}, source="sys")
+        self.eventlog.append("sys.ready", {
+            "units": len(self.unit_cards()),
+            "extensions": [str(getattr(ext, "name", "?"))
+                           for ext in self.extensions],
+            "llm_provider": str(getattr(self.provider, "name", "")),
+            "llm_model": str(getattr(self.provider, "model", "")),
+        }, source="sys")
         log.info("hub ready: rpc=%s events=%s web=%s",
                  self.sys_addresses.rpc, self.sys_addresses.events, cfg.web.port)
         return self
@@ -427,6 +458,12 @@ class App:
                 await result
         except Exception:
             pass
+        backend = getattr(self, "storage_backend", None)
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                self.log.exception("storage backend close failed")
         try:
             await self.ctx.dispose()
         except Exception:
@@ -437,13 +474,19 @@ class App:
     # ------------------------------------------------------------------
     # single-hub lock
     # ------------------------------------------------------------------
-    def _acquire_hub_lock(self) -> None:
+    async def _acquire_hub_lock(self) -> None:
         """Prevent two hubs from sharing one state directory.
 
         Overlapping hubs would unlink each other's IPC sockets on shutdown
         (the old process cleans up paths that a new process already rebound).
         A POSIX flock is released by the kernel when the process dies, so a
         stale lock file is harmless.
+
+        With ``cluster.standby=true`` this process is a cold standby: it waits
+        for the lock instead of failing, then boots against the same state
+        directory when the active hub exits.  That is process-level failover,
+        not consensus -- there is no quorum, no replication and a short
+        unavailability window while the standby finishes booting.
         """
         lock_path = self.paths.run_dir / "hub.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -451,15 +494,38 @@ class App:
             fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         except OSError as exc:
             raise Unavailable(f"cannot open hub lock {lock_path}: {exc}") from exc
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(fd)
-            raise Unavailable(
-                f"another StackFlowOS hub is using {self.paths.state_dir}") from exc
+        standby = bool(getattr(self.config.cluster, "standby", False))
+        poll_s = max(0.25, float(getattr(self.config.cluster,
+                                         "standby_poll_s", 2.0)))
+        waited_s = 0.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if not standby:
+                    os.close(fd)
+                    raise Unavailable(
+                        f"another StackFlowOS hub is using {self.paths.state_dir}") from exc
+                if waited_s % 60.0 < poll_s:
+                    self.log.info(
+                        "hub lock is held; standing by for %s (%.0fs)",
+                        self.paths.state_dir, waited_s)
+                await asyncio.sleep(poll_s)
+                waited_s += poll_s
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode("ascii"))
         self._lock_fd = fd
+        if waited_s:
+            self.log.info("standby acquired the hub lock after %.0fs", waited_s)
+            try:
+                self.eventlog.append("sys.standby.promoted", {
+                    "waited_s": int(waited_s), "pid": os.getpid(),
+                }, source="sys")
+            except Exception:
+                # EventLog is constructed after the lock; promotion is still
+                # recorded by sys.booted once start completes.
+                pass
 
     def _release_hub_lock(self) -> None:
         fd, self._lock_fd = self._lock_fd, None
@@ -526,6 +592,7 @@ class App:
             "agent.spawn": self._agent_spawn,
             "agent.kill": self._agent_kill,
             "agent.list": self._agent_list,
+            "capability.call": self._capability_call,
             "event.append": self._event_append,
             "event.since": self._event_since,
             "memory.get": self._memory_get,
@@ -960,6 +1027,35 @@ class App:
     async def _sys_stats(self, data, src):
         return self.stats()
 
+    async def _capability_call(self, data, src, principal=None):
+        """Execute a provider-backed capability (MCP/plugin/external tool).
+
+        The tool catalogue and the actual execution live in the optional
+        ``units`` extension; this hub action is only the authenticated bridge
+        that worker units use.  The extension is responsible for the approval
+        and audit path (fail-closed).  Unit callers are pinned to their own
+        project and can never name another project's capability scope.
+        """
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise BadRequest("capability name required")
+        args = data.get("args")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            raise BadRequest("capability args must be an object")
+        project_id = data.get("project_id")
+        if principal is not None and principal.is_unit:
+            project_id = principal.project_id
+        for extension in self.extensions:
+            call = getattr(extension, "call_capability", None)
+            if call is None:
+                continue
+            result = await maybe_await(call(name, args, project_id, principal))
+            if result is not None:
+                return result
+        raise NotFound(f"unknown capability: {name!r}")
+
     # ------------------------------------------------------------------
     # units
     # ------------------------------------------------------------------
@@ -1144,12 +1240,21 @@ class App:
     # leases
     # ------------------------------------------------------------------
     async def _lease_acquire(self, data, src, principal=None):
+        from .l2.leases import validate_resource_scope
+
         if not data.get("resource"):
             raise BadRequest("resource required")
         holder = (principal.id if principal is not None and principal.is_unit
                   else str(data.get("holder") or src))
-        lease = self.leases.acquire(
+        # A unit may only lease a resource that names its own project; the
+        # operator (and the in-process path) keeps the global namespace.
+        resource = validate_resource_scope(
             str(data["resource"]),
+            principal.project_id if principal is not None and principal.is_unit else None,
+            principal is None or principal.is_operator,
+        )
+        lease = self.leases.acquire(
+            resource,
             holder,
             int(data.get("ttl_s") or 300),
             renewable=bool(data.get("renewable", True)),
@@ -1162,16 +1267,21 @@ class App:
     async def _lease_renew(self, data, src, principal=None):
         holder = (principal.id if principal is not None and principal.is_unit
                   else str(data.get("holder") or src))
-        lease = self.leases.renew(str(data.get("lease_id") or ""), holder,
-                                  int(data["ttl_s"]) if data.get("ttl_s") else None)
+        token = data.get("token")
+        lease = self.leases.renew(
+            str(data.get("lease_id") or ""), holder,
+            int(data["ttl_s"]) if data.get("ttl_s") else None,
+            token=int(token) if token is not None else None)
         return lease.to_dict()
 
     async def _lease_release(self, data, src, principal=None):
         holder = (principal.id if principal is not None and principal.is_unit
                   else (data.get("holder") or src))
-        lease = self.leases.release(str(data.get("lease_id") or ""),
-                                    holder=holder,
-                                    reason=str(data.get("reason") or "released"))
+        token = data.get("token")
+        lease = self.leases.release(
+            str(data.get("lease_id") or ""), holder=holder,
+            reason=str(data.get("reason") or "released"),
+            token=int(token) if token is not None else None)
         return lease.to_dict()
 
     async def _lease_list(self, data, src, principal=None):
@@ -2051,6 +2161,15 @@ class App:
             "uptime_s": int(time.time() - self.started_at / 1000),
             "units": self.stats().get("units", {}),
         }
+        for key, service in (("eventlog", getattr(self, "eventlog", None)),
+                             ("leases", getattr(self, "leases", None))):
+            hook = getattr(service, "health", None)
+            if hook is None:
+                continue
+            try:
+                payload[key] = hook()
+            except Exception:  # noqa: BLE001 - health must never raise
+                payload[key] = {"ok": False}
         if getattr(self, "extensions", None):
             payload["extensions"] = extension_health(self.extensions)
         return payload

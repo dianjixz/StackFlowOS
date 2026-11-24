@@ -57,6 +57,49 @@ def _parser() -> argparse.ArgumentParser:
                         help="web launch token for Authorization: Bearer "
                              "(default: $SFO_WEB_TOKEN)")
 
+    url = sub.add_parser("url", help="mint a fresh browser login URL via the "
+                                     "hub control socket")
+    _add_common(url)
+    url.add_argument("--json", action="store_true", help="print the raw reply")
+    url.add_argument("--status", action="store_true",
+                     help="print control-socket status instead of a URL")
+
+    backup = sub.add_parser("backup", help="create a state archive")
+    _add_common(backup)
+    backup.add_argument("--dest", default=None, help="target directory/file")
+    backup.add_argument("--keep", type=int, default=None,
+                        help="keep the newest N archives")
+
+    restore = sub.add_parser("restore", help="restore a state archive")
+    _add_common(restore)
+    restore.add_argument("archive", help="sfo-backup-*.tar.gz")
+    restore.add_argument("--force", action="store_true",
+                         help="replace a non-empty state directory")
+
+    export_events = sub.add_parser("export-events",
+                                   help="export the event stream (jsonl/csv)")
+    _add_common(export_events)
+    export_events.add_argument("--format", choices=("jsonl", "csv"),
+                               default="jsonl")
+    export_events.add_argument("--since", type=int, default=None)
+    export_events.add_argument("--until", type=int, default=None)
+    export_events.add_argument("--types", default=None,
+                               help="comma-separated event types")
+    export_events.add_argument("--project", default=None)
+    export_events.add_argument("--out", default=None)
+
+    backup_status = sub.add_parser("backup-status",
+                                   help="show backup size/count")
+    _add_common(backup_status)
+    backup_status.add_argument("--json", action="store_true")
+
+    migrate = sub.add_parser("storage-migrate",
+                             help="copy JSON state into the SQLite backend")
+    _add_common(migrate)
+    migrate.add_argument("--sqlite-path", default=None)
+    migrate.add_argument("--dry-run", action="store_true")
+    migrate.add_argument("--include-projects", action="store_true")
+
     attach = sub.add_parser("attach", help="attach one worker unit to a running hub")
     attach.add_argument("--sys", required=True, help="hub sys rpc address (ipc:// or tcp://)")
     attach.add_argument("--role", required=True,
@@ -96,6 +139,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="allow a non-loopback web console bind "
                              "(sets web.allow_remote; transport is configured "
                              "separately via transport.allow_remote)")
+    parser.add_argument("--standby", action="store_true", default=None,
+                        help="cold-standby hub: wait for the state-dir lock "
+                             "instead of exiting when another hub is active")
+    parser.add_argument("--tls-cert", default=None,
+                        help="PEM certificate for the HTTPS listener")
+    parser.add_argument("--tls-key", default=None,
+                        help="PEM private key for the HTTPS listener")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -121,6 +171,18 @@ def main(argv: list[str] | None = None) -> int:
         return _run_cli(lambda: _doctor(args))
     if args.command == "status":
         return _run_cli(lambda: _status(args))
+    if args.command == "url":
+        return _run_cli(lambda: _url(args))
+    if args.command == "backup":
+        return _run_cli(lambda: _backup(args))
+    if args.command == "restore":
+        return _run_cli(lambda: _restore(args))
+    if args.command == "export-events":
+        return _run_cli(lambda: _export_events(args))
+    if args.command == "backup-status":
+        return _run_cli(lambda: _backup_status(args))
+    if args.command == "storage-migrate":
+        return _run_cli(lambda: _storage_migrate(args))
     if args.command == "demo":
         return _run_cli(lambda: asyncio.run(_demo(args)))
     return _run_cli(lambda: _hub(args))
@@ -198,6 +260,12 @@ def _build_config(args, *, for_web: bool = True) -> Config:
         # CLI flag is web-only: ``--host`` also targets the console.  Widening
         # the RPC listener requires ``transport.allow_remote`` in config.
         patch.setdefault("web", {})["allow_remote"] = True
+    if getattr(args, "standby", None):
+        patch.setdefault("cluster", {})["standby"] = True
+    if getattr(args, "tls_cert", None):
+        patch.setdefault("web", {})["tls_cert"] = args.tls_cert
+    if getattr(args, "tls_key", None):
+        patch.setdefault("web", {})["tls_key"] = args.tls_key
     if patch:
         # CLI flags are per-process; only the Settings UI persists changes.
         cfg = cfg.with_overrides(patch)
@@ -220,18 +288,14 @@ def _web_server(app, cfg):
     ``SFO_WEB_TOKEN`` is an explicit opt-in override for non-TTY deployments
     (systemd, containers); by default a fresh per-process token is generated
     and only printed on a TTY.  The token is never persisted by us.
+
+    TLS, multi-user accounts, the session bound and single-use launch tokens
+    all come from ``config.web``; the explicit arguments keep a live config
+    patch from being shadowed by a stale server-side default.
     """
     from .web.server import WebServer
 
-    if not is_loopback_host(cfg.web.host):
-        # L8: remote binds are explicit, but the TLS listener is Phase 5.  Be
-        # honest at startup instead of implying the console is protected.
-        print("[warn] web console is bound to a non-loopback address "
-              f"({cfg.web.host}); it speaks plaintext HTTP until the Phase 5 "
-              "TLS listener, so use an SSH tunnel or a TLS-terminating "
-              "reverse proxy", file=sys.stderr)
-
-    return WebServer(
+    server = WebServer(
         app,
         host=cfg.web.host,
         port=cfg.web.port,
@@ -240,16 +304,31 @@ def _web_server(app, cfg):
         sse_heartbeat_s=cfg.web.sse_heartbeat_s,
         sse_max_clients=cfg.web.sse_max_clients,
         launch_token=os.environ.get("SFO_WEB_TOKEN") or None,
+        tls_cert=cfg.web.tls_cert or None,
+        tls_key=cfg.web.tls_key or None,
+        tls_min_version=cfg.web.tls_min_version,
+        users=cfg.web.users,
+        session_max=cfg.web.session_max,
+        launch_token_single_use=cfg.web.launch_token_single_use,
     )
+    # Honest startup: a non-loopback plaintext listener is a real risk, and a
+    # stale certificate path must be visible before the first request.
+    for note in getattr(server, "security_notes", ()):
+        print(f"[warn] {note}", file=sys.stderr)
+    if not is_loopback_host(cfg.web.host) and not server.tls_enabled:
+        print("[warn] web console is bound to a non-loopback address without "
+              "TLS; use --tls-cert/--tls-key (or web.tls_* in config), an SSH "
+              "tunnel, or a TLS-terminating reverse proxy", file=sys.stderr)
+    return server
 
 
 def _print_web_url(server, label: str) -> None:
     """Print the login URL only on a TTY; never leak the token otherwise.
 
     systemd/journald capture stdout, so a token printed there would end up in
-    the journal.  Non-TTY operators set ``SFO_WEB_TOKEN`` explicitly and use
-    ``stackflowos status --token``; ``server.login_url`` remains available to
-    in-process callers (tests, future ``sfo url`` control socket).
+    the journal.  A non-TTY operator mints a one-shot URL from the same machine
+    with ``stackflowos url`` (operator control socket, same-uid only), or sets
+    ``SFO_WEB_TOKEN`` explicitly as an escape hatch.
     """
     if sys.stdout.isatty():
         print(f"\n  {label}  →  {server.login_url}")
@@ -565,10 +644,121 @@ def _doctor(args) -> int:
     return 0
 
 
+def _backup(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    from .observability.backup import backup_status, create_backup
+
+    path = create_backup(cfg.paths, dest=getattr(args, "dest", None),
+                         keep=getattr(args, "keep", None))
+    print(path)
+    status = backup_status(cfg.paths)
+    print(f"backups={status.get('backups', 0)} bytes={status.get('bytes', 0)}")
+    return 0
+
+
+def _restore(args) -> int:
+    # Do not call Config.load here: resolving a config ensures the state tree,
+    # which would make a fresh restore look like a non-empty target.
+    from .config import resolve_paths
+    from .observability.backup import restore
+
+    paths = resolve_paths(
+        root=Path(args.root) if getattr(args, "root", None) else None,
+        state_dir=Path(args.state_dir) if getattr(args, "state_dir", None) else None)
+    result = restore(args.archive, paths.state_dir,
+                     force=bool(getattr(args, "force", False)))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("backup"):
+        print(f"pre-restore backup: {result['backup']}", file=sys.stderr)
+    return 0
+
+
+def _export_events(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    from .observability.backup import export_events
+
+    path = export_events(
+        cfg.paths, format=args.format, since=args.since, until=args.until,
+        types=[item.strip() for item in args.types.split(",") if item.strip()]
+        if args.types else None,
+        project_id=args.project, dest=args.out)
+    print(path)
+    return 0
+
+
+def _backup_status(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    from .observability.backup import backup_status
+
+    status = backup_status(cfg.paths)
+    if getattr(args, "json", False):
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+    else:
+        print(f"backups={status.get('backups', 0)} bytes={status.get('bytes', 0)} "
+              f"dir={status.get('dir')} last={status.get('last_backup')}")
+    return 0
+
+
+def _storage_migrate(args) -> int:
+    cfg = _build_config(args, for_web=False)
+    from .storage import migrate_json_to_sqlite
+
+    result = migrate_json_to_sqlite(
+        cfg.paths, sqlite_path=args.sqlite_path, dry_run=bool(args.dry_run),
+        include_projects=bool(args.include_projects))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _url(args) -> int:
+    """Mint a fresh login URL (or read status) via the operator control socket.
+
+    The socket lives under the same state directory, is mode 0600 and checks
+    ``SO_PEERCRED``: only the hub's own uid can ask.  Tokens are never written
+    to disk, which is what makes non-TTY deployments usable without pinning a
+    long-lived ``SFO_WEB_TOKEN``.
+    """
+    cfg = _build_config(args, for_web=False)
+    from .security.control import control_socket_path, query_control_socket
+
+    action = "status" if getattr(args, "status", False) else "url"
+    reply = query_control_socket(control_socket_path(cfg.paths.run_dir), action)
+    if getattr(args, "json", False):
+        print(json.dumps(reply, ensure_ascii=False))
+        return 0 if reply.get("ok") else 1
+    if not reply.get("ok"):
+        print(f"control socket unavailable: {reply.get('error', 'unknown error')}",
+              file=sys.stderr)
+        print("the hub must be running in the same state directory "
+              f"({cfg.paths.state_dir}); SFO_WEB_TOKEN remains the non-TTY "
+              "escape hatch", file=sys.stderr)
+        return 1
+    if action == "status":
+        print(f"hub={reply.get('url')}  tls={reply.get('tls')}  "
+              f"running={reply.get('running')}  sessions={reply.get('sessions')}")
+        return 0
+    print(reply.get("url", ""))
+    return 0
+
+
 def _status(args) -> int:
     cfg = _build_config(args, for_web=False)
-    url = args.url or f"http://{cfg.web.host}:{cfg.web.port}"
+    scheme = "https" if cfg.web.tls_cert else "http"
+    url = args.url or f"{scheme}://{cfg.web.host}:{cfg.web.port}"
     token = getattr(args, "token", None) or os.environ.get("SFO_WEB_TOKEN")
+    if not token:
+        # No long-lived secret at hand: the same-uid control socket exposes a
+        # data-free liveness summary, which is enough for a text status.
+        from .security.control import control_socket_path, query_control_socket
+
+        reply = query_control_socket(control_socket_path(cfg.paths.run_dir),
+                                     "status")
+        if reply.get("ok"):
+            print(f"hub running at {reply.get('url')}  "
+                  f"tls={reply.get('tls')}  sessions={reply.get('sessions')}")
+            print("run `stackflowos status --token <token>` (or open the hub "
+                  "UI) for the full state")
+            return 0
     request = urllib.request.Request(f"{url}/api/state")
     if token:
         request.add_header("Authorization", f"Bearer {token}")

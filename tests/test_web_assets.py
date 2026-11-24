@@ -8,7 +8,9 @@ runtime in the Python test suite, so we check the contracts that matter most:
 * all ``getElementById`` targets exist in index.html;
 * no external HTTP(S) assets, no ``@import``, no inline event handlers;
 * every ``/api/...`` endpoint the frontend calls is present in the real
-  ``stackflowos/web/api.py`` route table (or the server's SSE route).
+  route table: ``stackflowos/web/api.py``, ``web/server.py`` (SSE) or an
+  optional subsystem's ``routes()`` extension (skills/plugins/MCP/units/
+  observability/sessions/git/discovery).
 
 Run with::
 
@@ -136,11 +138,23 @@ class WebAssetsTest(unittest.TestCase):
     # -- API contract ----------------------------------------------------
     def test_api_endpoints_used_by_ui_exist_in_route_table(self) -> None:
         routes: set[str] = set()
+        # Core JSON routes: ``r("GET", r"/api/...", ...)``.
         for method, pattern in re.findall(
             r'r\(\s*"(GET|POST|PATCH|DELETE)"\s*,\s*r?"([^"]+)"', self.api_text
         ):
             self.assertIn(method, {"GET", "POST", "PATCH", "DELETE"})
             routes.add(normalize_endpoint(pattern))
+        # Optional subsystems register routes through ``routes()`` as
+        # ``("GET", r"/api/...", handler)`` tuples.  Scan the whole package so
+        # moving a feature out of api.py cannot silently break this guard.
+        for source in (ROOT / "stackflowos").rglob("*.py"):
+            text = read(source)
+            if source == API_PY:
+                continue
+            for method, pattern in re.findall(
+                r'\(\s*"(GET|POST|PATCH|DELETE)"\s*,\s*r?"(/api/[^"]+)"', text
+            ):
+                routes.add(normalize_endpoint(pattern))
         # SSE lives in server.py rather than the JSON route table.
         for literal in re.findall(r'"(/api/[^"]+)"', self.server_text):
             routes.add(normalize_endpoint(literal))
