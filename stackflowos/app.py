@@ -1583,13 +1583,13 @@ class App:
         return agent.to_dict()
 
     async def _agent_spawn(self, data, src):
-        agent = await self.supervisor.spawn(
+        # Route every spawn (operator RPC, assistant tool, web) through the
+        # same scope/workspace guard so an unbound agent cannot be created.
+        return await self.spawn_agent(
             str(data.get("role") or ""),
             data.get("project_id"),
-            task_id=data.get("task_id"),
-            reason=str(data.get("reason") or "requested"),
+            data.get("task_id"),
         )
-        return agent.to_dict()
 
     async def _agent_kill(self, data, src):
         agent_id = str(data.get("agent_id") or "")

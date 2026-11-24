@@ -271,7 +271,7 @@ def build_report(project: Any, tasks: list[Any], *, memory: Any = None,
     values = _memory_values(memory, project_id)
     if values is None:
         _check(checks, "memory.seed", "项目记忆", _WARN,
-               "未连接记忆存储，跳过检查（离线模式）。",
+               "未连接或不可读记忆存储，跳过检查（离线模式）。",
                checked=False)
     else:
         missing_keys = [key for key in onboarding.MEMORY_KEYS if key not in values]
