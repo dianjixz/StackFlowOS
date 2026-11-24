@@ -110,11 +110,17 @@ function AgentRow({ agent }: { agent: Agent }): ReactNode {
 }
 
 function EventRow({ event }: { event: SfoEvent }): ReactNode {
+  const summary = eventSummary(event);
+  // A bare event has no payload, so the summary is just its type — don't print
+  // the same string twice in one row.
+  const description = summary === event.type
+    ? fmtTime(event.ts)
+    : `${fmtTime(event.ts)} · ${event.type}`;
   return (
     <ListItem
       key={event.id || event.seq}
-      label={eventSummary(event)}
-      description={`${fmtTime(event.ts)} · ${event.type}`}
+      label={summary}
+      description={description}
       onClick={() => navigate('events')}
     />
   );
