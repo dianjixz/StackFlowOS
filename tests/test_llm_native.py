@@ -142,7 +142,7 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase, ServerMixin):
         self.assertEqual(request["headers"]["Authorization"], "Bearer sk-secret")
         body = request["body"]
         self.assertEqual(body["tools"][0]["type"], "function")
-        self.assertEqual(body["tools"][0]["function"]["name"], "fs.read")
+        self.assertEqual(body["tools"][0]["function"]["name"], "fs_read")
         self.assertEqual(body["tool_choice"], "auto")
 
     async def test_chat_still_returns_text(self) -> None:
@@ -266,7 +266,7 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase, ServerMixin):
         body = request["body"]
         self.assertEqual(body["system"], "你是助手")
         self.assertEqual(body["messages"][0]["role"], "user")
-        self.assertEqual(body["tools"][0]["name"], "fs.list")
+        self.assertEqual(body["tools"][0]["name"], "fs_list")
         self.assertIn("input_schema", body["tools"][0])
         self.assertEqual(body["tools"][0]["input_schema"]["properties"]["path"]["type"],
                          "string")
@@ -371,7 +371,7 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase, ServerMixin):
         body = request["body"]
         self.assertEqual(body["systemInstruction"]["parts"][0]["text"], "你是助手")
         self.assertEqual(body["tools"][0]["functionDeclarations"][0]["name"],
-                         "fs.list")
+                         "fs_list")
         self.assertEqual(body["contents"][0]["role"], "user")
 
     async def test_gemini_sse(self) -> None:

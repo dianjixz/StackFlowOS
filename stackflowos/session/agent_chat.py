@@ -50,6 +50,7 @@ from ..agents.models import Agent, now_ms
 from ..agents.tools import ToolExecutor, ToolResult, tools_for
 from ..ai.llm import (attach_runtime, complete, openai_tool_schemas,
                       supports_native_tools)
+from ..ai.providers import internal_tool_name, provider_tool_name
 from ..ai.types import coerce_tool_calls
 from ..ai.prompts import SYSTEM_PROMPT_OS, role_prompt
 from ..errors import BadRequest, Conflict, SfoError
@@ -680,10 +681,14 @@ class AgentChatService:
             action: dict | None
             if native_calls:
                 call = native_calls[0]
-                action = {"tool": call.name,
+                action = {"tool": internal_tool_name(call.name, allowed),
                           "args": dict(call.arguments or {}),
                           "_native": True,
-                          "_call_id": call.id or f"call-{step}"}
+                          "_call_id": call.id or f"call-{step}",
+                          # Keep the provider spelling for the assistant
+                          # tool_calls message; internal names contain dots and
+                          # would be rejected on the next request.
+                          "_provider_tool": provider_tool_name(call.name)}
             else:
                 action = _parse_action(text)
             if action is not None and action["tool"] in allowed:
@@ -712,7 +717,8 @@ class AgentChatService:
                             "id": action["_call_id"],
                             "type": "function",
                             "function": {
-                                "name": action["tool"],
+                                "name": (action.get("_provider_tool")
+                                         or provider_tool_name(action["tool"])),
                                 "arguments": json.dumps(
                                     action["args"] or {}, ensure_ascii=False),
                             },

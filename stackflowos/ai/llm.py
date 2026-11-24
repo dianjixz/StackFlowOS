@@ -32,8 +32,10 @@ from .providers import (
     _redact,
     anthropic_tools,
     gemini_tools,
+    internal_tool_name,
     normalise_finish_reason,
     openai_tool_schemas,
+    provider_tool_name,
 )
 from .router import Router
 from .telemetry import attach_provider_runtime, estimate_messages_tokens
@@ -350,7 +352,10 @@ class LLMBrain:
                 "id": call.id or "call-0",
                 "type": "function",
                 "function": {
-                    "name": call.name,
+                    # History must echo the wire-safe spelling: OpenAI/
+                    # Anthropic/Gemini reject dotted names in a later request
+                    # even when the call itself parsed fine.
+                    "name": provider_tool_name(call.name),
                     "arguments": json.dumps(dict(action.args or {}),
                                             ensure_ascii=False),
                 },
@@ -494,11 +499,12 @@ class LLMBrain:
     def _parse_tool_call(call: ToolCall, tools: Any) -> tuple[Any, str]:
         from ..agents.brain import Action
 
-        if not isinstance(call.name, str) or call.name not in tools:
+        name = internal_tool_name(call.name, tools)
+        if not isinstance(name, str) or name not in tools:
             return None, f"未知工具 {call.name!r}（可用：{sorted(tools)}）"
         if not isinstance(call.arguments, dict):
             return None, "arguments 必须是对象"
-        return Action(tool=call.name, args=dict(call.arguments)), ""
+        return Action(tool=name, args=dict(call.arguments)), ""
 
     @staticmethod
     def _parse(payload: dict | None, tools: Any) -> tuple[Any, str]:

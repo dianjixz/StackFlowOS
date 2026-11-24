@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import threading
 import time
 from typing import Any, AsyncIterator, Callable
@@ -137,6 +138,50 @@ _JSON_TYPES = {
     "list": "array", "array": "array",
 }
 
+#: Provider tool-name charset.  OpenAI, Anthropic and Gemini all reject names
+#: outside ``[A-Za-z0-9_-]``; internal tool names are dotted (``fs.read``) and
+#: must be translated on the wire, then translated back when a call arrives.
+_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def provider_tool_name(name: Any) -> str:
+    """Return the wire-safe spelling of an internal tool name.
+
+    ``fs.read`` -> ``fs_read``.  The mapping is deliberately deterministic and
+    stateless so request schemas, conversation history and response parsing can
+    all apply it without sharing per-request state.  The internal catalogue has
+    no collisions after this transform (checked by ``tests/test_provider_tool_names``).
+    """
+    text = str(name or "").strip()
+    safe = _TOOL_NAME_RE.sub("_", text)
+    if not safe:
+        return "tool"
+    if not (safe[0].isalnum() or safe[0] == "_"):
+        safe = "tool_" + safe
+    return safe[:64]
+
+
+def internal_tool_name(name: Any, known: Any) -> str:
+    """Map a provider-returned tool name back to an internal tool name.
+
+    Accepts the internal spelling unchanged (some providers/mocks echo exactly
+    what was sent) and otherwise resolves the deterministic safe alias against
+    ``known`` names.  Unknown names are returned as-is so callers can report a
+    proper "unknown tool" error.
+    """
+    text = str(name or "").strip()
+    try:
+        candidates = list(known or ())
+    except TypeError:
+        candidates = []
+    if text in candidates:
+        return text
+    for candidate in candidates:
+        if provider_tool_name(candidate) == text:
+            return str(candidate)
+    return text
+
+
 
 def _tool_parts(tool: Any) -> tuple[str, str, dict]:
     """Return ``(name, description, json_schema_parameters)`` for any spec."""
@@ -178,7 +223,7 @@ def openai_tool_schemas(tools: Any) -> list[dict]:
         if not name:
             continue
         out.append({"type": "function",
-                    "function": {"name": name,
+                    "function": {"name": provider_tool_name(name),
                                  "description": description,
                                  "parameters": parameters}})
     return out
@@ -190,7 +235,7 @@ def anthropic_tools(tools: Any) -> list[dict]:
         name, description, parameters = _tool_parts(tool)
         if not name:
             continue
-        out.append({"name": name, "description": description,
+        out.append({"name": provider_tool_name(name), "description": description,
                     "input_schema": parameters})
     return out
 
@@ -201,7 +246,8 @@ def gemini_tools(tools: Any) -> list[dict]:
         name, description, parameters = _tool_parts(tool)
         if not name:
             continue
-        declarations.append({"name": name, "description": description,
+        declarations.append({"name": provider_tool_name(name),
+                             "description": description,
                              "parameters": parameters})
     return [{"functionDeclarations": declarations}] if declarations else []
 
@@ -1398,6 +1444,8 @@ __all__ = [
     "OpenAICompatibleProvider",
     "anthropic_tools",
     "gemini_tools",
+    "internal_tool_name",
     "normalise_finish_reason",
     "openai_tool_schemas",
+    "provider_tool_name",
 ]
