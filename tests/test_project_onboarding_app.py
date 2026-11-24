@@ -9,6 +9,7 @@ from pathlib import Path
 from stackflowos.app import App
 from stackflowos.config import Config
 from stackflowos.errors import BadRequest
+from stackflowos.web.api import WebAPI
 
 TMP_ROOT = Path(__file__).resolve().parents[1] / ".stackflowos" / "tmp"
 
@@ -85,6 +86,21 @@ class ProjectOnboardingAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((external / "brief.md").is_file())
         self.assertTrue(result["health"]["ready"],
                         result["health"]["not_ready_reasons"])
+
+    async def test_healthcheck_and_onboard_api_routes(self) -> None:
+        card = await self.app.create_project("API", "ship", spawn_lead=False)
+        project_id = card["id"]
+        api = WebAPI(self.app)
+        status, payload = await api.handle(
+            "GET", f"/api/projects/{project_id}/healthcheck", {}, b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["project_id"], project_id)
+        self.assertIn("checks", payload["data"])
+
+        status, payload = await api.handle(
+            "POST", f"/api/projects/{project_id}/onboard", {}, b"{}")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["health"]["ready"])
 
     async def test_spawn_requires_a_project_scope(self) -> None:
         with self.assertRaises(BadRequest) as caught:
