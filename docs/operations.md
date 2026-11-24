@@ -178,13 +178,19 @@ journalctl --user -u stackflowos-hub -f
 
 建议再加一个 health timer（每分钟探活，卡死也能重启），或至少监控
 `/healthz` 中的 `transport` 字段：HTTP 线程活着不代表 pynng IPC 活着。
-`/healthz` 不需要 token（`/api/health` 需要），适合 systemd/监控脚本直接调用：
+`/healthz` 不需要 token（`/api/health` 需要），适合 systemd/监控脚本直接调用。
+注意只重启“活着但不响应”的 hub：单元已经 `inactive`/`failed` 时交给 systemd 的
+`Restart=always` + `StartLimitBurst` 处理，否则会跟手动 `stop` 打架，而且每分钟
+`reset-failed` 会清掉启动限流，把一次启动失败变成整夜重试：
 
 ```bash
 # ~/.local/bin/stackflowos-health.sh
+unit=stackflowos-hub.service
+state=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+[ "$state" = "active" ] || { echo "hub is ${state:-unknown}; leaving to systemd" >&2; exit 0; }
 curl -fsS -m 3 --retry 2 --retry-delay 2 --retry-connrefused \
      -o /dev/null http://127.0.0.1:17800/healthz \
-  || systemctl --user restart stackflowos-hub.service
+  || systemctl --user restart "$unit"
 ```
 
 ```bash
