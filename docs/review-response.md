@@ -81,3 +81,20 @@
 | F2 | 没有认证后会话管理 UI | sec/front | 会话列表/轮换/撤销/登出、当前角色 | ✅ 已修复 |
 | F3 | 单元页缺详情抽屉/依赖图/动作按钮 | units/front | 详情抽屉、requires/wants 图、状态事件、动作按钮 | ✅ 已修复 |
 | F4 | 没有国际化 | front | zh/en 字典（518 键）+ t()/data-i18n + 语言切换，覆盖主路径；事件摘要/部分表单字段仍中文 | 🟡 部分（主路径） |
+
+## 七、工人反馈：空项目 workspace 的「入住设施」
+
+> 来源：一位工人在空项目里的体验。核心不是缺功能，而是缺信号。
+> 契约与验收见 `docs/onboarding.md`。
+
+| # | 反馈 | 处理 | 状态 |
+|---|---|---|---|
+| A1 | 门牌：项目绑定 + 默认 workspace 路径；没 scope 一律被拒 | 派工强制 project_id + workspace 存在；`brief.md` 写 id/目标/路径/边界；`project.health` 检查 scope | ✅ 已修复 |
+| A2 | 固定目录骨架（brief.md/tasks/artifacts/logs/tmp） | `projects/onboarding.py` 自动写入；`sfo project scaffold` 显式补齐；接入目录不隐式修改 | ✅ 已修复 |
+| A3 | 看板至少一个种子任务 | 创建/接入写入「入职自检」任务：health → 读 brief → 写 artifact → 登记 → review | ✅ 已修复 |
+| A4 | 入职自检入口 + 显式失败原因（error 不再为空） | `project.health` 工具/RPC、`GET /api/projects/{id}/healthcheck`、`sfo project health`；`blocked/failed` 都带非空 `error` 与 `error_code` | ✅ 已修复 |
+| A5 | 读类预授权，写/执行/网络人审 | 修复接入 workspace 边界（读回到 low 自动放行）；`security.auto_allow_low` 默认；health 检查读预授权 | ✅ 已修复 |
+| A6 | 事件流可按 agent + 时间回放 | `EventLog.query` agent/source/type/时间窗；`sfo events`、API、`event.query` 工具 | ✅ 已修复 |
+| A7 | 记忆初值（目标/术语/命名/产物路径） | 创建/接入写入 goal/brief/workspace/layout/conventions/glossary；注入 runner/LLM/agent chat | ✅ 已修复 |
+| A8 | 失败语义：未就绪 vs 执行失败 | Agent 终态 `blocked` vs `failed`，事件/UI 分开；runner preflight；超时/步数/工具上限归 blocked | ✅ 已修复 |
+

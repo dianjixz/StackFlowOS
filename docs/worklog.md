@@ -34,3 +34,35 @@
 - `docs/architecture.md`：扩展契约、新事件目录、新配置 section、非目标/长期项、§15 子系统实现。
 - `docs/security-fix-plan.md` §14：reviewer fs.write、lease 作用域、审计脱敏、launch token、DNS 固定 IP 标记完成；新增 §14.1 安全增补记录与残余风险。
 - 全量测试目标：见最后一次 `pytest` 输出；所有新增模块 `python -m compileall` 通过。
+
+### 10:00–10:20 工人反馈：项目入住设施、失败语义与读预授权
+- 背景：一位工人在空项目 workspace 里的反馈——缺门牌/目录骨架/种子任务/自检入口，
+  读动作频繁弹审批，失败只有 `failed` 且 `error` 为空，事件无法按 agent/时间回放。
+- **策略边界修复**：`PolicyEngine.workspace_for` + `workspace_resolver`，`ApprovalBroker`
+  的风险与 `path_prefix` 授权改用项目真实 workspace；接入项目（attached-ro/rw）里的
+  `fs.read/fs.list` 回到 low 自动放行，写仍 medium 人审，未知/非法 id fail-closed。
+  提交：`8abde18` `fix(policy): use attached project workspace for risk and approval scopes`。
+- **失败语义**：Agent 新增终态 `blocked`（缺 scope/workspace/任务、max_steps、超时、
+  工具上限、连续失败），`failed` 只留给执行错误；两者强制非空 `error` + `error_code`；
+  runner 在 claim 前 preflight；事件 `agent.blocked` 独立；派工强制 project_id 且
+  workspace 存在；UI 的活动/结束筛选与顺序同步。
+- **项目入住包**：新增 `stackflowos/projects/onboarding.py`（brief.md、固定目录、种子
+  任务、记忆初值、只读接入拒绝写入）与 `stackflowos/projects/health.py`（14 项检查 +
+  `ready/not_ready_reasons/next_actions/fix`）。创建项目自动入住；接入项目只做只读
+  巡检 + 状态侧种子；`POST /api/projects/{id}/onboard` 幂等补齐。
+- **自检入口**：Agent 工具 `project.health`；RPC `project.health`（按 principal 带 agent
+  binding 检查，单位只能看自己项目）；`GET /api/projects/{id}/healthcheck`；
+  CLI `sfo project health`（离线只读）与 `sfo project scaffold`（只写 workspace）；
+  项目详情新增「入住自检」卡（ok/warn/fail、fix、补齐/重检按钮）。
+- **读预授权与记忆**：`security.auto_allow_low` 默认生效（读类自动放行）；`memory.list`
+  RPC/工具/角色授权；Runner view、LLM compact state、Agent 对话上下文注入项目记忆。
+- **事件回放**：`EventLog.query` 支持 `agent_id/source/types/since_ts/until_ts`；API
+  `/api/events` `/api/console` 与工具 `event.query` 接线；新增 `sfo events` 命令行。
+- **文档**：新增 `docs/onboarding.md`；更新 `README.md`、`docs/architecture.md`
+  （§5.7 事件、§6.2 workspace 边界、§7 入住、§8.1 blocked/failed）。
+- **测试**：新增 `test_projects_onboarding/health`、`test_project_onboarding_app`、
+  `test_attached_workspace_policy`、`test_event_replay`；更新 runner/supervisor/limits/
+  queue/attach/event-trust/rpc-scope 断言；全量 **1151 passed + 623 subtests**（2 skipped）。
+- **提交**：`f6ae4c6` `feat(onboarding): project kit, health check, blocked/failed split,
+  replay filters`；`906351b` `fix(agents): use the LLM brain when routes or fallback are
+  configured`（并行阶段遗留的 5 行修复）。

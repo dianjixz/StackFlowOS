@@ -337,10 +337,11 @@ unit.state_changed / unit.action / unit.probe / sys.standby.promoted
 lease.acquired / lease.renewed / lease.released / lease.expired / lease.preempted
 project.created / project.updated / project.archived / project.progress / project.degraded / project.completed
 project.deleted / project.delete.completed / project.archive.completed / project.purge.failed
+project.onboarded / project.onboard.requested
 task.created / task.updated / task.claimed / task.started / task.review
 task.completed / task.blocked / task.artifact / task.note
 agent.spawned / agent.registered / agent.working / agent.waiting / agent.finished
-agent.failed / agent.terminated / agent.heartbeat / agent.step
+agent.blocked / agent.failed / agent.terminated / agent.heartbeat / agent.step
 approval.requested / approval.decided / approval.auto / approval.expired / approval.used / approval.ui_decided
 operator.action
 rule.created / rule.updated / rule.deleted
@@ -427,6 +428,13 @@ class Rule:
 判定顺序：**deny 优先**（任意匹配 deny → deny）→ allow（risk ≤ risk_max）→
 默认策略（low 按 `auto_allow_low`，medium/high 按 `medium_default/high_default`）。
 每次判定都写审计（`approval.auto` 或 `approval.requested`）。
+
+**workspace 边界按项目真实路径解析**（`PolicyEngine.workspace_for`）：托管项目是
+`<projects_root>/<id>/workspace`，接入项目（`attached-ro/rw`）是操作员选择的目录。
+`App` 注入 `projects.get(id).workspace` 作为 resolver；`ApprovalBroker` 的风险与
+`path_prefix` 授权也用同一解析。未知/非法 id 回退到不存在的托管路径（fail closed），
+不会因为接入目录在 `projects_root` 之外就拒绝所有读写——读仍是 low（默认自动放行），
+写仍是 medium（人审），工作区外仍升 high。
 
 ### 6.3 审批（ApprovalBroker）
 
@@ -523,6 +531,10 @@ class Project:
   `blocked → todo`；`review → todo`（打回）。非法迁移报 `ValidationError`。
 * `claim` 是原子操作：只有 `todo` 且无 assignee 才能被认领，否则 `CONFLICT`。
 * 系统工作区：`<state>/projects/<p-id>/workspace`，由系统创建。
+* 项目入住（onboarding）：创建项目时写入固定骨架 `brief.md`、`tasks/`、`artifacts/`、
+  `logs/`、`tmp/`，并写入种子任务“入职自检”、记忆初值（goal/workspace/layout/
+  conventions/glossary）；`sfo project health <id>` / `project.health` 逐项检查
+  scope/workspace/骨架/看板/记忆/读预授权/审计并给出修复建议。
 * 接入已有目录：`project.attach`/`POST /api/projects/attach`，目录不由系统创建；
   默认 `attached-ro`（Agent 只能读/列，`fs.write/fs.delete/shell.exec` 在 worker
   侧直接拒绝），显式 `allow_writes=true` 才是 `attached-rw`。同一路径重复接入会
@@ -559,7 +571,11 @@ class Project:
 * "随项目生灭"由 `AgentSupervisor.archive(project)` 保证：归档即杀光 subprocess。
 * lead 随项目创建自动拉起（`agents.auto_spawn_project_lead`）。
 * 每个 Agent 一个进程（= 一个 unit），`unit.kind` 等于 role。
-* Agent 状态：`spawning → idle → working → waiting → done|failed|dead`。
+* Agent 状态：`spawning → idle → working → waiting → done|blocked|failed|dead`。
+  `blocked` = 缺前置条件/预算到限（无 project scope、workspace 缺失、任务不存在/
+  已被认领、max_steps、任务超时、工具次数上限、连续失败）；`failed` = 执行期真的
+  出错（异常、LLM/工具崩溃）。两者都带非空 `error` 与机器可读 `error_code`；
+  UI/事件流分开显示，避免把“补一个前置条件”误判成“查 bug”。
 
 ### 8.2 Agent 运行循环（worker 进程）
 

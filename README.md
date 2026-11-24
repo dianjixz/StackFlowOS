@@ -202,7 +202,9 @@ lease = {
 ### 事件流（Event Log）
 
 append-only JSONL（`<state>/events/events.jsonl`），全局单调 `seq`，
-支持 `since(seq)` 重放。UI 的 SSE 断线后按 `lastSeq` 续传。
+支持 `since(seq)` 增量与按 **agent / source / type / 时间窗** 回放
+（`sfo events --agent agent-coder-1 --since-ts ...`，API `GET /api/events?agent_id=...`，
+Agent 工具 `event.query`）。UI 的 SSE 断线后按 `lastSeq` 续传。
 聊天、审批、任务、Agent 的一生都在同一条流里——审计不是另一张表。
 
 ### 已有目录 → 项目
@@ -215,6 +217,23 @@ append-only JSONL（`<state>/events/events.jsonl`），全局单调 `seq`，
   默认 **只读**（Agent 可读/列，写文件和 shell 被拒绝）；勾选“允许 Agent 写入”
   （或在对话里说“把 StackFlowOS 改成可写”）才切到可写，写操作仍走能力审批；
   项目详情可随时切回只读。删除项目只删登记记录，外部目录永远保留。
+
+### 项目入住（Agent Onboarding）
+
+Agent 进入空 workspace 时最缺的不是功能，是信号。项目创建/接入时会写入：
+
+- **门牌** `brief.md`：项目 id/目标/workspace/目录约定/审批边界/自检命令；
+- **固定骨架**：`tasks/`（中间产物）、`artifacts/`（交付物）、`logs/`（执行记录）、
+  `tmp/`（草稿）；
+- **种子任务**「入职自检」：读 brief → `project.health` → 写 artifact → 登记 → review，
+  让空项目也能完成一次完整闭环；
+- **记忆初值**：goal / workspace / layout / conventions / glossary，Agent 不再从零猜；
+- **一条自检入口**：`project.health` / `sfo project health <id>` /
+  `GET /api/projects/{id}/healthcheck`，逐项检查 scope、workspace、骨架、看板、
+  记忆、读预授权与审计，失败项带 `fix`。
+
+读类动作（`fs.read/fs.list/task.list/project.get/memory.list/project.health`）默认低风险
+自动放行；写/执行/网络保持人审。完整契约见 [`docs/onboarding.md`](docs/onboarding.md)。
 
 ### 权限（Capability → Risk → Policy → Approval → Grant → Audit）
 
@@ -243,6 +262,15 @@ append-only JSONL（`<state>/events/events.jsonl`），全局单调 `seq`，
 - **拒绝**：动作失败，Agent 收到 `DENIED`
 - 没人处理时到期自动拒绝（fail closed）
 - 放行规则可限定 principal（`coder.*`）、路径前缀、命令正则、域名、项目、风险上限
+
+Agent 终态分两种，UI 和事件流分开显示：
+
+- `blocked`：缺前置条件/到预算上限（无 project scope、workspace 缺失、任务不存在或
+  已被认领、max_steps、任务超时、工具次数上限、连续失败）；补条件即可重派；
+- `failed`：执行期真的出错（异常、LLM/工具崩溃）；需要查 bug。
+
+两者都带非空 `error` 和机器可读 `error_code`（如 `WORKSPACE_MISSING`、
+`MAX_STEPS`、`AGENT_CRASH`）。派工现在强制要求项目 scope 与可用 workspace。
 
 执行模型是**能力委托**：worker 在本地执行，sys 授权并审计。这对应内核给进程发 fd；
 已知限制是 worker 本身可信（见"边界"）。
@@ -425,6 +453,10 @@ stackflowos hub      [--transport ipc|tcp] [--host 127.0.0.1] [--allow-remote] [
                      [--tls-cert PEM --tls-key PEM] [--standby] [--no-web]
 stackflowos demo     [--until-done] [--timeout 240] [--goal ...]
 stackflowos doctor
+stackflowos project health <id> [--json]     # 入住自检（离线只读）
+stackflowos project scaffold <id>            # 只补 workspace 骨架
+stackflowos events [--project P] [--agent ID] [--source S] [--types T]
+                   [--since-ts MS] [--until-ts MS] [--limit N] [--json]
 stackflowos status   [--url https://127.0.0.1:17800] [--token <launch token>]
 stackflowos url      [--status] [--json]        # control socket 铸造登录 URL
 stackflowos backup | restore ARCHIVE [--force] | export-events | backup-status
