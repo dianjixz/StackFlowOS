@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import ipaddress
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -205,6 +206,78 @@ class AgentsCfg:
 
 
 @dataclass
+class AutonomyCfg:
+    """The self-driving loop: patrol, dispatch, bounded self-approval.
+
+    Everything is off by default.  Enabling autonomy is an explicit operator
+    decision with three independent switches (``enabled``, ``dispatch_mode``,
+    ``approve_mode``) and hard envelopes: quotas, capability allowlists,
+    project/role filters, a risk ceiling and a shell allowlist.  The guardian
+    never decides permanent/destructive capabilities (see
+    ``autonomy.models.HARD_DENY_CAPABILITIES``).
+    """
+
+    enabled: bool = False
+    #: Wall-clock seconds between patrols.
+    interval_s: float = 120.0
+    #: Run one patrol shortly after the hub is ready (instead of waiting a
+    #: full interval).
+    on_start: bool = True
+    #: Recent reports kept in ``state/autonomy.json`` (the latest is always
+    #: kept separately).
+    report_keep: int = 20
+    #: How long a ``todo`` task may sit with no live agent before dispatch.
+    task_idle_s: float = 120.0
+    #: How long a pending approval may wait before patrol calls it out.
+    approval_age_s: float = 120.0
+    #: Window used to aggregate agent failures.
+    failure_window_s: float = 3600.0
+    #: Same (role, error_code) failures at/above this become ``critical``.
+    failure_threshold: int = 3
+    #: off = observe only; tasks = create remediation tasks; agents = also
+    #: spawn workers for them.
+    dispatch_mode: str = "off"
+    #: Cap on concurrently active agents the governor itself dispatched.
+    dispatch_max_agents: int = 2
+    dispatch_max_tasks_per_hour: int = 10
+    dispatch_max_spawns_per_hour: int = 4
+    #: Per-finding cooldown after an attempt (successful or failed).
+    dispatch_cooldown_s: float = 900.0
+    #: off = never decide; observe = record recommendations only; enforce =
+    #: actually approve within the envelope.
+    approve_mode: str = "off"
+    #: Highest risk the guardian may approve.  ``high`` also requires explicit
+    #: ``approve_shell``/``approve_domains`` opt-ins for those capabilities.
+    approve_risk_max: str = "medium"
+    #: Capabilities the guardian may approve (single requests, mode="once").
+    approve_capabilities: list[str] = field(
+        default_factory=lambda: ["fs.write", "agent.spawn"])
+    #: Project allowlist; empty means every active/review/degraded project.
+    approve_projects: list[str] = field(default_factory=list)
+    #: Roles the guardian may spawn on a lead's behalf (``lead`` is excluded
+    #: by default: the governor spawns leads from its own dispatcher, not from
+    #: a worker request).
+    approve_roles: list[str] = field(
+        default_factory=lambda: ["architect", "coder", "tester",
+                                 "reviewer", "researcher"])
+    approve_max_per_hour: int = 20
+    #: Let a human see a request first; 0 means decide immediately.
+    approve_min_age_s: float = 0.0
+    #: Respect recent human denials: skip matching requests for this long.
+    approve_deny_cooldown_s: float = 86400.0
+    #: Per-project cap on live agents when auto-approving ``agent.spawn``.
+    approve_max_agents_per_project: int = 4
+    #: Auto-approve ``shell.exec`` only when it matches one of the operator's
+    #: regexes and runs inside the project workspace.  Requires
+    #: ``approve_risk_max="high"`` and a non-empty pattern list.
+    approve_shell: bool = False
+    approve_shell_patterns: list[str] = field(default_factory=list)
+    #: Domains the guardian may auto-approve for ``net.fetch`` (exact host or
+    #: dot-suffix, e.g. ``example.com``).
+    approve_domains: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SkillsCfg:
     #: Skill roots (relative paths resolve against the state dir).  Every
     #: sub-directory with a ``SKILL.md`` or ``skill.json`` is one skill.
@@ -294,6 +367,7 @@ DEFAULTS = {
     "security": dataclasses.asdict(SecurityCfg()),
     "llm": dataclasses.asdict(LLMCfg()),
     "agents": dataclasses.asdict(AgentsCfg()),
+    "autonomy": dataclasses.asdict(AutonomyCfg()),
     "skills": dataclasses.asdict(SkillsCfg()),
     "plugins": dataclasses.asdict(PluginsCfg()),
     "mcp": dataclasses.asdict(MCPCfg()),
@@ -309,6 +383,7 @@ _SECTIONS = {
     "security": SecurityCfg,
     "llm": LLMCfg,
     "agents": AgentsCfg,
+    "autonomy": AutonomyCfg,
     "skills": SkillsCfg,
     "plugins": PluginsCfg,
     "mcp": MCPCfg,
@@ -640,6 +715,8 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("agents.queue_max out of range")
         if section.config_reload_s < 0:
             raise ConfigError("agents.config_reload_s must be >= 0")
+    elif name == "autonomy":
+        _validate_autonomy(section)
     elif name == "skills":
         if not isinstance(section.dirs, list) or not all(
                 isinstance(item, str) and item.strip() for item in section.dirs):
@@ -728,6 +805,135 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("cluster.lease_clock_skew_s must be >= 0")
 
 
+def _validate_autonomy(section: AutonomyCfg) -> None:
+    """Validate the autonomy envelope before anything is persisted.
+
+    Imports are local so ``config`` stays a leaf module at import time and the
+    autonomy package can import config without a cycle.
+    """
+    from .autonomy.models import (
+        APPROVE_MODES,
+        DISPATCH_MODES,
+        HARD_DENY_CAPABILITIES,
+    )
+    from .security.capabilities import (
+        CAPABILITIES,
+        RISK_ORDER,
+        validate_project_id,
+    )
+
+    for flag in ("enabled", "on_start", "approve_shell"):
+        if not isinstance(getattr(section, flag), bool):
+            raise ConfigError(f"autonomy.{flag} must be a boolean")
+    if not (10.0 <= float(section.interval_s) <= 86400.0):
+        raise ConfigError("autonomy.interval_s out of range (10..86400)")
+    if not (1 <= int(section.report_keep) <= 200):
+        raise ConfigError("autonomy.report_keep out of range (1..200)")
+    if not (10.0 <= float(section.task_idle_s) <= 86400.0):
+        raise ConfigError("autonomy.task_idle_s out of range (10..86400)")
+    if not (10.0 <= float(section.approval_age_s) <= 86400.0):
+        raise ConfigError("autonomy.approval_age_s out of range (10..86400)")
+    if not (60.0 <= float(section.failure_window_s) <= 7 * 86400.0):
+        raise ConfigError("autonomy.failure_window_s out of range (60..604800)")
+    if not (1 <= int(section.failure_threshold) <= 100):
+        raise ConfigError("autonomy.failure_threshold out of range (1..100)")
+    if section.dispatch_mode not in DISPATCH_MODES:
+        raise ConfigError(
+            f"autonomy.dispatch_mode must be one of {list(DISPATCH_MODES)}")
+    for field_name, maximum in (("dispatch_max_agents", 32),
+                                ("dispatch_max_tasks_per_hour", 10000),
+                                ("dispatch_max_spawns_per_hour", 10000)):
+        value = getattr(section, field_name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"autonomy.{field_name} must be an integer")
+        if not (0 <= value <= maximum):
+            raise ConfigError(
+                f"autonomy.{field_name} out of range (0..{maximum})")
+    for field_name in ("dispatch_cooldown_s", "approve_min_age_s",
+                       "approve_deny_cooldown_s"):
+        value = getattr(section, field_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(f"autonomy.{field_name} must be a number")
+        if value < 0:
+            raise ConfigError(f"autonomy.{field_name} must be >= 0")
+    if section.approve_mode not in APPROVE_MODES:
+        raise ConfigError(
+            f"autonomy.approve_mode must be one of {list(APPROVE_MODES)}")
+    if section.approve_risk_max not in RISK_ORDER:
+        raise ConfigError(
+            f"autonomy.approve_risk_max must be one of {sorted(RISK_ORDER)}")
+    if not isinstance(section.approve_capabilities, list) or not all(
+            isinstance(item, str) and item for item in section.approve_capabilities):
+        raise ConfigError(
+            "autonomy.approve_capabilities must be a list of capability names")
+    for capability in section.approve_capabilities:
+        if capability not in CAPABILITIES:
+            raise ConfigError(
+                f"autonomy.approve_capabilities: unknown capability "
+                f"{capability!r}")
+        if capability in HARD_DENY_CAPABILITIES:
+            raise ConfigError(
+                f"autonomy.approve_capabilities may not include {capability!r}: "
+                "destructive/system capabilities always need a human")
+    if not isinstance(section.approve_projects, list):
+        raise ConfigError("autonomy.approve_projects must be a list")
+    for project_id in section.approve_projects:
+        if not isinstance(project_id, str):
+            raise ConfigError(
+                "autonomy.approve_projects entries must be project ids")
+        validate_project_id(project_id)
+    if not isinstance(section.approve_roles, list) or not all(
+            isinstance(item, str) and item for item in section.approve_roles):
+        raise ConfigError(
+            "autonomy.approve_roles must be a list of role names")
+    if not (0 <= int(section.approve_max_per_hour) <= 10000):
+        raise ConfigError("autonomy.approve_max_per_hour out of range")
+    if not (0 <= int(section.approve_max_agents_per_project) <= 32):
+        raise ConfigError(
+            "autonomy.approve_max_agents_per_project out of range (0..32)")
+    patterns = section.approve_shell_patterns
+    if not isinstance(patterns, list) or not all(
+            isinstance(item, str) for item in patterns):
+        raise ConfigError(
+            "autonomy.approve_shell_patterns must be a list of regex strings")
+    for pattern in patterns:
+        if not pattern:
+            raise ConfigError(
+                "autonomy.approve_shell_patterns entries must not be empty")
+        try:
+            re.compile(pattern)
+        except (re.error, OverflowError, RecursionError) as exc:
+            raise ConfigError(
+                f"invalid autonomy.approve_shell_patterns regex {pattern!r}: "
+                f"{exc}") from None
+    domains = section.approve_domains
+    if not isinstance(domains, list) or not all(
+            isinstance(item, str) and item.strip() for item in domains):
+        raise ConfigError(
+            "autonomy.approve_domains must be a list of host names")
+    capabilities = set(section.approve_capabilities)
+    if section.approve_shell:
+        if "shell.exec" not in capabilities:
+            raise ConfigError(
+                "autonomy.approve_shell requires shell.exec in "
+                "autonomy.approve_capabilities")
+        if not patterns:
+            raise ConfigError(
+                "autonomy.approve_shell requires approve_shell_patterns")
+        if section.approve_risk_max != "high":
+            raise ConfigError(
+                "autonomy.approve_shell requires approve_risk_max='high'")
+    if "shell.exec" in capabilities and not section.approve_shell:
+        raise ConfigError(
+            "shell.exec in approve_capabilities requires approve_shell=true")
+    if "net.fetch" in capabilities and not domains:
+        raise ConfigError(
+            "net.fetch in approve_capabilities requires approve_domains")
+    if section.approve_shell and "shell.exec" not in capabilities:
+        raise ConfigError(
+            "approve_shell=true requires shell.exec in approve_capabilities")
+
+
 _REDACTED = "***"
 _SECRET_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password",
                      "authorization", "bearer", "credential")
@@ -800,6 +1006,7 @@ class Config:
     security: SecurityCfg
     llm: LLMCfg
     agents: AgentsCfg
+    autonomy: AutonomyCfg
     skills: SkillsCfg
     plugins: PluginsCfg
     mcp: MCPCfg

@@ -56,6 +56,7 @@ EXTENSION_MODULES: tuple[str, ...] = (
     "stackflowos.units.control",
     "stackflowos.ai.llm_api",
     "stackflowos.agents.extension",
+    "stackflowos.autonomy",
     "stackflowos.security.sessions",
     "stackflowos.security.control",
     "stackflowos.observability.metrics",
