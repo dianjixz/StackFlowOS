@@ -208,6 +208,26 @@ def _redact_args(value: Any, *, depth: int = 0) -> Any:
     return value
 
 
+def _redact_data(value: Any, *, depth: int = 0) -> Any:
+    """Redact secrets in an audit result without truncating every string.
+
+    ``_redact_args`` is tuned for request arguments (300 chars per string);
+    audit results may legitimately contain longer text and are bounded once by
+    ``security.audit_max_field_chars`` afterwards.
+    """
+    if depth > 6:
+        return "…"
+    if isinstance(value, dict):
+        return {key: ("***" if is_secret_key(key)
+                      else _redact_data(item, depth=depth + 1))
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_data(item, depth=depth + 1) for item in value[:50]]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
 def _request_id(args: dict) -> str:
     for key in ("request_id", "id", "approval_id", "request"):
         value = args.get(key)
@@ -238,6 +258,29 @@ def _approval_confirm_ok(confirm: str, request_id: str, decision: str) -> bool:
     if request_id and confirm.lower() == request_id.lower():
         return True
     return confirm.lower() in _DECISION_CONFIRM_WORDS.get(decision, set())
+
+
+def _audit_limit(security: Any) -> int:
+    try:
+        value = int(getattr(security, "audit_max_field_chars", 4000) or 4000)
+    except (TypeError, ValueError):
+        value = 4000
+    return max(64, min(value, 65536))
+
+
+def _audit_redact_enabled(security: Any) -> bool:
+    value = getattr(security, "audit_redact", True)
+    return bool(value)
+
+
+def _audit_text(value: Any, limit: int, redact: bool) -> str:
+    text = str(value)
+    if redact:
+        text = redact_text(text)
+    if len(text) > limit:
+        # Leave room for the ellipsis so the field never exceeds the bound.
+        text = text[: max(0, limit - 1)] + "…"
+    return text
 
 
 class OperatorTools:
@@ -292,7 +335,19 @@ class OperatorTools:
     def _audit(self, requested: str, spec: OperatorTool | None, args: dict, *,
                ok: bool, subject: str, data: dict | None = None,
                error: str | None = None) -> None:
+        """Append an immutable, redacted ``operator.action`` audit record.
+
+        Both ``result`` and ``error`` used to be raw slices: a tool that
+        echoed a bearer token (or an exception message containing a URL with
+        userinfo) leaked it into the event log.  They now go through the
+        shared redactor and are truncated to ``security.audit_max_field_chars``.
+        The event log record itself is append-only; redaction happens before
+        the append and never rewrites history.
+        """
         try:
+            security = getattr(getattr(self.app, "config", None),
+                               "security", None)
+            limit = _audit_limit(security)
             payload = {
                 "tool": requested,
                 "capability": spec.capability if spec else None,
@@ -301,10 +356,13 @@ class OperatorTools:
                 "ok": bool(ok),
             }
             if error:
-                payload["error"] = error[:500]
+                payload["error"] = _audit_text(error, limit,
+                                               _audit_redact_enabled(security))
             if data:
-                summary = json.dumps(data, ensure_ascii=False, default=str)
-                payload["result"] = summary[:800]
+                summary = json.dumps(_redact_data(data), ensure_ascii=False,
+                                     default=str)
+                payload["result"] = _audit_text(summary, limit,
+                                                _audit_redact_enabled(security))
             project_id = args.get("project_id")
             self.app.eventlog.append("operator.action", payload,
                                      source="agent-assistant",

@@ -16,19 +16,21 @@ the console's security headers.  Only CSS/JS/images/favicon and the data-free
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import math
 import mimetypes
 import posixpath
 import re
+import ssl
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..errors import BadRequest, SfoError, Unavailable
 from ..protocol import dumps
 from ..util.logging import get_logger
-from .auth import WebAuth, security_headers
+from .auth import ROLE_OPERATOR, WebAuth, security_headers
 from .api import WebReply
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "webassets"
@@ -85,7 +87,32 @@ class WebServer:
                  secure: bool = False,
                  launch_token: str | None = None,
                  sse_heartbeat_s: float = DEFAULT_SSE_HEARTBEAT_S,
-                 sse_max_clients: int = DEFAULT_SSE_MAX_CLIENTS) -> None:
+                 sse_max_clients: int = DEFAULT_SSE_MAX_CLIENTS,
+                 # TLS listener (Phase 5 gap): when both PEM paths are given
+                 # the server speaks HTTPS directly; the cookie becomes
+                 # ``Secure`` automatically.  All new parameters keep
+                 # defaults so existing call sites/tests are unchanged.
+                 tls_cert: str | None = None,
+                 tls_key: str | None = None,
+                 tls_min_version: str = "TLSv1.2",
+                 users: Iterable[dict] | None = None,
+                 session_max: int | None = None,
+                 launch_token_single_use: bool | None = None,
+                 session_manager=None) -> None:
+        web_cfg = getattr(getattr(app, "config", None), "web", None)
+        # Config fallbacks: a caller that predates the new arguments (or the
+        # current CLI) still gets the configured TLS/users/session policy.
+        if tls_cert is None and tls_key is None:
+            tls_cert = getattr(web_cfg, "tls_cert", "") or None
+            tls_key = getattr(web_cfg, "tls_key", "") or None
+        if users is None:
+            configured_users = getattr(web_cfg, "users", None) or ()
+            users = configured_users
+        if session_max is None:
+            session_max = int(getattr(web_cfg, "session_max", 32) or 32)
+        if launch_token_single_use is None:
+            launch_token_single_use = bool(
+                getattr(web_cfg, "launch_token_single_use", True))
         self.app = app
         self.host = host
         self.port = port
@@ -98,20 +125,55 @@ class WebServer:
         self.sse_heartbeat_s = float(sse_heartbeat_s)
         self.sse_max_clients = int(sse_max_clients)
         self._sse_clients = 0
+        self.ssl_context = _build_tls_context(
+            tls_cert, tls_key, tls_min_version)
+        self.tls_enabled = self.ssl_context is not None
+        self.insecure_remote = (not self.tls_enabled
+                                and not _is_loopback_host(host))
+        self.security_notes: list[str] = []
+        if self.insecure_remote:
+            self.security_notes.append(
+                "web console is bound to a non-loopback address without TLS; "
+                "traffic is plaintext and must stay behind an SSH tunnel or a "
+                "TLS-terminating reverse proxy")
+        # Server-side browser sessions.  The extension subsystem loads before
+        # the WebServer in production and publishes its manager on
+        # ``app.security_sessions``; direct constructions (tests) fall back to
+        # a private manager.  Both paths share one table with the
+        # ``/api/sessions`` routes.
+        manager = session_manager
+        if manager is None:
+            manager = getattr(app, "security_sessions", None)
+        if manager is None:
+            from ..security.sessions import SessionManager
+
+            manager = SessionManager(
+                max_sessions=session_max,
+                ttl_s=max(60, int(cookie_ttl_days) * 86400))
+        self.session_manager = manager
+        try:
+            app.security_sessions = manager
+        except Exception:  # pragma: no cover - immutable apps in tests
+            pass
         # Browser admission: token -> HMAC cookie, Host/Origin/CSRF checks.
         # Both secrets are per-process and memory-only.
         self.auth = WebAuth(host=host, port=port,
                             trusted_hosts=trusted_hosts,
                             cookie_ttl_days=cookie_ttl_days,
-                            secure=secure,
-                            launch_token=launch_token)
+                            secure=bool(secure) or self.tls_enabled,
+                            launch_token=launch_token,
+                            users=users,
+                            sessions=manager,
+                            single_use=launch_token_single_use,
+                            scheme="https" if self.tls_enabled else "http")
         # Imported lazily to keep server.py reusable in tests.
         from .api import WebAPI
         self.api = WebAPI(app)
 
     @property
     def url(self) -> str:
-        return f"http://{_display_host(self.host)}:{self.port}"
+        scheme = "https" if self.tls_enabled else "http"
+        return f"{scheme}://{_display_host(self.host)}:{self.port}"
 
     @property
     def launch_token(self) -> str:
@@ -121,20 +183,71 @@ class WebServer:
     @property
     def login_url(self) -> str:
         """Browser login URL including the per-process launch token."""
-        return f"{self.url}/?token={self.auth.launch_token}"
+        return self.auth.login_url_for(self.auth.launch_token,
+                                       scheme="https" if self.tls_enabled else "http",
+                                       host=self.host, port=self.port)
+
+    def mint_login_url(self) -> str:
+        """Mint a fresh single-use launch token and return its browser URL.
+
+        Used by the operator control socket (``sfo url``); the token is never
+        logged or written to disk.
+        """
+        token = self.auth.mint_launch_token()
+        return self.auth.login_url_for(
+            token, scheme="https" if self.tls_enabled else "http",
+            host=self.host, port=self.port)
 
     async def start(self) -> str:
-        self._server = await asyncio.start_server(self._handle_client, self.host, self.port,
-                                                  limit=MAX_BODY + 65536)
+        self._server = await asyncio.start_server(
+            self._handle_client, self.host, self.port,
+            limit=MAX_BODY + 65536, ssl=self.ssl_context)
         sockets = self._server.sockets or []
         if sockets:
             self.port = sockets[0].getsockname()[1]
         # Keep the authority allow-list in sync with the ephemeral port.
         self.auth.port = self.port
+        self._attach_runtime()
+        for note in self.security_notes:
+            self.log.warning("%s", note)
         self.log.info("web listening on %s", self.url)
         return self.url
 
+    def _attach_runtime(self) -> None:
+        """Publish this server to the session/control extensions.
+
+        Extensions load before the WebServer exists, so they cannot hold a
+        server reference at build time.  Attaching at ``start()`` keeps the
+        dependency one-way and lets every piece degrade safely when absent.
+        """
+        try:
+            self.app.security_web = self
+        except Exception:  # pragma: no cover - defensive
+            pass
+        control = getattr(self.app, "security_control", None)
+        attach = getattr(control, "attach_web", None)
+        if callable(attach):
+            try:
+                attach(self)
+            except Exception:  # pragma: no cover - extension isolation
+                self.log.exception("control socket could not attach web server")
+
+    def _detach_runtime(self) -> None:
+        control = getattr(self.app, "security_control", None)
+        detach = getattr(control, "detach_web", None)
+        if callable(detach):
+            try:
+                detach(self)
+            except Exception:  # pragma: no cover
+                pass
+        try:
+            if getattr(self.app, "security_web", None) is self:
+                delattr(self.app, "security_web")
+        except Exception:  # pragma: no cover
+            pass
+
     async def stop(self) -> None:
+        self._detach_runtime()
         # Python 3.12's Server.wait_closed() waits for live connections too,
         # so clients must be cancelled first or an open SSE stream deadlocks
         # shutdown.
@@ -190,13 +303,32 @@ class WebServer:
             decision = self.auth.check(method, path, headers,
                                        query_pairs.get("token", ()))
             if decision.login:
-                await self._send_redirect(
-                    writer, "./", self.auth.set_cookie_header(headers.get("host", "")))
+                # Exchange the token for a server-side session + signed
+                # cookie.  A full session table answers 503 instead of
+                # silently dropping the login.
+                cookie = self.auth.set_cookie_header(
+                    headers.get("host", ""),
+                    user=decision.user or "launch-token",
+                    role=decision.role or ROLE_OPERATOR)
+                await self._send_redirect(writer, "./", cookie)
                 return
             if not decision.allowed:
                 await self._send_json(writer, decision.status, {
                     "ok": False,
                     "error": {"code": decision.code, "message": decision.message},
+                })
+                return
+            # Viewer accounts are read-only.  Enforcing this at the server
+            # layer (not per-handler) means a new route cannot forget it.
+            # ``/api/logout`` stays reachable so a viewer can end its session.
+            if (decision.authenticated
+                    and method not in ("GET", "HEAD")
+                    and getattr(decision, "role", ROLE_OPERATOR) != ROLE_OPERATOR
+                    and path != "/api/logout"):
+                await self._send_json(writer, 403, {
+                    "ok": False,
+                    "error": {"code": "FORBIDDEN",
+                              "message": "viewer role is read-only"},
                 })
                 return
             if path == "/healthz":
@@ -353,12 +485,16 @@ class WebServer:
         handler must not be able to inject its own framing or security-header
         overrides.
         """
-        safe_prefixes = ("content-disposition", "x-", "cache-control")
+        # Only framing-neutral headers are allowed through ``WebReply``.
+        # ``Set-Cookie`` is included because the session extension issues and
+        # clears the browser cookie from a normal JSON response.
+        safe_names = {"content-disposition", "cache-control", "set-cookie"}
         extra = ""
         for key, value in (extra_headers or {}).items():
             name = str(key).strip().lower()
             text = str(value).replace("\r", "").replace("\n", "")
-            if not name or name not in safe_prefixes and not name.startswith(("x-", "content-disposition")):
+            if not name or not (name in safe_names
+                                or name.startswith(("x-", "content-disposition"))):
                 continue
             extra += f"{name.title()}: {text}\r\n"
         header = (
@@ -569,6 +705,51 @@ def _parse_int_param(name: str, raw: str | None, *, default: int,
             raise BadRequest(f"{name} must be >= {minimum}")
         raise BadRequest(f"{name} must be in [{minimum}, {maximum}]")
     return value
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for an empty, ``localhost`` or loopback-literal bind address."""
+    value = (host or "").strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    value = value.split("%", 1)[0]
+    if not value or value.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _build_tls_context(cert: str | None, key: str | None,
+                       min_version: str) -> ssl.SSLContext | None:
+    """Build the HTTPS listener context, or ``None`` for plain HTTP.
+
+    A half-configured pair fails loudly rather than serving plaintext while
+    the operator believes TLS is on.  The minimum version defaults to TLS 1.2;
+    TLS 1.3 is accepted for hardened deployments.
+    """
+    cert = str(cert or "").strip()
+    key = str(key or "").strip()
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise ValueError("tls_cert and tls_key must be provided together")
+    versions = {
+        "TLSv1.2": ssl.TLSVersion.TLSv1_2,
+        "TLSv1.3": ssl.TLSVersion.TLSv1_3,
+    }
+    version = versions.get(str(min_version or "TLSv1.2").strip())
+    if version is None:
+        raise ValueError("tls_min_version must be TLSv1.2 or TLSv1.3")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = version
+    try:
+        context.options |= ssl.OP_NO_COMPRESSION
+    except AttributeError:  # pragma: no cover - always available on CPython
+        pass
+    context.load_cert_chain(cert, key)
+    return context
 
 
 def _display_host(host: str) -> str:
