@@ -23,8 +23,9 @@ Ctrl-C 会优雅关闭：先停 Agent 进程，再停失败域、聊天、传输
 ├── config.json              # 运行时配置覆盖（UI 设置保存到这里）
 ├── run/                     # IPC socket（sys.rpc.sock / sys.events.sock / <work_id>.*.sock）
 ├── events/
-│   ├── events.jsonl         # 当前事件流（append-only，8MB 轮转）
-│   └── events-<seq>.jsonl
+│   ├── events.jsonl         # 当前事件流（append-only）
+│   ├── events-<seq>-<ts>.jsonl.gz   # 压缩归档（storage.eventlog_rotate_*）
+│   └── .last_seq            # 持久化序号水位（防重启重号）
 ├── logs/
 │   ├── stackflowos.log
 │   └── agents/<work_id>.log # 每个 worker 进程的 stdout/stderr
@@ -35,12 +36,21 @@ Ctrl-C 会优雅关闭：先停 Agent 进程，再停失败域、聊天、传输
 │   ├── approvals.json       # 待审批 + 最近决策
 │   ├── agents.json          # Agent 花名册快照
 │   ├── chat.json            # 最近对话
-│   └── memory.json          # 项目记忆键值
+│   ├── llm_usage.json       # token/成本聚合（按项目/角色/provider/model）
+│   ├── skills.json          # 全局/项目级 skill 启用状态
+│   ├── lease_fencing.json   # 租约 fencing token 水位
+│   └── memory/              # 项目记忆键值（或 SQLite 后端）
+├── backups/                 # sfo backup 归档（0600）
 ├── projects/<p-id>/workspace/   # Agent 的全部产物
 └── tmp/                     # 测试/临时文件
 ```
 
-**备份**：停 hub 后拷贝整个 `.stackflowos/` 即可（事件流是权威审计）。
+可选 SQLite 后端（`storage.backend=sqlite`）把 eventlog/memory/counters 放进
+`state/stackflowos.db`（WAL + `user_version` 迁移）；projects/tasks 域仍是 JSON。
+
+**备份**：推荐 `sfo backup`（默认 `state/backups/`，manifest+sha256），不要直接拷运行中的目录。
+**恢复**：`sfo restore <archive>`（目标非空需 `--force`，会先自动备份当前状态）。
+**导出**：`sfo export-events --format jsonl|csv --since <seq> --types approval.*`。
 **重置**：停 hub 后删除 `.stackflowos/`；注意这会删掉项目工作区。
 
 ---
@@ -102,7 +112,9 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
    非 loopback 的 `transport.host` 必须同时显式设置
    `transport.allow_remote = true`；默认只允许 loopback，通配/网卡地址会被配置校验拒绝。
    Web 控制台若也要远程访问，用 `--host <具体IP> --allow-remote`（即
-   `web.allow_remote = true`），并置于 SSH 隧道或 TLS 终止反代之后（TLS 监听见 Phase 5）。
+   `web.allow_remote = true`）。**远程必须启用 TLS**：设置 `web.tls_cert` /
+   `web.tls_key`（或启动参数 `--tls-cert/--tls-key`），控制台会直接用 HTTPS 监听并给
+   cookie 加 `Secure`；否则只应走 SSH 隧道/本机反代，启动时会打印明文告警。
 2. 放行防火墙上的 sys RPC 端口与单元端口池。
 3. 远端设备安装同一份代码（需要 `pynng`），在本地有自己的 `.stackflowos/`；
    用 attach 接入：
@@ -112,9 +124,14 @@ IPC 模式不占端口。端口池可在设置 → 网络里改；改完需重�
    它会向 hub 申请 work_id 与地址，在本机起一个 worker 进程；任务结束自动退出。
    也可以手动指定 `--task t-3`。
 
-当前版本**没有设备发现**：地址要显式配置；sys 仍是单点；远端设备上的
-worker 会绑定 hub 分配端口池中的端口，需要保证该端口在该设备上可用。
-跨设备 PUB/SUB 的实际抖动还没有长时间实测（愿景文档已把这条列为未验证）。
+设备发现（可选）：设置 `cluster.discovery = "mdns"` 后，hub 通过标准库组播 DNS
+广播 `_stackflowos._tcp.local`（TXT 带 node_id/transport/http_port/version），
+`GET /api/discovery/peers` 列出发现的节点；`stackflowos.transport.discovery.discover_hubs()`
+可供 worker/CLI 自动找 hub。默认 `off`，不引入额外依赖。
+
+sys 仍是单点：`cluster.standby = true`（或 `hub --standby`）会启动一个**同状态目录冷备**
+进程，它在 hub.lock 上等待，活动 hub 退出后接管。没有 quorum/复制，切换期间短暂不可用；
+这是进程级 failover，不是 Raft。
 
 ---
 
@@ -136,8 +153,7 @@ Type=simple
 WorkingDirectory=/path/to/StackFlowOS
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-# 非 TTY 部署要显式给一个登录 token（见下面“登录 token”）。文件缺失时
-# systemd 忽略该行（前导 "-"），hub 仍会启动，只是没有可用的网页登录链接。
+# 可选逃生门：无 TTY 且无法用 `sfo url`（control socket 不可用）时才需要。
 EnvironmentFile=-%h/.config/stackflowos/web.env
 ExecStart=/usr/bin/python3 -m stackflowos hub --port 17800
 # 存活探针用匿名的 /healthz：它不需要登录 token，只报告 status/transport，
@@ -153,20 +169,20 @@ KillMode=control-group
 WantedBy=default.target
 ```
 
-**登录 token（非 TTY 部署）**：H1 起 Web 控制台要求认证，`stackflowos hub` 只在
-TTY 上打印本次进程的登录 URL；systemd 下没有 TTY，需要显式给一个 token：
+**登录 URL（非 TTY 部署，推荐）**：hub 在 `state/run/control.sock`（0600，
+`SO_PEERCRED` 同 uid）提供 operator 控制面。同一台机器的终端里执行：
 
 ```bash
-mkdir -p ~/.config/stackflowos && chmod 700 ~/.config/stackflowos
-python3 -c 'import secrets; print("SFO_WEB_TOKEN="+secrets.token_urlsafe(32))' \
-  > ~/.config/stackflowos/web.env
-chmod 600 ~/.config/stackflowos/web.env
+stackflowos url                 # 铸造一次性登录 URL
+stackflowos url --status        # 查看 hub URL/TLS/会话数（不含数据）
 ```
 
-之后用 `http://127.0.0.1:17800/?token=<token>` 登录一次（换成 HttpOnly Cookie），
-或 `stackflowos status --token <token>` / `Authorization: Bearer <token>`。
-注意：token 落盘为 0600，同用户进程可读；这是还没有 `sfo url` 控制套接字之前的
-过渡方案（见 security-fix-plan §5.1.6），威胁模型里归为“同用户残余风险”。
+URL 中的 launch token 只能兑换一次；兑换后浏览器拿到 HttpOnly/SameSite cookie。
+这个设计不需要把 `SFO_WEB_TOKEN` 写盘，也适合 systemd/容器。
+
+**逃生门**：若 control socket 不可用（非 Linux、无 `SO_PEERCRED`、跨容器挂载），
+再显式设置 `SFO_WEB_TOKEN`（0600 env file）。它是长期 secret，同用户进程可读，
+只作为最后手段；`Authorization: Bearer <token>` 仍可用于 CLI/自动化。
 
 ```bash
 systemctl --user daemon-reload
@@ -205,7 +221,16 @@ systemctl --user restart stackflowos-hub
 
 ## 6. 安全加固清单
 
-- [ ] Web 只绑 `127.0.0.1`；对外必须加反代鉴权。
+- [ ] Web 默认只绑 `127.0.0.1`；远程访问必须 TLS（`web.tls_*`）或 SSH 隧道。
+- [ ] 多用户部署在 `web.users` 配置 `token_sha256` + `operator|viewer` 角色；
+      viewer 只读，写操作在 admission/server 两层拒绝。
+- [ ] 启用的 shell/worker 沙箱：`security.sandbox = "auto" | "landlock" | "bwrap"`。
+      Landlock 限制写路径（workspace/tmp/logs）并在 ABI≥4 时 deny TCP；
+      bwrap 需要非特权 user namespace，失败会明确记录 “unsandboxed”。
+- [ ] 事件/审批通知：`observability.webhooks` 配置 IM/告警 webhook；
+      `observability.notify_events` 控制转发类型。
+- [ ] 监控：Prometheus 抓取 `GET /api/metrics`（需 Bearer token；文本格式）。
+- [ ] 定时 `sfo backup`，并把 `state/backups/` 复制到异地；备份含 config（0600）。
 - [ ] sys RPC/端口池只对受信网段开放。
 - [ ] 项目工作区所在磁盘单独做配额/快照；Agent 的产物都在那里。
 - [ ] 定期审阅「审批 → 规则」：`always` 规则等于长期授权，应设过期时间。
@@ -219,6 +244,33 @@ systemctl --user restart stackflowos-hub
 ## 7. 升级 / 迁移
 
 - 代码升级后重启 hub；`.stackflowos/state` 的数据格式在 `version: 1` 内兼容。
-- 迁移机器：拷贝仓库 + `.stackflowos/`；IPC 地址会按新路径重新分配
-  （地址不是持久身份，`work_id` 才是）。
+- 迁移机器：优先 `sfo backup` → 新机器 `sfo restore`；或停 hub 后拷整个目录。
+  IPC 地址会按新路径重新分配（地址不是持久身份，`work_id` 才是）。
 - 如果改了 `transport.mode` 或 `web.port`，设置页会提示 `restart_required`。
+- 切换到 SQLite：先 `sfo storage-migrate --dry-run` 看差异，再
+  `sfo storage-migrate`；设置 `storage.backend = "sqlite"` 后重启 hub。
+  JSON 文件仍保留（可回退），但事件序号以数据库水位为准。
+- 事件轮转由 `storage.eventlog_rotate_bytes / eventlog_rotate_keep` 控制；
+  跨归档的 `since`/查询/SSE 续传会自动回放，不需要手工拼接。
+
+## 8. 单元、能力与 Agent 控制面
+
+- 单元页/API：`GET /api/units`（含 summary）、`GET /api/units/{id}`（描述符 + 依赖 +
+  20 条状态事件）、`POST /api/units/{id}/probe`、`POST /api/units/{id}/actions`
+  （`probe|restart|disable|enable|drain|undrain`，只接受描述符声明的动作）。
+  服务单元是 in-process 逻辑单元，不做假 pid/地址；进程化失败域见 units-plan Phase 3。
+- 能力目录：`GET /api/capabilities?type=tool|skill|plugin|mcp_tool&project_id=`。
+  工具由 `tool.0` 提供，skill 由 `skill.0`，插件每个 `plugin.<id>`，MCP 每个
+  `mcp.<name>`；`available` 由 provider 单元状态实时推导。
+- 技能：`config.skills.dirs` 下放 `SKILL.md` 或 `skill.json`；`GET /api/skills`，
+  `POST /api/skills/{id}/enable|disable`（可选 `project_id`）；启用的技能按 trigger/
+  角色/项目注入 Agent system prompt。
+- 插件：`config.plugins.dirs` 下放 `stackflow.plugin.json`；受信 in-process 插件
+  通过 Cordis effect 注册/注销，`POST /api/plugins/{id}/load|unload`。
+- MCP：`config.mcp.servers[]` 配置 stdio server；`GET /api/mcp/servers`，
+  `connect/disconnect`，`GET /api/mcp/tools`，`POST /api/mcp/call`（走审批/审计）。
+- Agent：`GET /api/agents/queue` 查看按优先级排队的派工；`agents.max_workers` 满时
+  自动排队、worker 退出补位；`agents.task_timeout_s` / `max_tool_calls_per_task`
+  超限转为 blocked；运行中 Agent 通过 `unit.configure` 热更新限制/模型。
+  attached-rw 项目可开 `security.workspace_git`：每任务一个分支、任务结束提交，
+  `GET /api/projects/{id}/git` 查看、`POST .../git/rollback` 回滚。

@@ -333,6 +333,7 @@ workspace 写 `brief.md`；每个项目保留最近 5 条已结束 aggregator �
 sys.booted / sys.ready / sys.shutdown / sys.config.updated
 unit.allocated / unit.registered / unit.online / unit.suspect / unit.offline
 unit.released / unit.quarantined / unit.restarted / unit.paused / unit.resumed
+unit.state_changed / unit.action / unit.probe / sys.standby.promoted
 lease.acquired / lease.renewed / lease.released / lease.expired / lease.preempted
 project.created / project.updated / project.archived / project.progress / project.degraded / project.completed
 project.deleted / project.delete.completed / project.archive.completed / project.purge.failed
@@ -344,6 +345,11 @@ approval.requested / approval.decided / approval.auto / approval.expired / appro
 operator.action
 rule.created / rule.updated / rule.deleted
 tool.invoked / tool.result / tool.denied / tool.failed
+capability.called / capability.failed / capability.pending
+skill.scanned / skill.enabled / skill.disabled / skill.invalid
+plugin.loaded / plugin.unloaded / plugin.invalid
+mcp.connected / mcp.disconnected / mcp.tool.called
+llm.usage / llm.context.trimmed / approval.notified
 failure.detected / failure.action
 chat.message / chat.delta / chat.typing
 agent.chat.message / agent.chat.delta / agent.chat.tool / agent.chat.state / agent.chat.thread
@@ -703,8 +709,21 @@ SSE 帧：`data: <EventRecord JSON>\n\n`；每 15s 一行 `: ping\n\n`。
 环境变量：`SFO_ROOT`、`SFO_STATE_DIR`、`SFO_WEB_PORT`、`SFO_TRANSPORT_MODE`、
 `SFO_LLM_PROVIDER`、`SFO_LLM_BASE_URL`、`SFO_LLM_MODEL`、`SFO_LLM_API_KEY`。
 
-默认：ipc、web 17800、mock LLM、心跳 2s、离线 8s、审批 TTL 300s。
+默认：ipc、web 17800、mock LLM、心跳 2s、离线 8s、审批 TTL 300s、
+沙箱 off、TLS off、mDNS off、storage json、lease fencing on。
 所有运行期文件都在 `<repo>/.stackflowos/` 下。
+
+新增 section（校验在 `config.py::_validate_section`）：
+
+* `web`：`tls_cert/tls_key/tls_min_version/launch_token_single_use/session_max/users[]`
+* `security`：`sandbox/sandbox_allow_network/sandbox_tmp_mb/workspace_git/
+  workspace_git_commit/audit_redact/audit_max_field_chars/net_pin_dns`
+* `llm`：`stream/rpm/tpm/max_concurrency/max_context_tokens/project_token_budget/
+  fallback[]/routes[]/retries/retry_backoff_s`
+* `agents`：`task_timeout_s/max_tool_calls_per_task/queue_max/config_reload_s`
+* `skills`、`plugins`、`mcp`、`observability`、`storage`、`cluster`
+* `/api/config` 对 `api_key/token/secret/password/authorization` 等返回 `***`；
+  PATCH 回传 `***` 时由 `Config.apply` 还原为当前值，不会把掩码写盘。
 
 ---
 
@@ -728,6 +747,16 @@ stackflowos/
   session/         agent_chat.py（每个 Agent 的对话与工具轮）          [lead]
   web/             server.py api.py            [D/lead]
   webassets/       index.html css/ js/         [D]
+  extensions.py    optional subsystem loader (build/start/stop/units/routes)
+  capabilities.py  unified capability catalogue
+  skills/          SkillRegistry + manifest validation + injection
+  plugins/         PluginLoader (in-process Cordis apply)
+  mcp/             MCP stdio host + routes
+  units/control.py UnitController (probes/actions/deps/UnitClient)
+  observability/   Prometheus metrics, webhook notifications, backup
+  storage/         JSON/SQLite backends + migration
+  transport/       discovery.py (mDNS) / zmq_bridge.py (optional pyzmq)
+  deploy/          Dockerfile, systemd user unit, deploy README
 tests/
 ```
 
@@ -746,13 +775,23 @@ tests/
   `MAX_IPC_PATH_BYTES = 100`）。若检出路径仍使套接字路径超限，测试以明确原因 skip，
   而不是失败。
 
-## 13. 非目标（这一版不做）
+## 13. 非目标 / 长期项（更新于 2026-11-24）
 
-* 真正的多设备发现（mDNS/组网）：预留 TCP 地址即可，不实现发现协议。
-* 强沙箱（容器/命名空间）：用路径白名单 + 命令策略，文档写清限制。
-* 多用户与鉴权：默认单机单操作员，绑定 127.0.0.1；远程监听需显式
-  `allow_remote`（TLS 监听见 Phase 5）。
-* 大规模调度：单 hub，租约语义优先于吞吐。
+* **多 hub 强一致**：只做同状态目录冷备（`cluster.standby`），没有选主/quorum/分片。
+* **完整容器沙箱/独立 worker 用户**：Landlock/bwrap 已接入，但同 OS 用户仍是边界；
+  多租户需要独立 uid/容器。
+* **不受信插件子进程**：当前插件是受信 in-process（Cordis effect），子进程运行时
+  是阶段 3。
+* **审批拆进程**：`approval.0` 仍是 hub 进程内单元；`unit://` 抽象已就绪，拆进程
+  时调用方无需改。
+* **projects/tasks 全量事务化**：SQLite 后端已覆盖 eventlog/memory/counters，
+  项目/任务域仍是 JSON（原子写，但非跨文件事务）。
+* **OpenTelemetry / 告警内置**：Prometheus 文本 + webhook 已可用，OTel 导出未做。
+* **worker LLM usage 汇总**：hub 侧 chat/agent-chat 已持久化；worker 进程内的
+  usage 目前只在其本地 runtime，未回传 hub。
+* **大规模调度**：单 hub，租约语义优先于吞吐。
+
+---
 
 
 ---
@@ -786,3 +825,57 @@ tests/
 11. **Agent 对话是 hub 侧会话**：`session/agent_chat.py` 让已结束的 Agent 仍可被
     对话调用；工具经合成 unit principal 走同一作用域/审批路径，但不运行在独立
     worker 进程里。若要“每轮对话一个进程”的强隔离，是后续独立设计。
+
+
+## 15. 可选子系统扩展（2026-11-24）
+
+hub 是组合根，但不再为每个新能力加分支。`stackflowos/extensions.py` 按顺序
+import 下列模块并调用 `build(app)`：
+
+```
+capabilities → skills → plugins → mcp → units.control → ai.llm_api →
+agents.extension → security.sessions → security.control →
+observability.metrics → observability.notifications → observability.backup →
+transport.discovery → cluster.standby
+```
+
+扩展对象可实现的契约（全部可选）：
+
+| 成员 | 语义 |
+|---|---|
+| `name` | 稳定标识 |
+| `async start()/stop()` | 核心服务就绪后启动，逆序停止 |
+| `units()` | 贡献/覆盖 `/api/units` 描述符（同 `unit_id` 覆盖核心单元） |
+| `routes()` | `[("GET", r"/api/...", handler)]`，handler 为 `async (match, query, body)` |
+| `capabilities(kind)` | 能力目录条目（带 provider/available） |
+| `health()` | 进入 `/api/health.extensions` |
+| `async on_config(config)` | 配置热更新后重扫/重连/重建 |
+
+失败隔离：`build/start/on_config` 抛异常只记录日志并跳过，不会阻止 hub 启动；
+缺失的可选模块静默跳过。非 JSON 响应使用 `web/api.py::WebReply`（Prometheus、
+Set-Cookie）；请求认证角色通过 `web/api.py::current_auth()` 读取，不信任请求头。
+
+关键实现：
+
+* **单元控制**（`units/control.py`）：真实探针（eventlog 可写、provider 配置、
+  scheduler tick、SSE 连接等）+ 迟滞（2 失败 degraded、3 failed、2 成功恢复），
+  状态变化统一 `unit.state_changed`；`/api/units/{id}` 给出描述符、requires/wants
+  依赖图、最近 20 条状态事件与描述符声明的 actions。服务单元仍是 in-process，
+  不伪造 pid/地址；`UnitClient`/`unit://` 提供 inproc 与 NNG 同一接口。
+* **能力目录**（`capabilities.py`）：`tool.0` 的 `TOOLS` 注册为目录条目，skill/
+  plugin/MCP provider 通过扩展聚合；`available` 由 provider 单元状态单向推导，
+  不另存副本；`capability.call` RPC 桥接 worker 与 hub 侧审批。
+* **LLM**（`ai/`）：provider 抽象支持 OpenAI/Anthropic/Gemini 原生工具调用与流式；
+  Router 负责角色路由/降级/熔断；`telemetry.py` 持久化 usage/cost；`limits.py`
+  做 RPM/TPM/并发/项目预算；`context.py` 做窗口裁剪。
+* **安全**（`security/`）：TLS + 单次 launch token + control socket（0600/
+  `SO_PEERCRED`）+ 服务端会话表/角色；`sandbox.py` Landlock/bwrap；`util/net.py`
+  固定 IP fetch；`operator._audit` 脱敏。
+* **存储/分布式**（`l2/`、`storage/`、`transport/`）：事件 gzip 轮转 + 跨归档回放；
+  SQLite backend（WAL）与迁移 CLI；租约 fencing + 时钟偏移；mDNS 发现；
+  可选 pyzmq bridge；`deploy/` 提供容器/systemd。
+* **可观测性**（`observability/`）：Prometheus `/api/metrics`、webhook 通知、
+  tar.gz 备份/安全恢复/事件导出、日志 RotatingFileHandler。
+
+完整 API 与残余风险：`docs/team-plan.md`、`docs/review-response.md`、
+`docs/team/*.md`。

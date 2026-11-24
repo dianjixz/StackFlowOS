@@ -265,6 +265,29 @@ Agent 的工具调用一律经过 `ToolExecutor`：
 路径必须落在项目工作区、shell 有 cwd 限制与超时、敏感环境变量被剔除、
 输出截断并留档，每次调用前后都发事件。
 
+### 能力、技能、插件与 MCP
+
+系统把「运行体」和「目录条目」分开：
+
+- **能力目录**：`GET /api/capabilities?type=tool|skill|plugin|mcp_tool` 汇总
+  `tool.0`、`skill.0`、`plugin.*`、`mcp.*` 提供的条目；`available` 由 provider
+  单元状态实时推导，不会出现「提供者挂了但工具还显示可用」。
+- **Skill**：`skills.dirs`（默认 `<state>/skills`）下每个含 `SKILL.md` 或
+  `skill.json` 的目录是一个 skill；支持 manifest 校验、版本、全局/项目级启用、
+  按 trigger/角色/项目注入 Agent system prompt。`GET /api/skills` +
+  `POST /api/skills/{id}/enable|disable`。
+- **Plugin**：`plugins.dirs` 下的 `stackflow.plugin.json` 经校验后以受信
+  in-process 方式 apply 到 Cordis Context，贡献工具/skill，dispose 时自动注销；
+  `plugin.<id>` 是独立单元，`POST /api/plugins/{id}/load|unload` 热插拔。
+  示例：`examples/plugins/hello`。
+- **MCP**：`mcp.servers[]` 配 stdio JSON-RPC server；initialize/分页 tools/list/
+  tools/call、超时、崩溃重连；每个 server 登记 `mcp.<name>` 单元，工具进入能力
+  目录，调用走审批/审计。`GET /api/mcp/servers`、`POST /api/mcp/call`。
+- **单元控制**：`/api/units/{id}` 给出描述符、requires/wants 依赖图与最近状态
+  事件；`probe/restart/disable/enable/drain` 只接受描述符声明的动作；状态变化写
+  `unit.state_changed`。服务单元仍是 hub 进程内逻辑单元（不伪造 pid/地址），
+  真正拆进程见 `docs/units-plan.md` 阶段 3。
+
 ---
 
 ## 配置
@@ -279,12 +302,30 @@ Agent 的工具调用一律经过 `ToolExecutor`：
                  "advertise_host": null,
                  "port_pool_start": 17820, "port_pool_end": 17899 },
   "web": { "host": "127.0.0.1", "port": 17800, "allow_remote": false,
-           "tls_cert": "", "tls_key": "" },
+           "tls_cert": "", "tls_key": "", "tls_min_version": "TLSv1.2",
+           "launch_token_single_use": true, "session_max": 32,
+           "users": [] },
   "security": { "auto_allow_low": true, "medium_default": "ask",
                 "high_default": "ask", "approval_ttl_s": 300,
-                "grant_ttl_s": 3600, "allow_shell": true },
-  "llm": { "provider": "mock", "base_url": "", "model": "", "api_key": "" },
-  "agents": { "heartbeat_s": 2.0, "offline_after_s": 8.0, "max_workers": 6 }
+                "grant_ttl_s": 3600, "allow_shell": true,
+                "sandbox": "off", "sandbox_allow_network": false,
+                "workspace_git": false, "audit_redact": true,
+                "net_pin_dns": true },
+  "llm": { "provider": "mock", "base_url": "", "model": "", "api_key": "",
+           "stream": true, "rpm": 0, "tpm": 0, "max_concurrency": 8,
+           "max_context_tokens": 128000, "project_token_budget": 0,
+           "routes": [], "fallback": [] },
+  "agents": { "heartbeat_s": 2.0, "offline_after_s": 8.0, "max_workers": 6,
+              "task_timeout_s": 1800, "max_tool_calls_per_task": 200,
+              "queue_max": 64, "config_reload_s": 10 },
+  "skills": { "dirs": ["skills"], "enabled": [], "inject_max_chars": 8000 },
+  "plugins": { "dirs": ["plugins"], "enabled": [] },
+  "mcp": { "servers": [], "call_timeout_s": 30 },
+  "observability": { "metrics_enabled": true, "webhooks": [],
+                     "log_rotate_bytes": 33554432, "backup_keep": 7 },
+  "storage": { "backend": "json", "eventlog_rotate_bytes": 67108864 },
+  "cluster": { "discovery": "off", "standby": false,
+               "lease_fencing": true }
 }
 ```
 
@@ -292,8 +333,10 @@ Agent 的工具调用一律经过 `ToolExecutor`：
 以及任何非 loopback 地址，除非该段显式开启 `allow_remote`（hub 的 `--allow-remote`
 只放宽 `web`，RPC 监听用 `transport.allow_remote`）。两者互不放行：打开
 `web.allow_remote` 不会让 `transport.host` 变成 `0.0.0.0`，反之亦然。
-`web.tls_cert` / `web.tls_key` 是 Phase 5 TLS 监听的预留配置，当前控制台仍是明文
-HTTP；远程使用时请套 SSH 隧道或 TLS 终止反代，并在启动时留意 plaintext 警告。
+`web.tls_cert` / `web.tls_key` 同时给出时控制台直接以 HTTPS 监听（cookie 自动
+`Secure`），远程访问不再依赖 SSH 隧道/反代；非 loopback 且未配 TLS 会在启动日志和
+`server.security_notes` 里明确告警。`web.users` 可配置 `token_sha256` + `operator|viewer`
+多账号；viewer 只读。
 
 环境变量：`SFO_ROOT`、`SFO_STATE_DIR`、`SFO_WEB_PORT`、`SFO_TRANSPORT_MODE`、
 `SFO_LLM_PROVIDER`、`SFO_LLM_BASE_URL`、`SFO_LLM_MODEL`、`SFO_LLM_API_KEY`。
@@ -319,18 +362,73 @@ HTTP；远程使用时请套 SSH 隧道或 TLS 终止反代，并在启动时留
 「测试连接」会发一个最小请求并显示耗时/错误。`max_tokens` 会原样发送，不再被系统裁剪；上限由模型端点决定，
 填错时「测试连接」会显示端点的具体错误。
 
-worker 的新进程会读取新配置；已在跑的 Agent 用 spawn 时的配置。
-模型只影响"怎么想"，不影响"能不能动"——工具调用仍走审批。
+除了 OpenAI 兼容端点，也支持原生 **Anthropic**（`/v1/messages`）与 **Gemini**
+（`generateContent`）；`llm.routes` 可以按角色配不同模型，`llm.fallback` 是降级链：
+
+```json
+{ "llm": { "provider": "openai", "base_url": "...", "model": "primary",
+  "routes": [{"role": "coder", "provider": "anthropic", "model": "claude-...",
+              "api_key": "***"}],
+  "fallback": [{"provider": "mock"}] } }
+```
+
+原生 tool calling 已接入三家 provider（无法原生调用时回退 JSON 协议）。
+回复默认流式（`llm.stream=true`），SSE 上以 ephemeral `chat.delta` /
+`agent.chat.delta` 增量渲染。token/成本按项目/角色/provider/model 聚合到
+`state/llm_usage.json`；`llm.rpm/tpm/max_concurrency/project_token_budget` 在 hub
+侧限流/预算，429/5xx 有熔断。配置补丁会重建 provider；运行中的 worker 通过
+`unit.configure` 热更新限制与模型（api_key 不下发）。模型只影响"怎么想"，
+不影响"能不能动"——工具调用仍走审批。
+
+---
+
+## 安全模型（本轮更新）
+
+- **Web**：TLS 监听（可选）、单次 launch token、`sfo url` control socket（同 uid、
+  0600）、HttpOnly/SameSite cookie、Host/Origin/CSRF 准入、CSP/安全头；
+  服务端会话表支持列表/轮换/撤销/登出，`operator|viewer` 角色。
+- **执行**：`security.sandbox=landlock|bwrap|auto` 时 shell 在子进程里应用沙箱
+  （Landlock 写白名单 + ABI≥4 deny TCP；bwrap 需非特权 userns，失败会诚实降级）；
+  worker 进程启动时也按同一白名单收窄写入。默认 `off`，按需开启。
+- **网络**：`net.fetch` 默认解析一次后固定 IP 连接（DNS rebinding TOCTOU），
+  逐跳重定向重新校验；`security.net_pin_dns=false` 是逃生门。
+- **审批/审计**：审批 fail-closed；`operator._audit` 的 result/error 统一脱敏与
+  截断；租约带 fencing token 与 project 作用域校验。
+
+---
+
+## 运维与监控
+
+```bash
+sfo url                       # 铸造一次性登录 URL（control socket）
+sfo backup                    # state/backups/*.tar.gz（manifest+sha256）
+sfo restore <archive>         # 安全解包；非空目标需 --force，会先自动备份
+sfo export-events --format csv --since 100
+sfo storage-migrate --dry-run # JSON → SQLite（WAL）迁移预演
+sfo hub --standby             # 同状态目录冷备（进程级 failover，非 Raft）
+```
+
+Prometheus 抓取 `GET /api/metrics`（Bearer token；文本格式），覆盖单元/Agent/审批/
+租约/LLM token+cost/SSE。`observability.webhooks` 把 `approval.created`、
+`unit.failed` 等事件推到 IM/告警；`GET /api/health` 汇总 eventlog/leases/extensions
+健康。事件流按大小 gzip 轮转，跨归档 `since` 查询自动回放；`storage.backend=sqlite`
+可把 eventlog/memory/counters 放进单库（projects/tasks 仍 JSON）。设备发现可开
+`cluster.discovery=mdns`。详见 `docs/operations.md`。
+
 
 ---
 
 ## 命令
 
 ```
-stackflowos hub      [--transport ipc|tcp] [--host 127.0.0.1] [--allow-remote] [--port 17800] [--no-web]
+stackflowos hub      [--transport ipc|tcp] [--host 127.0.0.1] [--allow-remote] [--port 17800]
+                     [--tls-cert PEM --tls-key PEM] [--standby] [--no-web]
 stackflowos demo     [--until-done] [--timeout 240] [--goal ...]
 stackflowos doctor
-stackflowos status   [--url http://127.0.0.1:17800] [--token <launch token>]
+stackflowos status   [--url https://127.0.0.1:17800] [--token <launch token>]
+stackflowos url      [--status] [--json]        # control socket 铸造登录 URL
+stackflowos backup | restore ARCHIVE [--force] | export-events | backup-status
+stackflowos storage-migrate [--dry-run]
 stackflowos attach   --sys tcp://<hub>:17820 --role coder --project p-1
 stackflowos worker   （内部：由 supervisor 拉起）
 ```
@@ -353,6 +451,8 @@ Web 控制台默认要求认证：`stackflowos hub` 在 TTY 上打印本次进�
 
 ```bash
 python3 -m unittest discover -s tests -t . -v
+# 或（本机开发环境）：
+python3 -m pytest -q
 ```
 
 - 内核：effect 逆序、插件卸载、waterfall 否决、serial/bail
@@ -366,18 +466,25 @@ python3 -m unittest discover -s tests -t . -v
 
 ## 边界与已知限制（诚实清单）
 
-1. **单 hub。** 没有集群选主/分片；跨设备可以接进来，但 sys 仍是单点。
-2. **没有设备发现。** TCP 地址需要显式配置，不做 mDNS/组网。
-3. **worker 可信。** 工具在 worker 本地执行，sys 授权并审计；恶意 worker
-   可以绕过本地检查直接改文件。接不可信设备时要把执行搬进 sys 侧沙箱。
-4. **文件沙箱是路径白名单**，不是容器/命名空间；shell 仍拥有进程用户的权限。
-5. **远程绑定需显式开启。** 默认只绑 `127.0.0.1`；`0.0.0.0`/`::`/具体网卡地址必须
-   配 `allow_remote`。控制台认证（token/cookie）已有，但 TLS 监听是 Phase 5，
-   远程明文暴露前必须自己加 SSH 隧道或 TLS 终止反代。
+1. **单 hub（有冷备，无强一致）。** `cluster.standby` 是同状态目录第二进程，
+   活动 hub 退出后接管；没有 quorum/复制/分片，切换期间短暂不可用。
+2. **设备发现可选但非必需。** `cluster.discovery=mdns` 提供标准库组播发现；
+   默认关闭，TCP 地址仍可显式配置。
+3. **worker 仍是同一 OS 用户。** 工具在 worker 本地执行；hub 侧审批/路径/项目范围
+   强制，`security.sandbox` 开启后 worker 写入被 Landlock 收窄到 workspace/tmp/logs，
+   但同 uid 进程仍可读状态、发信号、读写 `.stackflowos`（OS 用户边界）。
+   接不可信设备/多租户仍需独立 uid 或容器（Phase 5）。
+4. **沙箱不是完整容器。** Landlock 只限制文件写 + (ABI≥4) TCP，不管 UDP/信号/
+   `/proc`；bwrap 需要非特权 user namespace，不可用时会明确写 “unsandboxed”。
+5. **远程访问需要显式 TLS。** 默认只绑 `127.0.0.1`；非 loopback 必须
+   `allow_remote`；控制台已支持 HTTPS 监听（`web.tls_*`），未配 TLS 会告警，
+   不建议明文暴露。
 6. **mock 大脑不是智能。** 它按角色产出确定性的真实工作，用来验证系统；
-   真智能来自外接模型。
-7. **L0 用 pynng，不是 libzmq。** 与 StackFlow 的 ZMQ 不能直连；
-   若要和在跑的 StackFlow 设备互通，需要写 bridge。这是替代关系，不是叠加。
+   真智能来自外接模型。原生 tool calling/流式/配额只对真实 provider 有意义。
+7. **pynng 不是 libzmq。** 与 StackFlow 的 ZMQ 不能直连；`transport/zmq_bridge.py`
+   在安装 `pyzmq` 时可做桥接，未安装时明确报错。
+8. **仍待补的长期项**：审批拆进程、不受信插件子进程、projects/tasks 全量事务化、
+   OpenTelemetry 导出、worker LLM usage 汇总、多 hub 强一致。
 
 ---
 

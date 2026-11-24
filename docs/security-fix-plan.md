@@ -1712,11 +1712,30 @@ git diff --check                             # OK
 
 **实施中发现的额外问题 / 未完成项**：
 
-1. **reviewer 角色的 `fs.write`**：`reviewer` 工具表没有 `fs.write`，所以 `_reviewer` 写 `review/<id>-review.md` 会被 runner 的角色工具检查拒绝（S5 未扩大权限）。这是既有功能缺陷，不在原审查清单；建议单独补 `fs.write` 或改为 `task.artifact` 记录评审。
-2. **lease 资源范围**：H3/M5 绑定了 lease holder，但 `lease.acquire` 的 `resource` 仍可填 `project:<别人的项目>:...`；建议后续把 unit 的 lease resource 限制为 own project/task。
-3. **operator 审计 result/error**：M8 只统一了 args/preview 脱敏；`operator._audit` 的 result/error 尚未 redact（M8 报告中已注明）。
-4. **H1 的 launch token**：当前进程生命周期内可重复兑换；方案原意是 `sfo url` 每次新签发、兑换即失效；control socket/`sfo url` 尚未实现，systemd 场景仍需显式 `SFO_WEB_TOKEN`（`docs/operations.md` §5 给出 0600 环境文件写法；探针已改用匿名 `/healthz`，不再依赖该 token）。
-5. **Phase 5**：OS 沙箱（Landlock/bwrap）、独立 worker 用户、TLS/远程模式、TLS 配置接线未做；当前远程部署仍需 SSH 隧道/反代。
-6. **同用户残余风险**：RPC/Web 认证只防“通过 API 的越权”；同用户进程仍可直读/写 `.stackflowos`、向 hub 发信号；README/威胁模型需继续保持这一说明。
+1. ~~**reviewer 角色的 `fs.write`**~~：2026-11-24 已补（`agents/roles.py` reviewer 工具表加入 `fs.write`，路径仍受 workspace 策略约束；测试见 `tests/test_agent_reviewer.py`）。
+2. ~~**lease 资源范围**~~：2026-11-24 已补（`l2/leases.py::validate_resource_scope`，`app._lease_acquire` 对外部 unit 强制 own-project；`lease.renew/release` 支持 fencing token）。
+3. ~~**operator 审计 result/error**~~：2026-11-24 已补（结构脱敏 + redact_text + `security.audit_max_field_chars` 截断；测试 `tests/test_sec_audit.py`）。
+4. ~~**H1 的 launch token**~~：2026-11-24 已补（`?token=` 默认单次兑换；`security/control.py` operator control socket + `sfo url` 铸造一次性 URL；`SFO_WEB_TOKEN` 仅保留为逃生门）。
+5. **Phase 5 部分完成**：TLS 监听已实现（`web.tls_cert/tls_key/tls_min_version`）；OS 沙箱已实现（Landlock 真实 restrict_self + bwrap 功能探测；shell.exec 与 worker 进程接线）；**独立 worker 用户仍未做**——同 uid 仍是残余边界。
+6. **同用户残余风险（保持）**：RPC/Web 认证只防“通过 API 的越权”；同用户进程仍可直读/写 `.stackflowos`、向 hub 发信号。本轮用 Landlock 收窄 worker 写范围、control socket 校验同 uid，但没有改变 OS 用户边界；README/威胁模型继续保持说明。
 7. **测试临时目录**：L9 只迁移了 `test_address`/`test_transport`；其余大量测试仍使用 `<repo>/.stackflowos/tmp` 的非 socket 状态（socket 已由 `socket_dir_for` 迁移），长路径 CI 仍建议统一迁移。
-8. **M4 DNS rebinding**：`getaddrinfo` 校验与 urllib 连接之间仍有 TOCTOU；未做 IP 固定连接。
+8. ~~**M4 DNS rebinding**~~：2026-11-24 已补（`util/net.py::fetch_url(pin_dns=True)` 连接内单次解析并固定 IP、逐跳重定向校验；`security.net_pin_dns=false` 为逃生门；`agents/tools.py` 默认走 pinned 路径）。
+
+
+---
+
+## 14.1 2026-11-24 安全增补实施记录
+
+对应本轮评审第三类「安全与远程使用」缺口。详细 API/测试见 `docs/team/sec.md`，部署方式见 `docs/operations.md`。
+
+| 条目 | 实现 | 测试 |
+|---|---|---|
+| TLS 监听 | `web/server.py` 构造 SSLContext，`asyncio.start_server(ssl=...)`；`Secure` cookie；`/healthz` 保持匿名；非 loopback 无 TLS 时 `security_notes` + 启动告警 | `tests/test_sec_tls.py` |
+| 单次 launch token | `web/auth.py` 兑换即失效（Bearer 作为 CLI/测试显式逃生门）；`security/control.py` 0600 + `SO_PEERCRED` 同 uid；`WebServer.mint_login_url` | `tests/test_sec_launch_token.py`、`test_sec_control.py`、`tests/test_feature_endpoints.py` |
+| 会话/多用户 | `security/sessions.py` 服务端会话表（列表/轮换/撤销/登出）；`web.users` token_sha256 + operator/viewer；viewer 写操作双层 403 | `tests/test_sec_sessions.py` |
+| OS 沙箱 | `security/sandbox.py`：Landlock ABI 探测与真实 `restrict_self`（写白名单、ABI≥4 deny TCP）、bwrap 功能探测与诚实降级；`agents/tools.py` shell.exec + worker 启动接线 | `tests/test_sec_sandbox.py`、`tests/test_agent_sandbox.py` |
+| 审计脱敏 | `session/operator.py::_audit` result/error redact + 截断 | `tests/test_sec_audit.py` |
+| net.fetch 固定 IP | `util/net.py` PinnedTarget/PinnedHTTP(S)Connection/GuardedRedirectHandler；`pin_dns` 开关 | `tests/test_sec_net.py`、`tests/test_net_fetch.py` |
+| 租约作用域/fencing | `l2/leases.py` token/verify/scope；`app._lease_acquire/renew/release` 接线 | `tests/test_dist_leases.py`、`tests/test_leases.py` |
+
+**剩余残余风险**：同 uid 进程边界、Bearer 长期 secret（SFO_WEB_TOKEN）、会话表在内存（hub 重启需重新登录）、Landlock 不覆盖 UDP/信号/`/proc`、bwrap 依赖非特权 user namespace。以上已在 `docs/team/sec.md` §9 与本文 §14 第 5/6 条写明。
