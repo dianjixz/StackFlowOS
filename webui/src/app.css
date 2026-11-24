@@ -30,3 +30,10 @@ body {
 .sfo-nowrap {
   white-space: nowrap;
 }
+
+/* Let the chat surface own the height of its column (composer dock at the
+   bottom, messages scrolling above it). */
+.sfo-chat-fill {
+  height: 100%;
+  min-height: 0;
+}

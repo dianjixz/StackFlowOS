@@ -27,7 +27,9 @@ import {
   MoonIcon,
   ShieldCheckIcon,
   SunIcon,
+  UserCircleIcon,
 } from '@heroicons/react/24/outline';
+import { useMediaQuery } from '@astryxdesign/core/hooks';
 import { t, useLang, useT, setLang } from './i18n';
 import { loadState, useStore, type SfoState } from './state/store';
 import { bootStore } from './state/store';
@@ -119,19 +121,21 @@ function LangToggle(): ReactNode {
   );
 }
 
-function SessionMenu(): ReactNode {
+function SessionMenu({ compact = false }: { compact?: boolean }): ReactNode {
   const auth = useAuth();
-  const label = auth.known
-    ? `${auth.user || t('shell.session')}${auth.role ? ` · ${auth.role}` : ''}`
-    : t('shell.session');
+  const label = auth.known ? (auth.user || t('shell.session')) : t('shell.session');
   return (
     <DropdownMenu
-      button={{
-        label,
-        variant: 'ghost',
-        size: 'sm',
-        endContent: auth.known ? <Badge label={auth.role} variant={auth.role === 'viewer' ? 'warning' : 'neutral'} /> : undefined,
-      }}
+      button={compact
+        ? { label: t('shell.session'), variant: 'ghost', size: 'sm', isIconOnly: true, icon: <UserCircleIcon /> }
+        : {
+          label,
+          variant: 'ghost',
+          size: 'sm',
+          endContent: auth.known && auth.role === 'viewer'
+            ? <Badge label={t('shell.viewer_hint')} variant="warning" />
+            : undefined,
+        }}
     >
       <DropdownMenuItem label={t('nav.settings')} onClick={() => navigate('settings')} />
       <DropdownMenuItem label={t('shell.logout')} onClick={() => { void signOut(); }} />
@@ -141,6 +145,7 @@ function SessionMenu(): ReactNode {
 
 function TopBar(): ReactNode {
   const sys = useStore(selSys);
+  const isCompact = useMediaQuery('(max-width: 960px)');
   const stats = useStore(selStats);
   const pending = useStore(selPending);
   const auth = useAuth();
@@ -154,20 +159,26 @@ function TopBar(): ReactNode {
       heading={(
         <HStack gap={2} align="center">
           <BrandMark />
-          <Heading level={1} accessibilityLevel={2}>StackFlow OS</Heading>
-          {sys?.host ? <Text size="xsm" color="secondary">{sys.host}</Text> : null}
+          {isCompact
+            ? <Text weight="semibold">StackFlow OS</Text>
+            : <Heading level={1} accessibilityLevel={2}>StackFlow OS</Heading>}
+          {!isCompact && sys?.host ? <Text size="xsm" color="secondary">{sys.host}</Text> : null}
         </HStack>
       )}
       endContent={(
         <HStack gap={3} align="center" wrap="wrap">
-          <Badge label={transport} variant="neutral" />
+          {!isCompact ? <Badge label={transport} variant="neutral" /> : null}
           <ConnectionChip />
-          <Text size="xsm" color="secondary">
-            {t('shell.units')} <Text as="span" weight="semibold" color="primary">{online}</Text>
-          </Text>
-          <Text size="xsm" color="secondary">
-            {t('shell.leases')} <Text as="span" weight="semibold" color="primary">{leases}</Text>
-          </Text>
+          {!isCompact ? (
+            <>
+              <Text size="xsm" color="secondary">
+                {t('shell.units')} <Text as="span" weight="semibold" color="primary">{online}</Text>
+              </Text>
+              <Text size="xsm" color="secondary">
+                {t('shell.leases')} <Text as="span" weight="semibold" color="primary">{leases}</Text>
+              </Text>
+            </>
+          ) : null}
           <Button
             label={String(pending)}
             icon={<ShieldCheckIcon />}
@@ -176,11 +187,11 @@ function TopBar(): ReactNode {
             tooltip={t('shell.approvals')}
             onClick={() => navigate('approvals')}
           />
-          {auth.known && !canWrite() ? <Badge label={t('shell.viewer_hint')} variant="warning" /> : null}
-          <LangToggle />
+          {!isCompact && auth.known && !canWrite() ? <Badge label={t('shell.viewer_hint')} variant="warning" /> : null}
+          {!isCompact ? <LangToggle /> : null}
           <ThemeToggle />
-          <SessionMenu />
-          <Clock />
+          <SessionMenu compact={isCompact} />
+          {!isCompact ? <Clock /> : null}
         </HStack>
       )}
     />

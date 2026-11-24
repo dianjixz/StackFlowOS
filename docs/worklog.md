@@ -132,3 +132,26 @@
 - 残余：权限不足的 agent 被拒后若一直重试会消耗派工尝试（5 次后停）；
   guardian 只按 (角色, capability) 尊重人类否决，未细化到具体路径/命令；
   自治不自动完成项目（done 仍是人的动作）；单 hub 假设、配额重启可能轻微超限。
+
+### 14:10–15:05 Web 控制台改用 Astryx 重写（第一波）
+- 决策：旧控制台（原生 JS/CSS，无构建）停止演进，新建 `webui/`——React 19 +
+  Astryx 设计系统 + Vite；构建产物仍写入 `stackflowos/webassets`，运行时零 Node
+  依赖。核心屏（对话/项目/Agent/单元/审批/事件/自治/设置）并行重写中。
+- 地基（lead，已提交 `05cc640`）：Astryx neutral 主题（明/暗/跟随系统）、AppShell +
+  TopNav + SideNav、hash 路由（兼容旧 `#agent/<id>` 深链）、api 客户端、
+  不可变 store + SSE reducer + `useStore` selector、i18n（导出旧字典 632 键 +
+  每屏独立 keys 模块，`import.meta.glob` 自动合并）、会话/401 门、toast 桥、
+  移动端 TopNav 收敛、`webui/README.md` 架构与规则。
+- fixture：`scripts/ui_mock.py` 补齐会话/LLM/能力/skills/plugins/MCP/autonomy/
+  单元详情探针动作/审批详情/项目 health·onboard·access·git/单 Agent 对话等
+  端点与种子数据；ticker 重复文案改为覆盖，截图不再是一墙重复。
+- CSP：Astryx 运行时注入一段 position-try 样式表并用内联 CSS 变量传尺寸，
+  `style-src 'self'` 会把两者都拦掉（overlay 定位静默失效）。改为
+  `style-src 'self' 'unsafe-inline'`，`script-src` 仍为 `'self'`；注释写明
+  理由（CSS 不能执行脚本、UI 全部 text 渲染）。
+- 对话屏（lead）：Astryx `ChatLayout/ChatMessage*/ChatComposer` + `Markdown`，
+  流式草稿/思考态、乐观发送、快捷建议空态；右侧「现场」面板（项目卡/在岗
+  Agent/事件 ticker）均深链到完整屏。明暗与 420px 移动端截图通过。
+- 团队：5 个 teammate 认领 task-1…task-5 并行重写其余屏幕（写作用域互斥：
+  `webui/src/screens/<x>/**` + `webui/src/i18n/keys/<x>.ts`），约定不 commit、
+  共享层改动先报 lead。

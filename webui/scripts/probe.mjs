@@ -1,0 +1,10 @@
+import { chromium } from 'playwright-core';
+const [url] = process.argv.slice(2);
+const b = await chromium.launch({ executablePath: '/usr/bin/google-chrome', args: ['--no-sandbox','--disable-gpu','--disable-dev-shm-usage'] });
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+p.on('response', (r) => { if (r.status() >= 400) console.log('HTTP', r.status(), r.url()); });
+p.on('console', (m) => { if (m.type() === 'error') console.log('CONSOLE', m.text().slice(0, 200)); });
+await p.goto(url, { waitUntil: 'domcontentloaded' });
+await p.waitForTimeout(3000);
+await p.screenshot({ path: '/tmp/probe.png' });
+await b.close();

@@ -57,8 +57,15 @@ COOKIE_NAME = "sfo_session"
 COOKIE_VERSION = "v1"
 DEFAULT_COOKIE_TTL_DAYS = 7
 
+# The console UI is built on the Astryx design system, whose runtime injects
+# one <style> element (anchored-overlay position fallbacks) and sets CSS
+# custom properties on elements for size/position props.  A strict
+# ``style-src 'self'`` blocks both and silently breaks overlays, so styles are
+# allowed inline while *scripts* stay same-origin only: injected CSS cannot
+# execute JavaScript, and every value the console renders is text (no
+# ``innerHTML`` from server data), so the XSS ceiling is unchanged.
 CONTENT_SECURITY_POLICY = (
-    "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
     "base-uri 'none'; form-action 'none'; object-src 'none'"
 )

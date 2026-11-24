@@ -175,6 +175,13 @@ class Fixture:
         self.rules = self._seed_rules()
         self.leases = self._seed_leases()
         self.config = self._seed_config()
+        self.sessions = self._seed_sessions()
+        self.agent_threads = self._seed_agent_threads()
+        self.autonomy_state = self._seed_autonomy()
+        self.skills = self._seed_skills()
+        self.plugins = self._seed_plugins()
+        self.mcp_servers = self._seed_mcp()
+        self.llm = self._seed_llm()
         self._refresh_all_cards()
         self._seed_events()
 
@@ -1013,6 +1020,10 @@ class Fixture:
             time.sleep(0.05)
         message = make_message("assistant", text, now_ms(), "agent-assistant")
         with self.lock:
+            # The ticker repeats its script; keep the transcript readable by
+            # replacing an older copy of the same line instead of stacking it.
+            self.conversation = [item for item in self.conversation
+                                 if item.get("text") != text]
             self.conversation.append(message)
             self.conversation = self.conversation[-200:]
         self._emit("chat.message", message, source="assistant")
@@ -1508,6 +1519,536 @@ class Fixture:
         self.stop.set()
 
 
+
+    # -- extra fixtures: sessions / agent chat / autonomy / catalog -------
+    def _seed_sessions(self) -> list[dict]:
+        t = int(now_ms() / 1000)
+        return [
+            {
+                "id": "sess-7f3a19", "user": "operator", "role": "operator",
+                "created": t - 5400, "last_seen": t - 4,
+                "expires": t + 6 * 86400, "authority": "operator",
+                "source": "launch-token",
+            },
+            {
+                "id": "sess-2c9d01", "user": "viewer", "role": "viewer",
+                "created": t - 900, "last_seen": t - 320,
+                "expires": t + 2 * 86400, "authority": "viewer",
+                "source": "config-users",
+            },
+        ]
+
+    def _seed_agent_threads(self) -> dict[str, list[dict]]:
+        t = now_ms()
+        threads: dict[str, list[dict]] = {}
+        for index, agent in enumerate(self._seed_agents_preview()):
+            agent_id = agent["id"]
+            base = t - (36 - index * 4) * 60 * 1000
+            threads[agent_id] = [
+                make_message("user", "先看一下当前任务的边界，再决定下一步。", base, agent_id),
+                {
+                    "id": f"msg-{agent_id}-2", "role": "assistant",
+                    "text": (
+                        f"收到。我先读了 {agent.get('summary') or '任务说明'}，"
+                        "并把工作区里的现状列了一遍。"
+                    ),
+                    "ts": base + 32_000, "agent_id": agent_id,
+                    "meta": {"tools": [
+                        {"id": f"tool-{index}-1", "tool": "fs.read",
+                         "state": "done", "args": {"path": "src/main.py"},
+                         "duration_ms": 12, "result": "ok"},
+                        {"id": f"tool-{index}-2", "tool": "shell.run",
+                         "state": "done", "args": {"command": "python -m pytest -q"},
+                         "duration_ms": 840, "result": "18 passed"},
+                    ]},
+                },
+                make_message("assistant", "接下来我会补齐测试，并把改动写进任务备注。", base + 60_000, agent_id),
+            ]
+        return threads
+
+    def _seed_agents_preview(self) -> list[dict]:
+        # The real seed order is stable; this only names the threads.
+        return [
+            {"id": "agent-lead-1", "summary": "正在协调 2 个工人"},
+            {"id": "agent-coder-2", "summary": "正在编辑 src/snake.py"},
+            {"id": "agent-reviewer-3", "summary": "等待 t-104 的评审"},
+            {"id": "agent-tester-4", "summary": "覆盖率 83%，待标记完成"},
+        ]
+
+    def _seed_autonomy(self) -> dict:
+        t = now_ms()
+        policy = {
+            "enabled": False, "interval_s": 120.0, "on_start": True,
+            "report_keep": 20, "task_idle_s": 120.0, "approval_age_s": 120.0,
+            "failure_window_s": 3600.0, "failure_threshold": 3,
+            "dispatch_mode": "observe", "dispatch_max_agents": 2,
+            "dispatch_max_tasks_per_hour": 10, "dispatch_max_spawns_per_hour": 4,
+            "dispatch_cooldown_s": 900.0, "approve_mode": "observe",
+            "approve_risk_max": "medium",
+            "approve_capabilities": ["fs.write", "agent.spawn"],
+            "approve_projects": [], "approve_roles": ["architect", "coder", "tester"],
+            "approve_max_per_hour": 20, "approve_min_age_s": 0.0,
+            "approve_deny_cooldown_s": 86400.0, "approve_max_agents_per_project": 4,
+            "approve_shell": False, "approve_shell_patterns": [],
+            "approve_domains": [],
+        }
+        findings = [
+            {"id": "f-1", "kind": "approval_waiting", "severity": "warn",
+             "title": "4 件审批等待超过 2 分钟",
+             "detail": "shell.run / network.connect 各 2 件",
+             "project_id": "p-1", "suggested": "approve"},
+            {"id": "f-2", "kind": "task_idle", "severity": "info",
+             "title": "t-106 已就绪但无人认领",
+             "detail": "空闲 3 分钟，依赖已满足", "project_id": "p-1",
+             "suggested": "dispatch"},
+            {"id": "f-3", "kind": "agent_failure", "severity": "critical",
+             "title": "coder 角色 30 分钟内失败 3 次",
+             "detail": "error_code=provider_error", "project_id": "p-2",
+             "suggested": "escalate"},
+        ]
+        report = {
+            "id": "rep-24", "trigger": "patrol", "dry_run": False,
+            "started_at": t - 90_000, "finished_at": t - 88_000,
+            "findings": findings,
+            "actions": [
+                {"kind": "dispatch", "finding_id": "f-2", "ok": True,
+                 "detail": "created task t-107"},
+            ],
+            "summary": {"findings": len(findings), "dispatched": 1, "approved": 0},
+            "error": None,
+        }
+        return {
+            "policy": policy,
+            "last_run": t - 88_000,
+            "running": False,
+            "report": report,
+            "history": [report],
+            "counts": {"findings": 3, "dispatched": 1, "approved": 0, "skipped": 2},
+            "dispatches": [
+                {"ts": t - 88_000, "finding_id": "f-2", "kind": "dispatch",
+                 "project_id": "p-1", "task_id": "t-107", "role": "coder",
+                 "ok": True, "reason": "task idle and unassigned"},
+            ],
+            "approvals": [
+                {"ts": t - 61_000, "approval_id": "apr-eaf32b76",
+                 "decision": "allow", "reason": "within fs.write envelope",
+                 "capability": "fs.write", "risk": "medium", "project_id": "p-1"},
+            ],
+            "rate": {"spawns": [t - 20 * 60_000, t - 5 * 60_000], "tasks": [t - 30 * 60_000]},
+        }
+
+    def _seed_skills(self) -> list[dict]:
+        return [
+            {"id": "ui-review", "name": "UI Review", "version": "1.2.0",
+             "description": "按设计系统规范检查界面截图。", "path": "skills/ui-review",
+             "valid": True, "enabled": True, "error": None,
+             "inject_max_chars": 8000, "triggers": ["review", "ui"]},
+            {"id": "release-notes", "name": "Release Notes", "version": "0.4.1",
+             "description": "从提交历史汇总发布说明。", "path": "skills/release-notes",
+             "valid": True, "enabled": False, "error": None,
+             "inject_max_chars": 4000, "triggers": ["release"]},
+            {"id": "broken-skill", "name": "Broken Skill", "version": "0.0.1",
+             "description": "缺少 SKILL.md 的示例。", "path": "skills/broken",
+             "valid": False, "enabled": False, "error": "missing SKILL.md",
+             "inject_max_chars": 2000, "triggers": []},
+        ]
+
+    def _seed_plugins(self) -> list[dict]:
+        return [
+            {"id": "obs-export", "name": "Observability Export", "version": "0.3.0",
+             "state": "loaded", "loaded": True, "error": None,
+             "path": ".stackflowos/plugins/obs-export", "unit_id": "plugin.obs-export"},
+            {"id": "git-hooks", "name": "Git Hooks", "version": "0.1.2",
+             "state": "unloaded", "loaded": False, "error": None,
+             "path": ".stackflowos/plugins/git-hooks", "unit_id": "plugin.git-hooks"},
+        ]
+
+    def _seed_mcp(self) -> list[dict]:
+        return [
+            {"name": "filesystem", "unit_id": "mcp.filesystem", "state": "ready",
+             "connection": "stdio", "enabled": True, "command": "npx",
+             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+             "cwd": None, "framing": "newline", "env_keys": [],
+             "tools": ["read_file", "write_file", "list_directory"], "tool_count": 3,
+             "last_error": None, "last_connected": int(now_ms() / 1000) - 600,
+             "pid": 19233, "stderr_tail": []},
+            {"name": "fetch", "unit_id": "mcp.fetch", "state": "idle",
+             "connection": "stdio", "enabled": True, "command": "uvx",
+             "args": ["mcp-server-fetch"], "cwd": None, "framing": "newline",
+             "env_keys": ["HTTP_PROXY"], "tools": [], "tool_count": 0,
+             "last_error": "", "last_connected": None, "pid": None, "stderr_tail": []},
+        ]
+
+    def _seed_llm(self) -> dict:
+        t = now_ms()
+        return {
+            "totals": {"prompt": 182_000, "completion": 64_000, "total": 246_000,
+                       "cost": 1.87, "requests": 412},
+            "projects": {"p-1": {"total": 152_000, "cost": 1.12},
+                         "p-2": {"total": 94_000, "cost": 0.75}},
+            "roles": {"lead": {"total": 120_000}, "coder": {"total": 90_000},
+                      "reviewer": {"total": 36_000}},
+            "providers": {"mock": {"total": 246_000, "cost": 1.87}},
+            "models": {"mock-small": {"total": 246_000, "cost": 1.87}},
+            "recent": [{"ts": t - 60_000, "role": "coder", "model": "mock-small",
+                        "prompt": 1200, "completion": 380, "cost": 0.003}],
+            "limits": {"rpm": 60, "tpm": 90000, "max_concurrency": 4, "in_flight": 0},
+            "circuit": {"state": "closed", "failures": 0, "opened_at": None},
+            "budget": {"project_token_budget": 400_000, "used": 246_000,
+                       "remaining": 154_000, "exceeded": False},
+        }
+
+    # -- extra read/write helpers ----------------------------------------
+    def approval_detail(self, approval_id: str) -> dict:
+        with self.lock:
+            row = next((item for item in self.approvals if item["id"] == approval_id), None)
+            if row is None:
+                raise Problem(404, "NOT_FOUND", f"no approval {approval_id}")
+            data = copy.deepcopy(row)
+        data["preview_full"] = data.get("preview") or ""
+        data["policy"] = {"matched_rule": None, "would_auto_approve": False}
+        return data
+
+    def autonomy_status(self) -> dict:
+        with self.lock:
+            state = copy.deepcopy(self.autonomy_state)
+        policy = state["policy"]
+        return {
+            "enabled": bool(policy.get("enabled")),
+            "running": bool(state.get("running")),
+            "last_run": int(state.get("last_run") or 0),
+            "next_run_in_s": 72.0 if policy.get("enabled") else None,
+            "interval_s": float(policy.get("interval_s") or 120.0),
+            "policy": policy,
+            "counts": copy.deepcopy(state.get("counts") or {}),
+            "findings": copy.deepcopy((state.get("report") or {}).get("findings") or []),
+            "report": copy.deepcopy(state.get("report")),
+            "history": copy.deepcopy(state.get("history") or []),
+            "dispatches": copy.deepcopy(state.get("dispatches") or []),
+            "approvals": copy.deepcopy(state.get("approvals") or []),
+            "guardrail": {
+                "spawns_last_hour": len((state.get("rate") or {}).get("spawns") or []),
+                "tasks_last_hour": len((state.get("rate") or {}).get("tasks") or []),
+                "approvals_last_hour": 1,
+                "limits": {
+                    "max_spawns_per_hour": int(policy.get("dispatch_max_spawns_per_hour") or 0),
+                    "max_tasks_per_hour": int(policy.get("dispatch_max_tasks_per_hour") or 0),
+                    "max_approvals_per_hour": int(policy.get("approve_max_per_hour") or 0),
+                    "max_agents": int(policy.get("dispatch_max_agents") or 0),
+                },
+            },
+        }
+
+    def autonomy_patrol(self, dry_run: bool) -> dict:
+        t = now_ms()
+        with self.lock:
+            base = copy.deepcopy(self.autonomy_state["report"] or {})
+            base.update({"id": new_id("rep").replace("rep-", "rep-")[:10],
+                         "trigger": "operator", "dry_run": bool(dry_run),
+                         "started_at": t - 300, "finished_at": t,
+                         "actions": [] if dry_run else base.get("actions", [])})
+            self.autonomy_state["last_run"] = t
+            self.autonomy_state["report"] = copy.deepcopy(base)
+        return base
+
+    def autonomy_patch(self, patch: dict) -> dict:
+        if not isinstance(patch, dict) or not patch:
+            raise Problem(400, "BAD_REQUEST", "policy patch must be a non-empty object")
+        known = set(self.autonomy_state["policy"])
+        unknown = sorted(set(patch) - known)
+        if unknown:
+            raise Problem(400, "BAD_REQUEST", f"unknown autonomy policy fields: {unknown}")
+        with self.lock:
+            self.autonomy_state["policy"].update(patch)
+        return self.autonomy_status()
+
+    def agent_history(self, agent_id: str, limit: int = 200) -> dict:
+        with self.lock:
+            agent = next((item for item in self.agents if item["id"] == agent_id), None)
+            if agent is None:
+                raise Problem(404, "NOT_FOUND", f"no agent {agent_id}")
+            project = next((p for p in self.projects if p["id"] == agent.get("project_id")), None)
+            messages = copy.deepcopy(self.agent_threads.get(agent_id, []))[-limit:]
+        return {
+            "agent": copy.deepcopy(agent),
+            "project": copy.deepcopy(project),
+            "messages": messages,
+            "busy": False,
+            "draft": None,
+            "provider": "mock",
+            "model": "mock-small",
+        }
+
+    def agent_send(self, agent_id: str, text: str) -> dict:
+        if not str(text or "").strip():
+            raise Problem(400, "BAD_REQUEST", "text required")
+        message = make_message("user", str(text).strip(), now_ms(), agent_id)
+        with self.lock:
+            self.agent_threads.setdefault(agent_id, []).append(message)
+        return {"message": message, "busy": True}
+
+    def agent_clear(self, agent_id: str) -> dict:
+        with self.lock:
+            self.agent_threads[agent_id] = []
+        return {"cleared": True}
+
+    def unit_summary(self) -> dict:
+        with self.lock:
+            units = copy.deepcopy(self.units)
+        by_tier = {"system": {"total": 0, "online": 0},
+                   "service": {"total": 0, "online": 0},
+                   "worker": {"total": 0, "online": 0}}
+        for unit in units:
+            tier = str(unit.get("tier") or "worker")
+            bucket = by_tier.setdefault(tier, {"total": 0, "online": 0})
+            bucket["total"] += 1
+            if unit.get("status") in ("online", "ready"):
+                bucket["online"] += 1
+        return {
+            "schema": "stackflow.unit-summary/v1",
+            "total": len(units),
+            "online": sum(1 for u in units if u.get("status") in ("online", "ready")),
+            "degraded": 0, "failed": 0, "critical_bad": False,
+            "by_tier": by_tier, "problems": [],
+        }
+
+    def unit_detail(self, unit_id: str) -> dict:
+        with self.lock:
+            unit = next((copy.deepcopy(item) for item in self.units
+                         if item.get("work_id") == unit_id), None)
+        if unit is None:
+            raise Problem(404, "NOT_FOUND", f"no unit {unit_id}")
+        unit.setdefault("tier", "worker")
+        unit["state"] = unit.get("status")
+        unit["since"] = unit.get("started_at")
+        unit["health"] = {"ok": unit.get("status") == "online", "last_latency_ms": 12}
+        unit["actions"] = ["probe", "restart", "disable", "drain"]
+        requires = ["sys.0"] if unit.get("kind") == "agent" else []
+        wants = ["llm.0"]
+        unit["requires"] = requires
+        unit["wants"] = wants
+        return {
+            "schema": "stackflow.unit/v1", "unit": unit, "descriptor": unit,
+            "state": unit.get("status"), "since": unit.get("started_at"),
+            "health": unit["health"], "actions": unit["actions"],
+            "requires": requires, "wants": wants,
+            "dependency": {
+                "nodes": [{"id": unit_id, "label": unit.get("label") or unit_id}] + [
+                    {"id": item, "label": item} for item in requires + wants],
+                "edges": [{"from": unit_id, "to": item, "kind": "requires"}
+                          for item in requires] + [
+                    {"from": unit_id, "to": item, "kind": "wants"} for item in wants],
+            },
+            "events": copy.deepcopy(self.events[-8:]),
+        }
+
+    def unit_probe(self, unit_id: str) -> dict:
+        detail = self.unit_detail(unit_id)
+        return {"unit_id": unit_id, "state": detail.get("state"), "ok": True,
+                "latency_ms": 12,
+                "checks": [{"name": "rpc", "ok": True, "latency_ms": 8},
+                           {"name": "events", "ok": True, "latency_ms": 4}]}
+
+    def unit_action(self, unit_id: str, action: str) -> dict:
+        detail = self.unit_detail(unit_id)
+        if action not in detail["actions"]:
+            raise Problem(409, "CONFLICT", f"unit does not declare action {action!r}")
+        return {"action": action, "unit_id": unit_id, "result": {"ok": True},
+                "unit": detail["unit"]}
+
+    def project_health(self, project_id: str) -> dict:
+        with self.lock:
+            project = copy.deepcopy(self._project(project_id))
+        checks = [
+            {"id": "workspace", "label": "工作区可用", "status": "ok",
+             "message": "workspace 目录存在且可读写", "checked": True},
+            {"id": "tasks", "label": "任务队列", "status": "ok",
+             "message": "12 个任务，无阻塞", "checked": True},
+            {"id": "approvals", "label": "待审批", "status": "warn",
+             "message": "有 4 件审批等待处理", "checked": True,
+             "fix": "打开审批中心处理"},
+        ]
+        return {
+            "schema": "stackflow.project-health/v1", "project_id": project_id,
+            "project_name": project.get("name"), "checked_at": now_ms(),
+            "ready": True, "status": "ready",
+            "summary": {"total": len(checks), "ok": 2, "warn": 1, "fail": 0},
+            "checks": checks, "not_ready_reasons": [], "next_actions": [],
+        }
+
+    def project_onboard(self, project_id: str) -> dict:
+        return {"project_id": project_id, "created_files": ["AGENTS.md", "docs/plan.md"],
+                "seed_task": "t-100", "health": self.project_health(project_id),
+                "ok": True}
+
+    def project_access(self, project_id: str, allow: bool) -> dict:
+        with self.lock:
+            card = copy.deepcopy(self._project(project_id))
+        card["workspace_mode"] = "attached-rw" if allow else "attached-ro"
+        card["allow_writes"] = bool(allow)
+        return card
+
+    def project_git(self, project_id: str) -> dict:
+        return {
+            "project_id": project_id, "workspace": "/tmp/workspace",
+            "workspace_mode": "attached-rw", "enabled": True,
+            "git_available": True, "repo": True, "branch": "task/snake",
+            "head": "dbe1b46", "dirty": True,
+            "commits": [
+                {"sha": "dbe1b46", "subject": "feat(autonomy): operator tools",
+                 "author": "lead", "ts": now_ms() - 3600_000},
+                {"sha": "303c3cf", "subject": "feat(autonomy): config section",
+                 "author": "lead", "ts": now_ms() - 7200_000},
+            ],
+            "changes": [
+                {"path": "src/snake.py", "status": "M", "additions": 42,
+                 "deletions": 7},
+                {"path": "tests/test_snake.py", "status": "A", "additions": 61,
+                 "deletions": 0},
+            ],
+            "stat": " 2 files changed, 103 insertions(+), 7 deletions(-)",
+        }
+
+    def project_git_rollback(self, project_id: str, ref: str) -> dict:
+        if not str(ref or "").strip():
+            raise Problem(400, "BAD_REQUEST", "git ref is required")
+        return {"project_id": project_id, "ref": ref, "commit": "dbe1b46",
+                "previous_head": "dbe1b46",
+                "backup_branch": f"backup/{ref}", "ok": True}
+
+    def llm_usage(self, project_id: str | None) -> dict:
+        llm = copy.deepcopy(self.llm)
+        used = llm["budget"]["used"] if not project_id else 152_000
+        return {
+            "project_id": project_id,
+            "totals": llm["totals"], "projects": llm["projects"],
+            "roles": llm["roles"], "providers": llm["providers"],
+            "models": llm["models"], "recent": llm["recent"],
+            "project": None,
+            "cost": llm["totals"]["cost"], "budget": dict(llm["budget"], used=used,
+                remaining=max(0, llm["budget"]["project_token_budget"] - used)),
+            "limits": llm["limits"], "circuit": llm["circuit"],
+            "providers_health": [{"provider": "mock", "model": "mock-small",
+                                  "role": "primary", "ok": True,
+                                  "last_latency_ms": 18, "last_error": "",
+                                  "circuit": llm["circuit"]}],
+            "updated_at": now_ms(), "generated_at": now_ms(),
+        }
+
+    def llm_models(self) -> dict:
+        return {
+            "primary": {"provider": "mock", "model": "mock-small", "role": "primary",
+                        "ok": True, "last_latency_ms": 18},
+            "providers": [{"provider": "mock", "model": "mock-small",
+                           "role": "primary", "ok": True}],
+            "health": {"ok": True, "last_latency_ms": 18},
+            "configured": {"provider": "mock", "model": "mock-small",
+                           "base_url": "", "stream": True, "rpm": 60,
+                           "tpm": 90000, "max_concurrency": 4,
+                           "max_context_tokens": 32000,
+                           "project_token_budget": 400000},
+            "routes": [{"role": "coder", "provider": "mock", "model": "mock-small",
+                        "ok": True}],
+            "fallback": [],
+            "generated_at": now_ms(),
+        }
+
+    def capabilities_payload(self, project_id: str | None) -> dict:
+        entries = [
+            {"type": "tool", "name": "fs.write", "label": "写文件", "risk": "medium",
+             "description": "在工作区内写入文件。", "source": "builtin"},
+            {"type": "tool", "name": "shell.run", "label": "执行命令", "risk": "high",
+             "description": "在工作区内执行 shell 命令。", "source": "builtin"},
+            {"type": "tool", "name": "net.fetch", "label": "抓取网页", "risk": "medium",
+             "description": "按白名单域名抓取网页。", "source": "builtin"},
+            {"type": "skill", "name": "ui-review", "label": "UI Review", "risk": "low",
+             "description": "按设计系统规范检查界面截图。", "source": "skill"},
+            {"type": "plugin", "name": "obs-export", "label": "Observability Export",
+             "risk": "low", "description": "导出指标到外部系统。", "source": "plugin"},
+            {"type": "mcp", "name": "filesystem", "label": "MCP filesystem",
+             "risk": "medium", "description": "MCP 文件系统服务器。", "source": "mcp"},
+        ]
+        for entry in entries:
+            entry["project_id"] = project_id
+            entry["enabled"] = True
+        return {
+            "schema": "stackflow.capabilities/v1", "project_id": project_id,
+            "count": len(entries),
+            "by_type": {kind: sum(1 for e in entries if e["type"] == kind)
+                        for kind in ("tool", "skill", "plugin", "mcp")},
+            "capabilities": entries,
+        }
+
+    def skills_payload(self, project_id: str | None) -> dict:
+        entries = copy.deepcopy(self.skills)
+        return {
+            "skills": entries, "project_id": project_id,
+            "summary": {"total": len(entries),
+                        "valid": sum(1 for e in entries if e["valid"]),
+                        "invalid": sum(1 for e in entries if not e["valid"]),
+                        "enabled": sum(1 for e in entries if e["enabled"]),
+                        "state": "ready", "reason": None},
+            "unit_id": "skill.0",
+        }
+
+    def set_skill(self, skill_id: str, enabled: bool) -> dict:
+        with self.lock:
+            entry = next((item for item in self.skills if item["id"] == skill_id), None)
+            if entry is None:
+                raise Problem(404, "NOT_FOUND", f"no skill {skill_id}")
+            entry["enabled"] = bool(enabled)
+            return copy.deepcopy(entry)
+
+    def plugins_payload(self) -> dict:
+        return {"plugins": copy.deepcopy(self.plugins),
+                "summary": {"total": len(self.plugins),
+                            "loaded": sum(1 for p in self.plugins if p["loaded"])},
+                "unit_id": "plugin.0"}
+
+    def set_plugin(self, plugin_id: str, loaded: bool) -> dict:
+        with self.lock:
+            entry = next((item for item in self.plugins if item["id"] == plugin_id), None)
+            if entry is None:
+                raise Problem(404, "NOT_FOUND", f"no plugin {plugin_id}")
+            entry["loaded"] = bool(loaded)
+            entry["state"] = "loaded" if loaded else "unloaded"
+            return {"plugin": copy.deepcopy(entry), "unit_id": entry["unit_id"]}
+
+    def mcp_payload(self) -> dict:
+        return {"servers": copy.deepcopy(self.mcp_servers),
+                "summary": {"total": len(self.mcp_servers),
+                            "ready": sum(1 for s in self.mcp_servers if s["state"] == "ready")},
+                "unit_id": "mcp.0"}
+
+    def mcp_connect(self, name: str, connected: bool) -> dict:
+        with self.lock:
+            server = next((item for item in self.mcp_servers if item["name"] == name), None)
+            if server is None:
+                raise Problem(404, "NOT_FOUND", f"no mcp server {name}")
+            server["state"] = "ready" if connected else "idle"
+            server["pid"] = 19233 if connected else None
+            return {"server": copy.deepcopy(server)}
+    def mcp_tools(self, server_name: str | None) -> dict:
+        tools = []
+        for server in self.mcp_servers:
+            if server_name and server["name"] != server_name:
+                continue
+            for tool in server["tools"]:
+                tools.append({"server": server["name"], "name": tool,
+                              "description": f"{tool} via {server['name']}",
+                              "input_schema": {"type": "object", "properties": {}}})
+        return {"tools": tools, "count": len(tools)}
+
+    def mcp_call(self, server: str, tool: str, args: dict | None) -> dict:
+        return {"server": server, "tool": tool, "ok": True,
+                "result": {"content": [{"type": "text",
+                                        "text": f"{tool} ok ({args or {}})"}]}}
+
+    def device_sessions_summary(self) -> dict:
+        with self.lock:
+            rows = copy.deepcopy(self.sessions)
+        return {"sessions": rows, "count": len(rows), "max_sessions": 16}
+
 def request_mode(mode: str, decision: str) -> str | None:
     return mode if decision == "allow" else None
 
@@ -1665,6 +2206,43 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch_api(self, method: str, path: str, query: dict, body: dict):
         fixture = self.fixture
         routes = [
+            ("GET", r"/api/sessions"),
+            ("POST", r"/api/sessions/rotate"),
+            ("DELETE", r"/api/sessions/([^/]+)"),
+            ("GET", r"/api/llm/usage"),
+            ("GET", r"/api/llm/models"),
+            ("POST", r"/api/llm/test"),
+            ("GET", r"/api/capabilities"),
+            ("GET", r"/api/skills"),
+            ("POST", r"/api/skills/([^/]+)/enable"),
+            ("POST", r"/api/skills/([^/]+)/disable"),
+            ("GET", r"/api/plugins"),
+            ("POST", r"/api/plugins/([^/]+)/load"),
+            ("POST", r"/api/plugins/([^/]+)/unload"),
+            ("GET", r"/api/mcp/servers"),
+            ("POST", r"/api/mcp/servers/([^/]+)/connect"),
+            ("POST", r"/api/mcp/servers/([^/]+)/disconnect"),
+            ("GET", r"/api/mcp/tools"),
+            ("POST", r"/api/mcp/call"),
+            ("GET", r"/api/autonomy/status"),
+            ("GET", r"/api/autonomy"),
+            ("POST", r"/api/autonomy/patrol"),
+            ("PATCH", r"/api/autonomy/policy"),
+            ("GET", r"/api/units/summary"),
+            ("GET", r"/api/units/([^/]+)"),
+            ("POST", r"/api/units/([^/]+)/probe"),
+            ("POST", r"/api/units/([^/]+)/actions"),
+            ("GET", r"/api/approvals/([^/]+)"),
+            ("GET", r"/api/agents/([^/]+)/chat"),
+            ("POST", r"/api/agents/([^/]+)/chat"),
+            ("POST", r"/api/agents/([^/]+)/chat/cancel"),
+            ("DELETE", r"/api/agents/([^/]+)/chat"),
+            ("GET", r"/api/projects/([^/]+)/healthcheck"),
+            ("POST", r"/api/projects/([^/]+)/onboard"),
+            ("POST", r"/api/projects/([^/]+)/access"),
+            ("GET", r"/api/projects/([^/]+)/git"),
+            ("POST", r"/api/projects/([^/]+)/git/rollback"),
+            ("DELETE", r"/api/projects/([^/]+)"),
             ("GET", r"/api/health"),
             ("GET", r"/api/state"),
             ("GET", r"/api/events"),
@@ -1708,6 +2286,100 @@ class Handler(BaseHTTPRequestHandler):
             return 404, {"ok": False, "error": {
                 "code": "NOT_FOUND", "message": f"no route {method} {path}"}}
 
+        # -- extended surface (settings / units / autonomy / agent chat) --
+        if path == "/api/sessions" and method == "GET":
+            return 200, {"ok": True, "data": fixture.device_sessions_summary()}
+        if path == "/api/sessions/rotate":
+            return 200, {"ok": True, "data": {"rotated": True,
+                                              "session": copy.deepcopy(fixture.sessions[0])}}
+        if path.startswith("/api/sessions/") and method == "DELETE":
+            session_id = match.group(1)
+            with fixture.lock:
+                fixture.sessions = [row for row in fixture.sessions
+                                    if row["id"] != session_id]
+            return 200, {"ok": True, "data": {"revoked": True, "id": session_id}}
+        if path == "/api/llm/usage":
+            return 200, {"ok": True, "data": fixture.llm_usage(query.get("project_id"))}
+        if path == "/api/llm/models":
+            return 200, {"ok": True, "data": fixture.llm_models()}
+        if path == "/api/llm/test":
+            return 200, {"ok": True, "data": {"ok": True, "provider": "mock",
+                                              "model": "mock-small", "latency_ms": 18,
+                                              "text": "pong"}}
+        if path == "/api/capabilities":
+            return 200, {"ok": True, "data": fixture.capabilities_payload(
+                query.get("project_id"))}
+        if path == "/api/skills":
+            return 200, {"ok": True, "data": fixture.skills_payload(
+                query.get("project_id"))}
+        if path.startswith("/api/skills/") and path.endswith(("/enable", "/disable")):
+            enabled = path.endswith("/enable")
+            return 200, {"ok": True, "data": fixture.set_skill(match.group(1), enabled)}
+        if path == "/api/plugins":
+            return 200, {"ok": True, "data": fixture.plugins_payload()}
+        if path.startswith("/api/plugins/") and path.endswith(("/load", "/unload")):
+            loaded = path.endswith("/load")
+            return 200, {"ok": True, "data": fixture.set_plugin(match.group(1), loaded)}
+        if path == "/api/mcp/servers":
+            return 200, {"ok": True, "data": fixture.mcp_payload()}
+        if path.startswith("/api/mcp/servers/") and path.endswith(("/connect", "/disconnect")):
+            connected = path.endswith("/connect")
+            return 200, {"ok": True, "data": fixture.mcp_connect(match.group(1), connected)}
+        if path == "/api/mcp/tools":
+            return 200, {"ok": True, "data": fixture.mcp_tools(query.get("server"))}
+        if path == "/api/mcp/call":
+            return 200, {"ok": True, "data": fixture.mcp_call(
+                str(body.get("server") or ""), str(body.get("tool") or ""),
+                body.get("args") or {})}
+        if path in ("/api/autonomy", "/api/autonomy/status") and method == "GET":
+            return 200, {"ok": True, "data": fixture.autonomy_status()}
+        if path == "/api/autonomy/patrol":
+            return 200, {"ok": True, "data": fixture.autonomy_patrol(
+                bool(body.get("dry_run")))}
+        if path == "/api/autonomy/policy" and method == "PATCH":
+            return 200, {"ok": True, "data": fixture.autonomy_patch(body)}
+        if path == "/api/units/summary":
+            return 200, {"ok": True, "data": fixture.unit_summary()}
+        if path.startswith("/api/units/") and path.endswith("/kill"):
+            return 200, {"ok": True, "data": fixture.kill_unit(match.group(1))}
+        if path.startswith("/api/units/") and path.endswith("/probe"):
+            return 200, {"ok": True, "data": fixture.unit_probe(match.group(1))}
+        if path.startswith("/api/units/") and path.endswith("/actions"):
+            return 200, {"ok": True, "data": fixture.unit_action(
+                match.group(1), str(body.get("action") or ""))}
+        if path.startswith("/api/units/") and method == "GET":
+            return 200, {"ok": True, "data": fixture.unit_detail(match.group(1))}
+        if path.startswith("/api/approvals/") and bool(match) and method == "GET":
+            return 200, {"ok": True, "data": fixture.approval_detail(match.group(1))}
+        if path.startswith("/api/agents/") and path.endswith("/chat") and method == "GET":
+            try:
+                limit = min(int(query.get("limit") or 200), 400)
+            except ValueError:
+                limit = 200
+            return 200, {"ok": True, "data": fixture.agent_history(match.group(1), limit)}
+        if path.startswith("/api/agents/") and path.endswith("/chat") and method == "POST":
+            return 202, {"ok": True, "data": fixture.agent_send(
+                match.group(1), str(body.get("text") or ""))}
+        if path.startswith("/api/agents/") and path.endswith("/chat/cancel"):
+            return 200, {"ok": True, "data": {"canceled": True}}
+        if path.startswith("/api/agents/") and path.endswith("/chat") and method == "DELETE":
+            return 200, {"ok": True, "data": fixture.agent_clear(match.group(1))}
+        if path.startswith("/api/projects/") and path.endswith("/healthcheck"):
+            return 200, {"ok": True, "data": fixture.project_health(match.group(1))}
+        if path.startswith("/api/projects/") and path.endswith("/onboard"):
+            return 200, {"ok": True, "data": fixture.project_onboard(match.group(1))}
+        if path.startswith("/api/projects/") and path.endswith("/access"):
+            return 200, {"ok": True, "data": fixture.project_access(
+                match.group(1), bool(body.get("allow_writes")))}
+        if path.startswith("/api/projects/") and path.endswith("/git") and method == "GET":
+            return 200, {"ok": True, "data": fixture.project_git(match.group(1))}
+        if path.startswith("/api/projects/") and path.endswith("/git/rollback"):
+            return 200, {"ok": True, "data": fixture.project_git_rollback(
+                match.group(1), str(body.get("ref") or ""))}
+        if path.startswith("/api/projects/") and method == "DELETE":
+            return 200, {"ok": True, "data": {"project_id": match.group(1),
+                                              "deleted": True,
+                                              "purged_workspace": bool(body.get("purge_workspace"))}}
         # health
         if path == "/api/health":
             return 200, {"ok": True, "data": {"status": "ok", "version": "0.1.0",

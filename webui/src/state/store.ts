@@ -26,14 +26,20 @@ export interface ChatMessage {
   pending?: boolean;
   error?: boolean;
   tool_calls?: ToolCall[];
+  meta?: { tools?: ToolCall[]; [key: string]: unknown };
 }
 
 export interface ToolCall {
   id?: string;
+  /** Astryx-style name, or the backend's `tool` field. */
   name?: string;
+  tool?: string;
   args?: unknown;
-  result?: string;
+  result?: unknown;
   status?: string;
+  /** Final state of the call: done / error / running. */
+  state?: string;
+  duration_ms?: number;
 }
 
 export interface ProjectCounts {
