@@ -112,6 +112,14 @@ def _parser() -> argparse.ArgumentParser:
     autonomy_patrol.add_argument("--json", action="store_true")
     autonomy_set = autonomy_sub.add_parser(
         "set", help="update the autonomy policy (persisted)")
+    # ``--url/--token`` are accepted both before and after the subcommand
+    # (``sfo autonomy --token T status`` and ``... status --token T``).  The
+    # SUPPRESS default keeps the top-level value when the subcommand omits it.
+    for _sub in (autonomy_status, autonomy_patrol, autonomy_set):
+        _sub.add_argument("--url", default=argparse.SUPPRESS,
+                          help="hub base URL (default: config web host/port)")
+        _sub.add_argument("--token", default=argparse.SUPPRESS,
+                          help="web token (default: $SFO_WEB_TOKEN)")
     autonomy_set.add_argument("--enabled", dest="enabled",
                               action="store_true", default=None)
     autonomy_set.add_argument("--disabled", dest="disabled",
