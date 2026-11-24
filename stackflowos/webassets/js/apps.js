@@ -93,7 +93,7 @@ const view = {
   tasksToken: 0,
   selectedTaskId: null,
   scrollToTask: false,
-  agentFilter: 'active',
+  agentFilter: 'all',
   rules: [],
   rulesLoading: false,
   recentDecisions: [],
