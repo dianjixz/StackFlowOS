@@ -62,7 +62,7 @@
   （§5.7 事件、§6.2 workspace 边界、§7 入住、§8.1 blocked/failed）。
 - **测试**：新增 `test_projects_onboarding/health`、`test_project_onboarding_app`、
   `test_attached_workspace_policy`、`test_event_replay`；更新 runner/supervisor/limits/
-  queue/attach/event-trust/rpc-scope 断言；全量 **1151 passed + 623 subtests**（2 skipped）。
+  queue/attach/event-trust/rpc-scope 断言；全量 **1152 passed + 623 subtests**（2 skipped）。
 - **提交**：`f6ae4c6` `feat(onboarding): project kit, health check, blocked/failed split,
   replay filters`；`6f99e86` 文档；`3768e0d` 统一 `agent.spawn` RPC 的项目 scope 守卫；
   `906351b` `fix(agents): use the LLM brain when routes or fallback are configured`
