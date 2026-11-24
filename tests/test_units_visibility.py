@@ -51,7 +51,10 @@ class UnitVisibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(units[unit_id]["runtime"]["mode"], "in_process")
             self.assertIsNone(units[unit_id]["pid"])
         self.assertEqual(units["approval.0"]["critical"], True)
-        self.assertEqual(units["skill.0"]["state"], "disabled")
+        # Phase 2: skill.0 is derived from the real SkillRegistry scan, so a
+        # clean hub with zero skills is ready/degraded rather than hard-coded
+        # "disabled" (docs/units-plan.md §7 阶段 2).
+        self.assertIn(units["skill.0"]["state"], ("ready", "degraded"))
 
     async def test_unit_cards_include_workers_after_sys(self):
         card = await self.app.attach_project("单元测试", str(self.tmp),

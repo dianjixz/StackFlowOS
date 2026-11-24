@@ -1,0 +1,14 @@
+{
+  "id": "hello",
+  "name": "Hello 插件",
+  "version": "0.1.0",
+  "entry": {"type": "python", "module": "hello_plugin:apply"},
+  "runtime": "in_process",
+  "requires": ["context.0", "tool.0"],
+  "contributes": {"tools": ["plugin.echo"], "skills": ["hello-skill"]},
+  "permissions": ["inproc"],
+  "config_schema": {
+    "type": "object",
+    "properties": {"greeting": {"type": "string"}}
+  }
+}
