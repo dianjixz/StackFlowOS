@@ -117,8 +117,18 @@
   `task.blocked` 正确报告。截图 `docs/img/autonomy-live.png`（767 轮巡检、3 项待处理）。
 - 全量测试：**1307 passed, 2 skipped, 680 subtests passed**（94.5s）。
 - `compileall`、`git diff --check`、`node --check` 全过。
+- **真实 provider 缺陷**：live 网关对工具名 `fs.read` 返回 HTTP 400
+  （`^[a-zA-Z0-9_-]+$`）。新增 `provider_tool_name()`：schema 发 `fs_read`，
+  消费端映射回 `fs.read`，native 历史也回写安全拼写；直连网关验证返回
+  `fs_read` 工具调用；补 11 个测试并更新 3 处旧断言。全量 **1319 passed,
+  2 skipped, 680 subtests**。
 - 提交：`303c3cf` 配置/数据形状/服务骨架；`dbe1b46` 操作员工具/CLI/测试；
-  `03443cb` patrol+dispatcher+guardian+API；`bbb59f9` 前端。
+  `03443cb` patrol+dispatcher+guardian+API；`bbb59f9` 前端；
+  `3a263c1` review/blocked 检查与文档；`8e3ea87` provider 工具名修复。
+- 上线：live hub（17800，systemd）备份后重启，`autonomy.enabled=true,
+  dispatch_mode=agents, approve_mode=enforce`（fs.write/agent.spawn，risk≤medium；
+  shell/删除/系统/项目管理仍人审）。首个真实 reviewer 在工具名修复前失败，
+  修复后网关直连验证通过；该失败作为 `agent.failure` 留在巡检报告里。
 - 残余：权限不足的 agent 被拒后若一直重试会消耗派工尝试（5 次后停）；
   guardian 只按 (角色, capability) 尊重人类否决，未细化到具体路径/命令；
   自治不自动完成项目（done 仍是人的动作）；单 hub 假设、配额重启可能轻微超限。
