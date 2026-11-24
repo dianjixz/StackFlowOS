@@ -75,3 +75,50 @@
 - 远程/TLS：本机自签证书启动 `hub --tls-cert/--tls-key --port 18999`，`stackflowos url` 经 control socket 铸造一次性 URL → HTTPS `?token=` 兑换 303 + HttpOnly cookie → `/api/health` 200；第二次兑换被拒绝。
 - 清理：停止遗留的仓库 `.stackflowos` hub 进程，避免占用 17800；工作树只保留文档变更。
 - 团队看板：task-1…task-7 全部 completed；7 个 teammate 已停止，无后台任务。
+
+## 2026-11-24（下午）自治闭环：巡检 / 派工 / 代理审批
+
+### 11:30–12:00 设计与契约
+- 目标：让 OS 自己巡系统、自己派工、自己批审批，但不是"系统给自己无限放权"——
+  由人预授权围栏 + 配额 + 审计 + 急停。
+- 新增 `docs/team/autonomy-plan.md` 作为并行契约（文件所有权、模块接口、事件/API、
+  验收）；4 个 teammate 并行：patrol / guard（dispatcher+guardian）/ api / front。
+- 新增配置段 `autonomy`（24 个字段，默认全关；枚举/上下界/capability 白名单/
+  shell 正则可编译校验；删除/系统/项目管理类能力禁止进入自动审批白名单）。
+- 新增 `stackflowos/autonomy/`：`models.py`（Finding/DispatchHint/PatrolReport/
+  fingerprint）、`service.py`（loop/状态/`run_patrol`/`status`/`configure`）、
+  `patrol.py`、`dispatcher.py`、`guardian.py`、`api.py`；`extensions.py` 注册为第
+  15 个扩展，挂 `app.autonomy`，贡献 `autonomy.0` 单元。
+
+### 12:00–13:30 四个工作流交付
+- patrol：12 项只读检查（hub/unit/project/health/task.idle/stalled/agent.failure/
+  approval.pending/denial/lease.orphan/failure burst），Snapshot+纯函数，
+  fingerprint 稳定，20 个测试。
+- guard：Dispatcher（off/tasks/agents、fingerprint 去重+冷却、小时配额、自治在岗
+  Agent 上限、每轮 5 动作、建任务/派工失败隔离、每 fingerprint 5 次尝试上限）；
+  Guardian（pending/agent-*、capability 白名单+硬拒绝、风险上限、项目/角色/在岗数、
+  workspace 路径且非 `.git`、shell 正则+cwd+控制符、域名、人类否决冷却、小时配额、
+  min_age；enforce 走 `decide_approval(mode=once, by=autonomy:guardian)`）；
+  62 个测试。
+- api：`GET /api/autonomy[/status]`、`POST /api/autonomy/patrol`、
+  `PATCH /api/autonomy/policy`，读需认证、写需 operator；16 个测试。
+- front：Dock「自治」应用（状态卡/发现/派工/审批/策略表单/倒计时/移动端），
+  `#autonomy` 深链，zh/en 632 键，13 个静态测试；截图 `docs/img/autonomy.png`。
+- Lead：操作员工具 `autonomy.status/patrol/configure`、CLI `sfo autonomy
+  status|patrol|set`、服务测试、配置测试、真实 App 闭环集成测试。
+
+### 13:30–14:05 集成、真实闭环与验收
+- 新增 `task.review`（review 无人处理 → 派 reviewer）与 `task.blocked`（报告，
+  不派工）检查，补 7 个测试；observe 建议事件按 request_id 去重，避免每轮刷屏。
+- **真实两小时无人值守闭环**（临时 state，mock LLM，17888）：753 轮巡检、0 错误、
+  4 次自主派工（architect/researcher/coder/tester），10 次代理审批（fs.write、
+  agent.spawn），项目 p-1 到 76%（2 done / 3 review / 1 blocked）。
+  重启加载新检查后再派 3 个 reviewer，t-1/t-3 评审完成；剩余阻塞项被
+  `task.blocked` 正确报告。截图 `docs/img/autonomy-live.png`（767 轮巡检、3 项待处理）。
+- 全量测试：**1307 passed, 2 skipped, 680 subtests passed**（94.5s）。
+- `compileall`、`git diff --check`、`node --check` 全过。
+- 提交：`303c3cf` 配置/数据形状/服务骨架；`dbe1b46` 操作员工具/CLI/测试；
+  `03443cb` patrol+dispatcher+guardian+API；`bbb59f9` 前端。
+- 残余：权限不足的 agent 被拒后若一直重试会消耗派工尝试（5 次后停）；
+  guardian 只按 (角色, capability) 尊重人类否决，未细化到具体路径/命令；
+  自治不自动完成项目（done 仍是人的动作）；单 hub 假设、配额重启可能轻微超限。

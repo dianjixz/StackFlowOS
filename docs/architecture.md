@@ -334,6 +334,8 @@ sys.booted / sys.ready / sys.shutdown / sys.config.updated
 unit.allocated / unit.registered / unit.online / unit.suspect / unit.offline
 unit.released / unit.quarantined / unit.restarted / unit.paused / unit.resumed
 unit.state_changed / unit.action / unit.probe / sys.standby.promoted
+autonomy.patrol.started / autonomy.patrol.completed / autonomy.finding
+autonomy.dispatched / autonomy.approval / autonomy.policy.changed / autonomy.error
 lease.acquired / lease.renewed / lease.released / lease.expired / lease.preempted
 project.created / project.updated / project.archived / project.progress / project.degraded / project.completed
 project.deleted / project.delete.completed / project.archive.completed / project.purge.failed
@@ -359,6 +361,31 @@ memory.updated / demo.seeded
 
 事件 `data` 必须自包含：UI 不查库也能渲染一张卡片。
 金额/路径/命令等敏感预览放在 `preview` 字段，UI 原样展示。
+
+---
+
+### 5.8 自治中枢（autonomy）
+
+`autonomy.0` 是一个 hub 内服务单元，也是扩展（`extensions.py` 中的
+`stackflowos.autonomy`）。它把"人发现→人派工→人审批"改成受策略约束的循环：
+
+1. **巡检**：`patrol.collect_snapshot(app)` 收集一次状态，`run_checks` 纯函数
+   产出 `Finding`（只读，不写项目/任务/审批）；报告与历史写
+   `state/autonomy.json`，新出现的 warn/critical 才发 `autonomy.finding`。
+2. **派工**：`dispatcher.Dispatcher` 只处理带 `DispatchHint` 的 finding；
+   同 fingerprint 冷却、同任务不重派、小时配额、自治在岗 Agent 上限、每轮最多
+   5 个动作；建任务 `created_by=autonomy:governor` 且描述带
+   `[autonomy:<fingerprint>]`；spawn 复用 `App.spawn_agent`。
+3. **代理审批**：`guardian.Guardian` 对 pending 请求逐条评估，全部围栏
+   （capability 白名单、硬拒绝集合、风险上限、项目/角色、workspace 路径、
+   shell 正则/域名白名单、人类否决冷却、小时配额）满足才调用
+   `App.decide_approval(mode="once", by="autonomy:guardian")`；`observe`
+   模式只记录建议。
+
+三个开关独立且默认关闭：`autonomy.enabled`（总闸）、`dispatch_mode`
+（off/tasks/agents）、`approve_mode`（off/observe/enforce）。配置热更新通过
+`on_config` 重建循环；`enabled=false` 立即停止下一轮。状态文件由 hub 锁保证
+单写者，冷备接管时恢复。完整围栏与限制见 `docs/autonomy.md`。
 
 ---
 
@@ -695,6 +722,9 @@ loopback 地址，除非显式设置 `web.allow_remote = true`（CLI 对应
 | POST | `/api/agents/{id}/chat/cancel` | 停止当前轮并拒绝该轮的待审批 |
 | DELETE | `/api/agents/{id}/chat` | 清空该 Agent 的线程 |
 | GET/PATCH | `/api/config` | 系统设置 |
+| GET | `/api/autonomy`、`/api/autonomy/status` | 自治：策略/计数/findings/报告/历史/派工与审批记录 |
+| POST | `/api/autonomy/patrol` | `{dry_run?}` 立即巡一轮（operator） |
+| PATCH | `/api/autonomy/policy` | 局部自治策略，校验+持久化+热生效（operator） |
 | GET | `/api/console` | 审计/事件（按类型过滤） |
 | POST | `/api/system/complete/{project_id}` | 人工确认项目完成 |
 
@@ -706,7 +736,7 @@ SSE 帧：`data: <EventRecord JSON>\n\n`；每 15s 一行 `: ping\n\n`。
 * **状态栏**：系统名、host、在线单元数、租约数、待审批徽标、时钟。
 * **主界面**：左侧/主区 **对话框**（首屏就是能说话），
   右侧/下区 **工作面板**（项目卡片、Agent 花名册、实时事件）。
-* **Dock**：项目、Agent、单元、审批、事件、设置。
+* **Dock**：项目、Agent、单元、审批、自治、事件、设置。
 * **App 窗口**：从底部升起的面板；可关闭、可切换。
 * **项目卡片**：名称、状态、进度环、当前任务、在岗工人、最近活动、待审批数。
   点击进入详情：任务看板（todo/doing/review/done）、产物、Agent、事件、里程碑。
@@ -737,6 +767,14 @@ SSE 帧：`data: <EventRecord JSON>\n\n`；每 15s 一行 `: ping\n\n`。
 * `llm`：`stream/rpm/tpm/max_concurrency/max_context_tokens/project_token_budget/
   fallback[]/routes[]/retries/retry_backoff_s`
 * `agents`：`task_timeout_s/max_tool_calls_per_task/queue_max/config_reload_s`
+* `autonomy`：`enabled/interval_s/on_start/report_keep/task_idle_s/
+  approval_age_s/failure_window_s/failure_threshold/dispatch_mode/
+  dispatch_max_agents/dispatch_max_tasks_per_hour/dispatch_max_spawns_per_hour/
+  dispatch_cooldown_s/approve_mode/approve_risk_max/approve_capabilities[]/
+  approve_projects[]/approve_roles[]/approve_max_per_hour/approve_min_age_s/
+  approve_deny_cooldown_s/approve_max_agents_per_project/approve_shell/
+  approve_shell_patterns[]/approve_domains[]`（默认全关；硬件拒绝删除/系统/项目
+  管理类能力进入自动审批白名单）
 * `skills`、`plugins`、`mcp`、`observability`、`storage`、`cluster`
 * `/api/config` 对 `api_key/token/secret/password/authorization` 等返回 `***`；
   PATCH 回传 `***` 时由 `Config.apply` 还原为当前值，不会把掩码写盘。
@@ -850,7 +888,7 @@ import 下列模块并调用 `build(app)`：
 
 ```
 capabilities → skills → plugins → mcp → units.control → ai.llm_api →
-agents.extension → security.sessions → security.control →
+agents.extension → autonomy → security.sessions → security.control →
 observability.metrics → observability.notifications → observability.backup →
 transport.discovery → cluster.standby
 ```
@@ -892,6 +930,11 @@ Set-Cookie）；请求认证角色通过 `web/api.py::current_auth()` 读取，�
   可选 pyzmq bridge；`deploy/` 提供容器/systemd。
 * **可观测性**（`observability/`）：Prometheus `/api/metrics`、webhook 通知、
   tar.gz 备份/安全恢复/事件导出、日志 RotatingFileHandler。
+* **自治**（`autonomy/`）：`autonomy.0` 周期巡检（只读 findings）→ 配额/冷却内
+  建任务与派工 → 在人类预授权围栏内逐条代理审批（`mode=once`，
+  `decided_by="autonomy:guardian"`）。总闸 `enabled`、派工/审批各自独立模式；
+  默认全关，删除/系统/项目管理类能力永不自动批准；状态在
+  `state/autonomy.json`，每一步写 `autonomy.*` 事件。详见 `docs/autonomy.md`。
 
 完整 API 与残余风险：`docs/team-plan.md`、`docs/review-response.md`、
 `docs/team/*.md`。

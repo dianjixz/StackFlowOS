@@ -163,6 +163,26 @@ class AutonomyServiceTests(unittest.IsolatedAsyncioTestCase):
             types=["autonomy.finding"], limit=50)]
         self.assertEqual(types, [])
 
+    async def test_observe_events_are_deduplicated(self) -> None:
+        await self.service.configure({
+            "enabled": True, "on_start": False, "interval_s": 600,
+            "dispatch_mode": "off", "approve_mode": "observe",
+        })
+        record = {
+            "request_id": "apr-observe-1", "decision": "observe",
+            "capability": "fs.write", "principal": "agent-coder-1",
+            "risk": "medium", "reason": "would allow", "ts": 1,
+        }
+        with patch("stackflowos.autonomy.guardian.Guardian") as guardian:
+            guardian.return_value.apply = _async([dict(record)])
+            await self._patrol([], dry_run=False)
+            await self._patrol([], dry_run=False)
+        events = [item for item in self.app.eventlog.query(
+            types=["autonomy.approval"], limit=50)]
+        self.assertEqual(len(events), 1,
+                         "observe recommendation must be announced once")
+        await self.service.configure({"enabled": False})
+
     async def test_configure_persists_and_reconciles_loop(self) -> None:
         await self.service.configure({
             "enabled": True, "on_start": False, "interval_s": 600,

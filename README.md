@@ -15,6 +15,8 @@
   改配置、归档/删除项目），每次动作写入 `operator.action` 审计；工人仍受审批约束
 - **每个 Agent 也能单独对话**：在「Agent」里点成员进入 `#agent/<id>`，用它的角色、
   项目工作区和工具直接干活；一个对话线程按 Agent 持久保存，流式回复与工具调用可见
+- **自治闭环（默认关闭）**：`autonomy.0` 周期性自己巡检系统，把发现转成任务/派工，
+  并在人预先划定的能力/风险/项目/配额围栏内代理审批；每一步写事件，可一键急停
 
 > 设计与判断的完整推导见 [docs/vision.md](docs/vision.md)，
 > 实现契约见 [docs/architecture.md](docs/architecture.md)，
@@ -64,6 +66,7 @@ python3 -m stackflowos status --token "$SFO_WEB_TOKEN"
 | Agent | 花名册、按角色派工、终止；**点成员进入对话**（角色工具 + 项目现场 + 流式工具卡片） |
 | 单元 | 进程表：work_id、地址、状态、能力、心跳 |
 | 审批 | 待审批队列（风险 / 范围 / 预览 / TTL）、放行规则编辑器、审计 |
+| 自治 | 巡检发现、自主派工记录、代理审批理由；开关 / 模式 / 配额 / 能力白名单 |
 | 事件 | 全量事件流（可过滤、可展开原始 JSON） |
 | 设置 | 常规 / 网络 / AI / 安全 / 存储 / 关于 |
 
@@ -280,6 +283,38 @@ Agent/单元/审批/规则/配置/租约/项目文件都能直接操作，不再
 碰宿主 shell，且每次调用都写入不可变的 `operator.action` 事件。工人 Agent 不共享
 这个特权，仍走审批。
 
+### 自治闭环（巡检 / 派工 / 代理审批）
+
+系统里常驻一个 `autonomy.0` 单元。打开后它做三件事，形成一个闭环：
+
+1. **巡检**：周期收集 health/单元/项目/任务/Agent/审批/租约/事件，用一组只读检查
+   产出 findings（任务闲置、审批积压、单元失联、失败突发、项目未入住……）；
+   只对新出现的问题写 `autonomy.finding`，不刷屏。
+2. **派工**：带 `DispatchHint` 的 finding 在配额与冷却内变成任务 / 工人——
+   空项目拉 lead，闲置 todo 任务拉对应角色；同 fingerprint 不重复、同任务不重派。
+3. **代理审批**：在**人预先划定的围栏**内（能力白名单、风险上限、项目/角色过滤、
+   路径必须在 workspace、每小时上限、人类否决冷却）以 `autonomy:guardian` 身份
+   逐条放行 pending 审批，写 `approval.decided` + `autonomy.approval`。
+   删除文件、杀进程、改配置/规则、项目管理**永远**需要人。
+
+```json
+{"autonomy": {"enabled": true, "dispatch_mode": "agents",
+              "approve_mode": "enforce", "approve_risk_max": "medium",
+              "approve_capabilities": ["fs.write", "agent.spawn"]}}
+```
+
+三个开关互相独立：`enabled` 是总闸，`dispatch_mode=off|tasks|agents`，
+`approve_mode=off|observe|enforce`。**默认全关**；建议先 `observe` 看它"会怎么批"，
+再打开 `enforce`。`shell.exec` 默认不自动放行，需要人写下命令正则白名单并显式
+`approve_shell=true`；`net.fetch` 需要域名白名单。
+
+GUI 的「自治」应用显示 findings、派工记录、每条审批理由，并提供开关/模式/配额/
+能力白名单；`sfo autonomy status|patrol|set` 是同一控制面的 CLI；
+`POST /api/autonomy/patrol` 可立即巡一轮，`PATCH /api/autonomy/policy` 改策略。
+完整检查表、围栏与残余风险见 [docs/autonomy.md](docs/autonomy.md)。
+
+![自治应用（真实运行：巡检发现、自主派工、代理审批）](docs/img/autonomy-live.png)
+
 ### Agent 角色
 
 | 角色 | 生命周期 | 职责 |
@@ -346,6 +381,10 @@ Agent 的工具调用一律经过 `ToolExecutor`：
   "agents": { "heartbeat_s": 2.0, "offline_after_s": 8.0, "max_workers": 6,
               "task_timeout_s": 1800, "max_tool_calls_per_task": 200,
               "queue_max": 64, "config_reload_s": 10 },
+  "autonomy": { "enabled": false, "interval_s": 120,
+                "dispatch_mode": "off", "approve_mode": "off",
+                "approve_risk_max": "medium",
+                "approve_capabilities": ["fs.write", "agent.spawn"] },
   "skills": { "dirs": ["skills"], "enabled": [], "inject_max_chars": 8000 },
   "plugins": { "dirs": ["plugins"], "enabled": [] },
   "mcp": { "servers": [], "call_timeout_s": 30 },
@@ -458,6 +497,7 @@ stackflowos project scaffold <id>            # 只补 workspace 骨架
 stackflowos events [--project P] [--agent ID] [--source S] [--types T]
                    [--since-ts MS] [--until-ts MS] [--limit N] [--json]
 stackflowos status   [--url https://127.0.0.1:17800] [--token <launch token>]
+stackflowos autonomy status|patrol [--dry-run]|set   # 自治闭环控制面（HTTP）
 stackflowos url      [--status] [--json]        # control socket 铸造登录 URL
 stackflowos backup | restore ARCHIVE [--force] | export-events | backup-status
 stackflowos storage-migrate [--dry-run]

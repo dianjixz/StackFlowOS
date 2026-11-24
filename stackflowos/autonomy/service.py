@@ -56,6 +56,11 @@ def _blank_state() -> dict:
         "history": [],
         "dispatch": {},
         "approvals": [],
+        #: ``request_id -> ts`` for observe-mode approvals already announced.
+        #: Without this an observe-mode patrol would re-emit the same
+        #: recommendation every interval (the guardian intentionally returns
+        #: one record per still-pending request).
+        "observed": {},
         "rate": {"tasks": [], "spawns": [], "approvals": []},
     }
 
@@ -513,6 +518,11 @@ class AutonomyService:
             if isinstance(approvals, list):
                 state["approvals"] = [row for row in approvals
                                       if isinstance(row, dict)]
+            observed = raw.get("observed")
+            if isinstance(observed, dict):
+                state["observed"] = {
+                    str(key): int(value) for key, value in observed.items()
+                    if isinstance(value, (int, float))}
             rate = raw.get("rate")
             if isinstance(rate, dict):
                 for key in state["rate"]:
@@ -559,6 +569,12 @@ class AutonomyService:
             self._state["dispatch"] = dict(newest)
         approvals = self._state.get("approvals") or []
         self._state["approvals"] = approvals[-_MAX_APPROVAL_RECORDS:]
+        observed = self._state.get("observed")
+        if isinstance(observed, dict) and len(observed) > 200:
+            newest = sorted(observed.items(),
+                            key=lambda item: int(item[1] or 0),
+                            reverse=True)[:200]
+            self._state["observed"] = dict(newest)
         cutoff = now_ms() - 3600 * 1000
         rate = self._state.get("rate") or {}
         for key in ("tasks", "spawns", "approvals"):
@@ -608,8 +624,19 @@ class AutonomyService:
         for record in report.approvals:
             if emitted >= _MAX_ACTION_EVENTS:
                 break
-            if str(record.get("decision")) == "skip":
+            decision = str(record.get("decision"))
+            if decision == "skip":
                 continue
+            if decision == "observe":
+                # Announce each observe-mode recommendation once; the record
+                # itself stays in the report/state (the UI still shows the
+                # current state without an event every interval).
+                request_id = str(record.get("request_id") or "")
+                observed = self._state.setdefault("observed", {})
+                if request_id and request_id in observed:
+                    continue
+                if request_id:
+                    observed[request_id] = int(record.get("ts") or now_ms())
             self._emit("autonomy.approval", {
                 **record, "seq": report.seq,
             }, project_id=record.get("project_id"))
