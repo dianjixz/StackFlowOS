@@ -230,7 +230,10 @@ systemctl --user restart stackflowos-hub
 - [ ] 事件/审批通知：`observability.webhooks` 配置 IM/告警 webhook；
       `observability.notify_events` 控制转发类型。
 - [ ] 监控：Prometheus 抓取 `GET /api/metrics`（需 Bearer token；文本格式）。
-- [ ] 定时 `sfo backup`，并把 `state/backups/` 复制到异地；备份含 config（0600）。
+      `sfo_http_requests_total` 只统计经过 API 路由的 `/api/*`；`/healthz`、静态资源
+      和 SSE 建连不计（在线 SSE 看 `sfo_sse_clients`）。
+- [ ] 定时 `sfo backup`，并把 `state/backups/` 复制到异地；备份含 config（默认脱敏
+      secret 字段，归档 0600）。
 - [ ] sys RPC/端口池只对受信网段开放。
 - [ ] 项目工作区所在磁盘单独做配额/快照；Agent 的产物都在那里。
 - [ ] 定期审阅「审批 → 规则」：`always` 规则等于长期授权，应设过期时间。

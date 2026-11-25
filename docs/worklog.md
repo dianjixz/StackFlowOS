@@ -173,3 +173,61 @@
 - 截图全部更新：`docs/img/{home,projects,project,agents,agent-chat,units,approvals,
   events,autonomy,settings,mobile,agent-chat-mobile}.png`。
 - 运行注意：live hub 需要重启一次才会下发新的 CSP 头（静态文件已即时生效）。
+
+## 2026-11-26
+
+### 01:50–02:15 文档一致性：修正 self-hosting/dist，新增 known-limitations
+- 按审计第 9 节逐条 `grep` 读代码复核，不照抄审计文字。`docs/self-hosting.md` §5
+  四条过期表述改写：沙箱可选（`security/sandbox.py`、`agents/sandbox.py`，默认
+  `off`、Landlock 只管写/TCP、bwrap 可降级 unsandboxed）；设备发现可选
+  （`transport/discovery.py::build`/`discover_hubs`，`cluster.discovery=mdns`）；
+  事件流有 gzip 轮转/跨归档回放（`l2/eventlog.py`）；`attached-rw` 可用
+  `security.workspace_git` 做每任务分支（`agents/workspace_git.py`，默认关）。
+  单 hub 补充"冷备只等 `run/hub.lock`、无选主/复制/分片"。
+- `docs/team/dist.md` §9.7/§9.11 改为"已接线"：`App._lease_acquire` 调
+  `validate_resource_scope`，`App.health()` 聚合 eventlog/leases/extensions；
+  附 `tests/test_dist_leases.py`、`tests/test_dist_health.py` 回归路径。
+- 新增 `docs/known-limitations.md`：10 条确认保留的架构限制，每条含
+  **限制/影响/现状证据（路径::符号）/缓解/是否计划内**；覆盖单 hub 冷备、同 uid
+  非容器沙箱、审批/插件同进程与 permissions 不强制、内存会话/重启重登/长期
+  Bearer、JSON 无事务+不双写+fencing 尽力而为+租约 TTL+fencing、备份非一致快照
+  （config.json 默认脱敏、`include_secrets` 可选）、delta 临时不可回放、无 OTel/
+  指标重启归零/通知尽力而为、测试 skip 缺口、前端 i18n/单草稿/固定依赖图/移动端。
+- 链接：README「边界与已知限制」、self-hosting §5、dist.md §9 均指向
+  `known-limitations.md`；`docs/operations.md` §6 补 `sfo_http_requests_total` 只
+  统计经过 API 路由的 `/api/*` 的口径；`docs/team/ops.md` §4/§9.8 同步备份
+  config.json 默认脱敏的行为。
+- 未改任何 `.py`/`.toml`/`tests/`；未 `git add`/`git commit`。
+
+### 02:15–02:25 审计九节问题修复：7 个工作流并行交付与集成门禁
+- 把审计拆成 7 个共享任务（W1 LLM / W2 Web 与可观测性 / W3 安全沙箱与备份 / W4 文档 /
+  W5 存储一致性 / W6 测试与打包 / W7 编排），7 个 subagent 并行、写作用域互斥、全部不
+  commit，由 lead 统一集成。
+- W1：worker 启动绑定共享 state_dir，worker 的 LLM usage/成本/预算在主状态可见（文件桥接
+  写前 refresh）；主 `LLMCfg` 增 `price_per_1k_input/output`、`circuit_threshold/circuit_cooldown_s`
+  （默认 0/3/30，行为不变）；预算/裁剪/截断统一 `estimate_tokens`；流式已输出后失败抛
+  `StreamInterrupted` 且不再 failover 重放（`tests/test_llm_usage_bridge.py` 14 例）。
+- W2：`/api/units?include=brief|descriptor` 生效（未知值 400）；列表与 summary 同源控制面
+  有效状态并带 `state_source/staleness`；operator 拒绝 403；`sfo_agent_queue_depth` 无来源为
+  -1 + `sfo_agent_queue_known`；skills/capabilities 支持 limit/offset；HTTP 计数口径写进 HELP。
+- W3：沙箱能力矩阵 + 启动审计（不可用降级 UNSANDBOXED 告警/事件；本机实测 Landlock 可用
+  abi=8）；备份 `config.json` 默认脱敏、`include_secrets` 显式明文、restore 回填；插件高危
+  permissions 加载审计；审批超时 `approval.timeout` + 有界升级队列。
+- W4：self-hosting §5、team/dist §9.7/§9.11 按代码改写；新增 `docs/known-limitations.md`
+  10 条；README/operations/ops.md 同步。
+- W5：fencing 落盘失败计数进 health/metrics；`storage.consistency.verify_divergence` 只读
+  分叉检查 + CLI；transient（`*.delta`）回放显式跳过并计数；migrate dry-run 不再建空库。
+- W6：dev extras=pytest+pytest-subtests、`[tool.pytest.ini_options]`；`tests/conftest.py`
+  tmp/socket helper（>100 字节 skip 带原因）；`scripts/test-report.sh` 跳过汇总。
+- W7：`App.start()` 末尾 `supervisor.resume_queue()`，重启后已持久化排队任务主动 drain +
+  `agent.queue_restored`；`rollback(ref, force=False)` 对 dirty 工作区默认拒绝
+  （`GIT_WORKSPACE_DIRTY`），force 时 stash 到 `refs/sfo-rollback-stash/*`。
+- Lead 集成补线：`agents/git_api.py` 转发 `force` 并把 dirty 映射为 409 + 结构化 detail；
+  `hotreload.LLM_RUNTIME_FIELDS` 增收价/熔断字段；`observability/metrics.py` 增
+  `sfo_lease_fencing_persist_failures_total`、`sfo_eventlog_replay_skipped_transient_total`；
+  `sfo backup --include-secrets`。
+- 全量门禁：`/tmp/sfo-venv/bin/python -m pytest -q` → **1388 passed, 3 skipped, 680 subtests**
+  （98.9s；3 skip 为真实组播 / pyzmq / 本解释器缺 pytest-subtests）。
+- 未修、已记录：单 hub 无选主/复制/分片、worker 同 uid 非容器、审批/插件同进程、JSON 无
+  事务与不双写、无 OTel、跨主机 worker usage 桥、units drain 无在途计数。见
+  `docs/known-limitations.md`。

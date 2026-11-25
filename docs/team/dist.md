@@ -309,15 +309,28 @@ python -m stackflowos.transport.zmq_bridge \
 
 ## 9. 残余风险 / 后续
 
+> 更完整的架构限制清单（影响/缓解/是否计划内）见
+> [docs/known-limitations.md](../known-limitations.md)。本节保留 DIST 交付时的细节。
+
 1. **轮转时延**：压缩整个活动文件期间持有 `EventLog._lock`，append 会短暂阻塞；默认阈值 64MB（config）时可能几十~几百 ms。本轮接受（轮转低频），如需零停顿可改为 rename + 后台压缩，但会引入"归档未就绪"的读窗口（已用 seq 去重兜底）。
 2. **gz 查询需整包解压**：单个归档大小有上限（轮转阈值），内存可控；但极端阈值下 query 会一次性读入该归档。
 3. **旧格式保留**：显式 `rotate_bytes=` 的调用（含两个旧测试）继续产生未压缩 `events-*.jsonl` 且不修剪。若 Lead 希望统一压缩格式，需要同步改旧测试；本轮选择不破坏基线。
 4. **`rotate_keep=0`**：轮转后立即删除归档，等于只保留内存窗口与活动文件；`since(0)` 无法回放已删历史，属预期配置风险。
 5. **SQLite 切换不是自动双写**：必须显式迁移；JSON/SQLite 两份历史可能分叉。fencing/counters 在 backend 写入失败时回退 JSON 文件（会打 WARNING），此时两种存储可能不一致。
 6. **fencing 持久化是 best-effort**：磁盘只读/满时 token 仍递增但不落盘，重启可能重复；`health().fencing.persisted=false` 可监控。
-7. **租约 RPC 尚未接线**：`validate_resource_scope`、token 校验、`App.health` 两行都在本文 §3.3 给出；在 Lead 接线前，RPC 层行为与旧版一致（不能跨项目访问的保护尚未生效）。
+7. **租约 RPC 已接线（原文“尚未接线”已过时）**：`App._lease_acquire` 在调用
+   `LeaseManager.acquire` 之前执行 `validate_resource_scope`
+   （`stackflowos/app.py::App._lease_acquire`），普通 unit principal 只能租自己项目的
+   `project:<id>[:suffix]`，跨项目返回 `Denied`；operator 与进程内路径保留全局命名
+   空间。测试见 `tests/test_dist_leases.py`（`validate_resource_scope` 各形态）与 RPC
+   层回归。§9.6 的 fencing 持久化 best-effort 仍然成立。
 8. **mDNS 未做真实组播 CI**：编码/状态机有单测，真实环境（容器无组播、5353 被 avahi 占用、防火墙）只做了失败隔离；`discover_hubs` 失败静默返回 `[]`，调用方必须有显式地址回退。TXT 无签名/无认证，仅用于链路本地发现，不要放敏感信息。
 9. **ZMQ 桥未在装有 pyzmq 的环境实测**（本机无 pyzmq）：协议转换逻辑复用了 `RpcClient/EventPublisher/EventSubscriber` 的既有语义，但真实 socket 组合、关闭顺序需在装有 pyzmq 的机器上做一次 smoke test。
 10. **ProjectStore 续用 JSON**：projects/tasks 域未事务化；高并发多 hub 场景仍会损坏状态。冷备必须保证同一时刻只有一个 writer。
-11. **health 顶层聚合未接线**：eventlog/leases 的 health 方法已实现并测试，`/api/health` 顶层需要 §3.3(4) 的两行；discovery 已作为扩展自动出现。
+11. **health 顶层聚合已接线（原文“未接线”已过时）**：`App.health()` 逐个调用
+    `eventlog.health()` / `leases.health()`，合并 `extensions.health()` 后返回；
+    `/api/health` 路由在 `stackflowos/web/api.py` 注册。任一服务没有 `health` 方法
+    时该键跳过，抛错时降级为 `{"ok": false}`，不影响整体探针；discovery 作为
+    extension 自动出现在 `extensions.discovery`。测试见
+    `tests/test_dist_health.py::AppHealthTests`。
 12. **`storage.sqlite_path` 为空**时默认 `<state>/state/stackflowos.db`；若状态目录在只读介质，EventLog/MemoryStore 会自动建库失败 → SQLite 初始化异常会向上抛，部署时要保证目录可写（默认 `/data`）。

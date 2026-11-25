@@ -13,7 +13,10 @@ authors = [{ name = "StackFlowOS" }]
 dependencies = ["pynng>=0.9.0"]
 
 [project.optional-dependencies]
-dev = []
+# Test tooling only: pytest runs the suite; pytest-subtests reports the
+# `unittest.TestCase.subTest` assertions the suite relies on as individual
+# subtests (pytest alone still executes them, it just aggregates the output).
+dev = ["pytest>=8.0", "pytest-subtests>=0.12"]
 
 [project.scripts]
 stackflowos = "stackflowos.cli:main"
@@ -24,3 +27,9 @@ include = ["stackflowos*"]
 
 [tool.setuptools.package-data]
 stackflowos = ["webassets/**/*"]
+
+[tool.pytest.ini_options]
+# `scripts/test-report.sh` adds --junitxml/-q; -rs keeps skip reasons visible
+# for plain `pytest` runs too, so untested optional paths are never invisible.
+testpaths = ["tests"]
+addopts = "-rs"

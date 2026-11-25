@@ -271,14 +271,57 @@ kill %1 %2 2>/dev/null; rm -rf /tmp/demo-repo
 
 ## 5. 已知限制
 
-1. **工人 Agent 是可信的**：系统没有在沙箱层面强制隔离进程，规则与审批是「协作式」约束。恶意或幻觉的工人可能尝试越界，依赖审批与事件审计兜底，而不是内核隔离。
-2. **单 hub**：只有一个中心 hub，没有多 hub 复制或 leader 选举；hub 是单点，重启期间调度暂停。
-3. **无设备发现**：worker 必须手动配置 hub 地址（`--hub http://...`），没有 mDNS/注册中心自动发现。
-4. **租约只有 TTL**：没有强一致的分布式锁，时钟偏移大时可能出现短暂双持有。
-5. **事件流是有界内存/单文件追加**：没有内建长期归档与分页压缩，事件量大时需要外部日志系统。
-6. **审批依赖人在环**：操作员长时间不在线时，高风险任务会停在等待审批状态（超时视为拒绝）。
-7. **`attached-rw` 直连真实仓库**：Agent 的写入没有 git 分支隔离，误写会直接落到工作区，建议先提交或用独立 clone。
-8. **端到端接口以上面路径为准**：若本仓库路由有调整，以 `src/` 中的实际注册为准，命令需同步更新。
+> 本节在 2026-11-26 按仓库当前代码复核。逐条证据、影响、缓解和是否计划内见
+> [known-limitations.md](known-limitations.md)；本节只做摘要。旧版本曾写"没有沙箱 /
+> 无设备发现 / 无事件归档 / attached-rw 无 git 分支隔离"——那是这些能力落地前的
+> 状态，现已按当前实现更正（沙箱可选、发现可选、事件流有轮转归档、分支隔离是
+> `security.workspace_git` 可选项）。
+
+1. **工人 Agent 仍是同一 OS 用户的进程（沙箱可选、默认关闭）**：`security.sandbox`
+   默认 `off`；开启后 worker 进程用 Landlock 把写限制到 workspace/tmp/logs，`shell.exec`
+   也会按 `security.sandbox` 包裹（`stackflowos/agents/sandbox.py::apply_process_sandbox`
+   /`::wrap_shell_command`）。但它不是容器：Landlock 只管文件写 + ABI≥4 的 TCP，
+   不管 UDP/信号/`/proc`；bwrap 依赖非特权 user namespace，探测失败会明确降级
+   `unsandboxed`（`stackflowos/security/sandbox.py::detect_bwrap`/`::build_command`），
+   且只有 Linux 有后端（`::detect_landlock`）。同 uid 下 worker 仍可读状态目录、
+   发信号。启动审计会写 `sandbox.capabilities`/`sandbox.unsandboxed` 事件
+   （`::audit_startup`）。
+2. **单 hub（有冷备，无选主/复制/分片）**：`cluster.standby=true` 只是同状态目录的
+   第二进程轮询 `run/hub.lock` 接管（`stackflowos/app.py::App._acquire_hub_lock`）；
+   active hub 退出后接管，但 active 只是挂起（SIGSTOP/VM freeze/网络分区）时无法
+   判定死亡；没有 quorum、日志复制、leader 选举或分片。
+3. **设备发现是可选扩展，默认关闭**：`cluster.discovery=mdns` 时 hub 在本地链路广播
+   `_stackflowos._tcp.local` 并提供 `GET /api/discovery/peers`
+   （`stackflowos/transport/discovery.py::build`）；`discover_hubs()` 是库级浏览接口，
+   worker 接入仍用显式地址（`stackflowos attach --sys ...`）。组播不可用（容器/无
+   路由/5353 被占）只记 health/日志，不阻塞 hub；真实组播 I/O 默认不在测试里跑
+   （`SFO_TEST_MDNS=1` 才跑）。
+4. **租约是 TTL + fencing，不是分布式锁**：`LeaseManager` 是 hub 进程内表
+   （`stackflowos/l2/leases.py::LeaseManager`），同一资源单持有、TTL + 时钟偏移容忍、
+   可抢占；fencing token 单调递增且尽力持久化（写盘失败时
+   `health()["fencing"]["persisted"]=false`，重启后可能重发 token）。RPC 入口已接线：
+   `App._lease_acquire` 在 acquire 前调用 `validate_resource_scope`
+   （`stackflowos/app.py::App._lease_acquire`），普通 worker 不能拿别的项目的
+   `project:<id>` 租约；操作员与进程内路径保留全局命名空间。没有跨 hub 共识。
+5. **事件流有界并会轮转归档，但归档不是长期数据仓库**：EventLog 单文件追加，超过
+   `storage.eventlog_rotate_bytes`（默认 64MB）gzip 轮转、保留
+   `eventlog_rotate_keep`（默认 5）个归档（`stackflowos/l2/eventlog.py::EventLog`）；
+   跨归档 `since`/query 自动回放；超出保留窗口的归档会被修剪，流式 delta 不落盘
+   （`EventLog.EPHEMERAL_TYPES`/`is_transient`）。长期审计用
+   `sfo export-events` 或外部日志系统；SQLite 后端可替代 JSONL（见
+   [operations.md](operations.md) §7）。
+6. **审批依赖人在环**：操作员长时间不在线时，高风险任务会停在等待审批状态，超时
+   视为拒绝（`stackflowos/security/approvals.py::ApprovalBroker`）；自动批准规则
+   需要显式配置。
+7. **`attached-rw` 直写真实仓库，分支隔离是可选项**：`security.workspace_git=true`
+   时（仅 `attached-rw` 工作区）每个任务从当前分支建 `task/<project>-<task>` 并在
+   任务结束提交，`/api/projects/{id}/git` 查看、`.../git/rollback` 回滚
+   （`stackflowos/agents/workspace_git.py`；runner 接线见
+   `stackflowos/agents/runner.py::_git_begin`）；默认 `false`，写入直接落到工作区。
+   开启该选项时，`WorkspaceGit.ensure_repo()` 会拒绝把嵌套在更大 git 仓库里的子目录
+   当成 workspace root 去操作外层仓库。建议先提交或用独立 clone。
+8. **端到端接口以上面路径为准**：若本仓库路由有调整，以 `stackflowos/web/api.py`
+   中的实际注册为准，命令需同步更新。
 
 ---
 

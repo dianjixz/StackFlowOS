@@ -259,7 +259,7 @@ config 可能含密钥）；目录 0700。内容：
 manifest.json                  # format=sfo-backup, version=1, app_version,
                                # created_at/ISO, includes/excluded, skipped,
                                # counts, files{arcname:{size,sha256,mtime}}
-config.json                    # 存在才打包
+config.json                    # 存在才打包（默认脱敏 secret 字段；include_secrets=True 才原样）
 state/...                      # projects/counters/rules/approvals/agents/chat/memory...
 projects/<id>/workspace/...    # Agent 产物
 events/...                     # events.jsonl + 轮转文件
@@ -276,6 +276,13 @@ N 个，按 mtime 修剪。
 **一致性**：hub 运行中备份不做全局快照，文件可能在两次读之间变化。写入的字节与
 manifest 一致，但不同文件可能来自不同瞬间；需要严格一致时先停 hub 或低频写入。
 （manifest 不记录“正在写入”状态，`.json` 原子写 + 事件 append 单行通常可接受。）
+
+**config.json 脱敏**：`create_backup(..., include_secrets=False)` 是默认值，
+`api_key`/`token`/`secret`/`password` 等命中的字段整体写成 `***`；显式
+`create_backup(..., include_secrets=True)` 才原样打包（`sfo backup` 是否暴露该开关
+以 CLI 当前实现为准）。restore 通过 `_restore_masked_secrets` 把 `***` 与目标机器
+现有配置合并：目标已有真实值的回填，没有的保持 `***`（需人工补齐），并在结果里
+统计 restored/missing。
 
 ### restore 安全
 
@@ -437,9 +444,10 @@ log handlers [('StreamHandler', None), ('RotatingFileHandler', 33554432)]
    应用 `seq` 去重。`to_thread` 线程不可取消，`stop()` 后可能有在途请求。
 7. 通知 payload **发送前就脱敏**（不只是日志/事件）：webhook 收不到 secret 字段；
    如果某个接收方确实需要原始值，应改为显式配置白名单（当前不支持，安全默认）。
-8. 备份包含 `config.json`（可能有 API key）与 `state`（规则/审批/记忆），因此归档
-   0600；请不要把 `backups/` 放到共享目录或提交到 git。备份不是一致性快照（hub
-   运行中可能跨瞬间），严格场景先停 hub。
+8. 备份包含 `config.json`（默认把 secret 字段脱敏为 `***`；`include_secrets=True`
+   才含明文）与 `state`（规则/审批/记忆），因此归档 0600；请不要把 `backups/` 放到
+   共享目录或提交到 git。备份不是一致性快照（hub 运行中可能跨瞬间），严格场景
+   先停 hub。
 9. 恢复的 manifest 校验保证归档自洽，但不等于“可信来源”：恶意但自洽的归档仍会
    被恢复；只从自己产生的备份恢复。
 10. `restore` 会替换整个 state 目录（包括项目工作区）；`force=True` 时已自动备份

@@ -3,6 +3,7 @@
 Temporary state lives in a short system temp directory (``SFO_TEST_TMPDIR``,
 default ``<tempdir>/sfo-tests``), never under the checkout: unix socket paths
 must fit in ``sockaddr_un``, so a deep checkout path would make IPC binds fail.
+The root and the path-length skip check come from :mod:`tests.conftest`.
 The allocator is exercised without starting any sockets except for the TCP
 probe binds.
 """
@@ -10,7 +11,6 @@ probe binds.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import socket
 import tempfile
@@ -19,21 +19,9 @@ from pathlib import Path
 
 from stackflowos.errors import Unavailable, ValidationError
 from stackflowos.transport.address import MAX_IPC_PATH_BYTES, AddressAllocator
+from tests.conftest import TMP_ROOT, require_ipc_dir
 
-TMP_ROOT = Path(os.environ.get("SFO_TEST_TMPDIR")
-                or Path(tempfile.gettempdir()) / "sfo-tests")
 WORK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+\.[0-9]+$")
-
-
-def _ipc_path_too_long(run_dir: Path) -> bool:
-    """Whether even a hashed IPC socket path would exceed the length limit.
-
-    Mirrors :meth:`AddressAllocator._ipc_path`: when ``run_dir`` is deep it
-    builds ``<run_dir>/<stem>-<12-char digest><suffix>`` with a one-char stem.
-    """
-    shortest_name = 1 + 1 + 12 + len(".events.sock")  # x-<digest><suffix>
-    return (len(str(run_dir).encode("utf-8")) + 1 + shortest_name
-            > MAX_IPC_PATH_BYTES)
 
 
 def _bindable(host: str, port: int) -> bool:
@@ -73,10 +61,7 @@ class AddressAllocatorTests(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------
     def skip_if_ipc_path_too_long(self, run_dir: Path) -> None:
-        if _ipc_path_too_long(run_dir):
-            self.skipTest(
-                "checkout path too long for unix sockets: "
-                f"{run_dir}")
+        require_ipc_dir(self, run_dir, label="run dir for unix sockets")
 
     def ipc(self, **kwargs) -> AddressAllocator:
         self.skip_if_ipc_path_too_long(self.run_dir)

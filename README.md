@@ -563,6 +563,10 @@ python3 -m pytest -q
 
 ## 边界与已知限制（诚实清单）
 
+> 每条的代码证据、影响、缓解和是否计划内见
+> [docs/known-limitations.md](docs/known-limitations.md)。本节是摘要，两者冲突时以
+> `known-limitations.md` 和代码为准。
+
 1. **单 hub（有冷备，无强一致）。** `cluster.standby` 是同状态目录第二进程，
    活动 hub 退出后接管；没有 quorum/复制/分片，切换期间短暂不可用。
 2. **设备发现可选但非必需。** `cluster.discovery=mdns` 提供标准库组播发现；
@@ -581,7 +585,7 @@ python3 -m pytest -q
 7. **pynng 不是 libzmq。** 与 StackFlow 的 ZMQ 不能直连；`transport/zmq_bridge.py`
    在安装 `pyzmq` 时可做桥接，未安装时明确报错。
 8. **仍待补的长期项**：审批拆进程、不受信插件子进程、projects/tasks 全量事务化、
-   OpenTelemetry 导出、worker LLM usage 汇总、多 hub 强一致。
+   OpenTelemetry 导出、多 hub 强一致。
 
 ---
 
