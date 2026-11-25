@@ -372,18 +372,23 @@ class AgentSupervisor:
         })
         return agent
 
-    def _schedule_drain(self) -> None:
-        """Start a background drain when a slot may have opened up."""
+    def _schedule_drain(self) -> bool:
+        """Start a background drain when a slot may have opened up.
+
+        Returns ``True`` when a drain task is running (or was just created), so
+        :meth:`resume_queue` can report whether the queue was really re-armed.
+        """
         if self._closing or not self.queue:
-            return
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - sync test call
-            return
+            return False
         if self._drain_task is not None and not self._drain_task.done():
-            return
+            return True
         self._drain_task = loop.create_task(self._drain_safe())
         self._drain_task.add_done_callback(self._drain_done)
+        return True
 
     def _drain_done(self, task: asyncio.Task) -> None:
         if self._drain_task is task:
@@ -444,6 +449,35 @@ class AgentSupervisor:
                 self._starting.discard(agent.id)
         self.save()
         return started
+
+    def resume_queue(self) -> dict:
+        """Re-arm the dispatch queue after a hub restart (boot hook).
+
+        :meth:`load` restores the persisted :class:`QueueEntry` rows but nothing
+        starts them: before this hook a parked spawn only moved when a *new*
+        spawn, a live config change or a finish/restart event touched the
+        supervisor, so a queue left behind by the previous process could wait
+        indefinitely.  Called once at boot by the hub, after ``agents.json`` is
+        loaded and the rest of the system is up.  When slots are free the drain
+        runs as a background task; otherwise the entries keep waiting for the
+        next slot release.  One ``agent.queue_restored`` event records what the
+        snapshot contained either way.
+        """
+        queued = len(self.queue)
+        available = max(0, self.max_workers - self._running_count())
+        scheduled = False
+        if queued and available > 0:
+            scheduled = self._schedule_drain()
+        if queued:
+            self._emit("agent.queue_restored", {
+                "queued": queued,
+                "available": available,
+                "max_workers": self.max_workers,
+                "scheduled": scheduled,
+                "queue_ids": [entry.id for entry in self.queue.entries()],
+            })
+        return {"queued": queued, "available": available,
+                "scheduled": scheduled}
 
     async def _allocate_and_launch(self, agent: Agent, *, role: str,
                                    project_id: str | None,

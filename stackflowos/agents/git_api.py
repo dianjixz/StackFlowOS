@@ -14,9 +14,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..errors import BadRequest, Denied, NotFound, SfoError
+from ..errors import BadRequest, Conflict, Denied, NotFound, SfoError
 from ..web.api import current_auth
-from .workspace_git import GitError, WorkspaceGit, git_available
+from .workspace_git import (
+    DirtyWorkspaceError,
+    GitError,
+    WorkspaceGit,
+    git_available,
+)
 
 
 def _ok(data: Any, status: int = 200) -> tuple[int, dict]:
@@ -121,8 +126,17 @@ class ProjectGitAPI:
         ref = str(payload.get("ref") or "").strip()
         if not ref:
             raise BadRequest("git ref is required")
+        # ``force`` snapshots tracked dirty work under refs/sfo-rollback-stash/*
+        # before the reset; without it a dirty workspace is refused (409) so an
+        # attached directory never loses uncommitted changes silently.
+        force = bool(payload.get("force"))
         try:
-            result = self._git(project).rollback(ref)
+            result = self._git(project).rollback(ref, force=force)
+        except DirtyWorkspaceError as exc:
+            raise Conflict(
+                str(exc), code=DirtyWorkspaceError.code,
+                detail={"changes": exc.changes, "hint": exc.hint},
+            ) from exc
         except GitError as exc:
             raise BadRequest(str(exc)) from exc
         result["project_id"] = str(getattr(project, "id", ""))
@@ -135,6 +149,8 @@ class ProjectGitAPI:
                     "commit": result["commit"],
                     "previous_head": result["previous_head"],
                     "backup_branch": result["backup_branch"],
+                    "force": force,
+                    "stash_ref": result.get("stash_ref", ""),
                 }, source="operator", project_id=result["project_id"])
         except Exception:  # pragma: no cover - audit is best effort
             log = self._log()

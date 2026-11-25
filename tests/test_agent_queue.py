@@ -264,6 +264,68 @@ class SupervisorQueueTests(_SupervisorHelpers, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(restored.stats()["running"], 1)
         await sup.kill(running.id)
 
+    # -- boot resume (audit §4: a restored queue must be drained) ---------
+    async def test_resume_queue_starts_persisted_entries_after_restart(
+            self) -> None:
+        sup = self._make(max_workers=1, queue_max=4)
+        running = await sup.spawn("coder", "p-1", task_id="t-1")
+        queued = await sup.spawn("tester", "p-1", task_id="t-2")
+        self.assertEqual(queued.status, "queued")
+        sup.save()
+
+        # The restarted hub has one more slot than the old one, so the queue
+        # restored from agents.json must start without any other trigger.
+        restored = self._make(max_workers=2, queue_max=4)
+        restored.load()
+        waiting = restored.get(queued.id)
+        self.assertEqual(waiting.status, "queued")
+        self.assertEqual(len(restored.queue), 1)
+
+        result = restored.resume_queue()
+        self.assertEqual(result, {"queued": 1, "available": 1,
+                                  "scheduled": True})
+        await self._wait_until(lambda: waiting.status != "queued")
+        self.assertEqual(waiting.status, "idle")
+        self.assertEqual(len(restored.queue), 0)
+        # Exactly one explicit boot event records what the snapshot held.
+        restored_events = self.eventlog.payload("agent.queue_restored")
+        self.assertEqual(len(restored_events), 1)
+        self.assertEqual(restored_events[0]["queued"], 1)
+        self.assertEqual(restored_events[0]["available"], 1)
+        self.assertTrue(restored_events[0]["scheduled"])
+        self.assertIn("agent.dequeued", self.eventlog.types())
+        self.assertEqual(running.status, "idle")
+
+    async def test_resume_queue_without_slot_waits_for_a_release(self) -> None:
+        sup = self._make(max_workers=1, queue_max=2)
+        running = await sup.spawn("coder", "p-1", task_id="t-1")
+        queued = await sup.spawn("tester", "p-1", task_id="t-2")
+        sup.save()
+
+        restored = self._make(max_workers=1, queue_max=2)
+        restored.load()
+        result = restored.resume_queue()
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(result["available"], 0)
+        self.assertFalse(result["scheduled"])
+        waiting = restored.get(queued.id)
+        self.assertEqual(waiting.status, "queued")
+        events = self.eventlog.payload("agent.queue_restored")
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]["scheduled"])
+
+        # The restored queue was not lost: the next slot release drains it.
+        restored.finish(restored.get(running.id).id, "done")
+        await self._wait_until(lambda: waiting.status != "queued")
+        self.assertEqual(waiting.status, "idle")
+
+    async def test_resume_queue_with_empty_queue_is_a_noop(self) -> None:
+        sup = self._make(max_workers=2)
+        result = sup.resume_queue()
+        self.assertEqual(result, {"queued": 0, "available": 2,
+                                  "scheduled": False})
+        self.assertNotIn("agent.queue_restored", self.eventlog.types())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

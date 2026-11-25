@@ -16,7 +16,7 @@ from stackflowos.agents.queue import QueueEntry
 from stackflowos.agents.supervisor import AgentSupervisor
 from stackflowos.agents.workspace_git import WorkspaceGit, git_available
 from stackflowos.config import AgentsCfg, SecurityCfg
-from stackflowos.errors import BadRequest, Denied, NotFound
+from stackflowos.errors import BadRequest, Conflict, Denied, NotFound
 from stackflowos.kernel.context import Context
 from stackflowos.web.api import WebAPI
 
@@ -158,6 +158,55 @@ class AgentExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["commit"], first["commit"])
         self.assertTrue(result["backup_branch"])
         self.assertEqual((workspace / "a.txt").read_text("utf-8"), "one\n")
+
+    @unittest.skipUnless(git_available(), "git binary is not available")
+    async def test_rollback_refuses_dirty_workspace_with_409(self) -> None:
+        workspace = self.tmp / "dirty"
+        workspace.mkdir()
+        (workspace / "a.txt").write_text("one\n", encoding="utf-8")
+        git = WorkspaceGit(workspace)
+        git.ensure_repo()
+        first = git.commit_task("t-1")
+        (workspace / "a.txt").write_text("uncommitted\n", encoding="utf-8")
+        self.projects.items["p-1"] = SimpleNamespace(
+            id="p-1", workspace=str(workspace), workspace_mode="attached-rw")
+
+        with self.assertRaises(Conflict) as ctx:
+            await self.ext.git.project_git_rollback(
+                SimpleNamespace(group=lambda _n: "p-1"), {},
+                {"ref": first["commit"]})
+        exc = ctx.exception
+        self.assertEqual(exc.code, "GIT_WORKSPACE_DIRTY")
+        self.assertEqual(exc.http_status, 409)
+        self.assertTrue(exc.detail["changes"])
+        self.assertTrue(exc.detail["hint"])
+        # Nothing was written: the pending edit survives untouched.
+        self.assertEqual((workspace / "a.txt").read_text("utf-8"),
+                         "uncommitted\n")
+
+    @unittest.skipUnless(git_available(), "git binary is not available")
+    async def test_rollback_force_stashes_dirty_work(self) -> None:
+        workspace = self.tmp / "forced"
+        workspace.mkdir()
+        (workspace / "a.txt").write_text("one\n", encoding="utf-8")
+        git = WorkspaceGit(workspace)
+        git.ensure_repo()
+        first = git.commit_task("t-1")
+        (workspace / "a.txt").write_text("uncommitted\n", encoding="utf-8")
+        self.projects.items["p-1"] = SimpleNamespace(
+            id="p-1", workspace=str(workspace), workspace_mode="attached-rw")
+
+        status, payload = await self.ext.git.project_git_rollback(
+            SimpleNamespace(group=lambda _n: "p-1"), {},
+            {"ref": first["commit"], "force": True})
+        self.assertEqual(status, 200)
+        result = payload["data"]
+        self.assertTrue(result["stash_ref"])
+        self.assertEqual((workspace / "a.txt").read_text("utf-8"), "one\n")
+        subprocess.run(["git", "stash", "apply", result["stash_ref"]],
+                       cwd=workspace, check=True, capture_output=True)
+        self.assertEqual((workspace / "a.txt").read_text("utf-8"),
+                         "uncommitted\n")
 
     @unittest.skipUnless(git_available(), "git binary is not available")
     async def test_rollback_denied_for_read_only_workspace(self) -> None:

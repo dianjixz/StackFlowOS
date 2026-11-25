@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 
 from stackflowos.agents.brain import MockBrain
 from stackflowos.agents.models import Agent
 from stackflowos.agents.runner import AgentRunner
 from stackflowos.agents.tools import ToolExecutor
-from stackflowos.agents.workspace_git import (GitError, WorkspaceGit,
-                                              git_available, task_branch_name,
-                                              validate_ref)
+from stackflowos.agents.workspace_git import (DirtyWorkspaceError, GitError,
+                                              WorkspaceGit, git_available,
+                                              task_branch_name, validate_ref)
 from stackflowos.config import AgentsCfg, SecurityCfg
+from tests.conftest import git_scratch_dir
 from tests.test_agent_runner import FakeSysAPI
 
-TMP_ROOT = Path(__file__).resolve().parent.parent / ".stackflowos" / "tmp"
 GIT = git_available()
 
 
@@ -27,7 +25,7 @@ class WorkspaceGitTests(unittest.TestCase):
     def setUp(self) -> None:
         # Outside the checkout: git must see an isolated repo root (a
         # workspace nested in another repository is refused by design).
-        self.tmp = Path(tempfile.mkdtemp(prefix="sfo-git-", dir="/tmp"))
+        self.tmp = git_scratch_dir()
         self.ws = self.tmp / "workspace"
         self.ws.mkdir()
         (self.ws / "README.md").write_text("hello\n", encoding="utf-8")
@@ -101,6 +99,79 @@ class WorkspaceGitTests(unittest.TestCase):
         with self.assertRaises(GitError):
             self.git.rollback("-x")
 
+    def test_rollback_refuses_dirty_workspace(self) -> None:
+        self.git.ensure_repo()
+        self.git.task_branch("p-1", "t-1")
+        head = self.git.commit_task("t-1")["commit"]
+        (self.ws / "README.md").write_text("local edit\n", encoding="utf-8")
+
+        with self.assertRaises(DirtyWorkspaceError) as caught:
+            self.git.rollback(head)
+        error = caught.exception
+        self.assertEqual(error.code, "GIT_WORKSPACE_DIRTY")
+        self.assertIn("force=True", str(error))
+        self.assertIn("refs/sfo-rollback-stash/", str(error))
+        self.assertIn("force=True", error.hint)
+        self.assertEqual([item["path"] for item in error.changes],
+                         ["README.md"])
+        # Refused before any write: the edit and HEAD are untouched, and no
+        # backup branch was fabricated for a rollback that never happened.
+        self.assertEqual((self.ws / "README.md").read_text(encoding="utf-8"),
+                         "local edit\n")
+        self.assertEqual(self.git.info()["head"], head)
+        branches = subprocess.check_output(
+            ["git", "-C", str(self.ws), "branch", "--list", "sfo-rollback/*"],
+            text=True)
+        self.assertEqual(branches.strip(), "")
+
+    def test_forced_rollback_stashes_dirty_work_in_a_ref(self) -> None:
+        self.git.ensure_repo()
+        self.git.task_branch("p-1", "t-1")
+        head = self.git.commit_task("t-1")["commit"]
+        (self.ws / "README.md").write_text("local edit\n", encoding="utf-8")
+        (self.ws / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+
+        result = self.git.rollback(head, force=True)
+        self.assertTrue(result["force"])
+        self.assertTrue(result["dirty_before"])
+        self.assertIn("README.md",
+                      [item["path"] for item in result["changes"]])
+        self.assertTrue(
+            result["stash_ref"].startswith("refs/sfo-rollback-stash/"),
+            result["stash_ref"])
+        self.assertEqual(result["restore_hint"],
+                         f"git stash apply {result['stash_ref']}")
+        # The tracked edit was reset away...
+        self.assertEqual((self.ws / "README.md").read_text(encoding="utf-8"),
+                         "hello\n")
+        # ... but it survives in the stash ref and can be restored.
+        apply = subprocess.run(
+            ["git", "-C", str(self.ws), "stash", "apply",
+             result["stash_ref"]], capture_output=True, text=True)
+        self.assertEqual(apply.returncode, 0, apply.stderr)
+        self.assertEqual((self.ws / "README.md").read_text(encoding="utf-8"),
+                         "local edit\n")
+        # reset --hard never deletes untracked files, so they are still there.
+        self.assertEqual((self.ws / "scratch.txt").read_text(encoding="utf-8"),
+                         "untracked\n")
+        self.assertTrue(result["backup_branch"].startswith("sfo-rollback/"))
+        self.assertEqual(self.git.info()["head"], head)
+
+    def test_forced_rollback_with_only_untracked_changes_needs_no_stash(
+            self) -> None:
+        self.git.ensure_repo()
+        self.git.task_branch("p-1", "t-1")
+        head = self.git.commit_task("t-1")["commit"]
+        (self.ws / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+        result = self.git.rollback(head, force=True)
+        # Nothing tracked was dirty, so there is nothing to preserve; the
+        # untracked file is left in place by git itself.
+        self.assertEqual(result["stash_ref"], "")
+        self.assertNotIn("restore_hint", result)
+        self.assertTrue(result["dirty_before"])
+        self.assertEqual((self.ws / "scratch.txt").read_text(encoding="utf-8"),
+                         "untracked\n")
+
     def test_refuses_nested_workspace_of_outer_repo(self) -> None:
         outer = self.tmp / "outer"
         outer.mkdir()
@@ -130,7 +201,7 @@ class WorkspaceGitTests(unittest.TestCase):
 @unittest.skipUnless(GIT, "git binary is not available")
 class RunnerGitIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="sfo-git-run-", dir="/tmp"))
+        self.tmp = git_scratch_dir(prefix="sfo-git-run-")
         self.ws = self.tmp / "attached"
         self.ws.mkdir()
         (self.ws / "README.md").write_text("base\n", encoding="utf-8")

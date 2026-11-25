@@ -20,6 +20,11 @@ Safety rules enforced here (all git calls are argv lists, never a shell):
 * nothing is pushed, no remote is configured, no branch is deleted; a rollback
   first creates a ``sfo-rollback/*`` backup branch pointing at the previous
   HEAD so the reset itself is recoverable;
+* a rollback refuses a dirty workspace (``DirtyWorkspaceError``,
+  ``GIT_WORKSPACE_DIRTY``): ``reset --hard`` would silently discard tracked
+  modifications that a backup branch cannot recover.  ``force=True``
+  snapshots them under ``refs/sfo-rollback-stash/*`` first and returns the
+  ref (``git stash apply <ref>`` restores the work);
 * git hooks are disabled (``core.hooksPath=/dev/null``) and prompts/failures are
   bounded by a timeout, so an attached repo cannot block the agent.
 """
@@ -43,6 +48,10 @@ _SAFE_FRAGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 #: Branch prefix; ``sfo-rollback/`` is reserved for the safety backup branch.
 TASK_BRANCH_PREFIX = "task/"
 ROLLBACK_BRANCH_PREFIX = "sfo-rollback/"
+#: Ref namespace for uncommitted work preserved by a forced rollback.
+ROLLBACK_STASH_PREFIX = "refs/sfo-rollback-stash/"
+#: Error code carried by :class:`DirtyWorkspaceError` (stable for API callers).
+DIRTY_WORKSPACE_CODE = "GIT_WORKSPACE_DIRTY"
 #: Hard cap for one git invocation (seconds).
 GIT_TIMEOUT_S = 60.0
 #: Git configuration forced for every call (no hooks, no prompts, no signing).
@@ -59,6 +68,25 @@ _GIT_CONFIG = (
 
 class GitError(Exception):
     """A safe, user-facing git failure (never contains secrets)."""
+
+
+class DirtyWorkspaceError(GitError):
+    """``rollback`` refused: the workspace has uncommitted changes.
+
+    ``git reset --hard`` discards tracked modifications and the index, which a
+    ``sfo-rollback/*`` backup branch cannot restore (it only keeps commits).
+    The caller must commit the work, or pass ``force=True`` so the pending
+    changes are snapshotted under :data:`ROLLBACK_STASH_PREFIX` first.
+    """
+
+    code = DIRTY_WORKSPACE_CODE
+
+    def __init__(self, message: str, *, changes: list[dict] | None = None,
+                 hint: str = "") -> None:
+        super().__init__(message)
+        self.code = DIRTY_WORKSPACE_CODE
+        self.changes = list(changes or [])
+        self.hint = hint
 
 
 def git_available() -> bool:
@@ -364,16 +392,66 @@ class WorkspaceGit:
             raise GitError(f"unknown git ref: {cleaned}")
         return commit
 
-    def rollback(self, ref: str) -> dict:
+    def _stash_dirty_work(self) -> str:
+        """Snapshot uncommitted tracked work into a rollback stash ref.
+
+        ``git stash create`` builds a stash commit without touching the
+        working tree or the shared ``refs/stash`` reflog; we anchor that commit
+        under a dedicated ref, so concurrent rollbacks cannot clobber each
+        other.  Returns '' when only untracked files were dirty (a
+        ``reset --hard`` never deletes those, so there is nothing to keep).
+        """
+        try:
+            commit = self._run("stash", "create",
+                               "sfo: pre-rollback snapshot").strip()
+        except GitError as exc:
+            raise GitError(
+                f"cannot snapshot uncommitted changes before rollback: {exc}"
+            ) from exc
+        if not commit:
+            return ""
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        ref = f"{ROLLBACK_STASH_PREFIX}{stamp}"
+        suffix = 1
+        while self._ok("rev-parse", "--verify", ref):
+            suffix += 1
+            ref = f"{ROLLBACK_STASH_PREFIX}{stamp}-{suffix}"
+        try:
+            self._run("update-ref", ref, commit)
+        except GitError as exc:
+            raise GitError(
+                f"cannot preserve uncommitted changes as {ref}: {exc}"
+            ) from exc
+        return ref
+
+    def rollback(self, ref: str, *, force: bool = False) -> dict:
         """Restore the workspace to ``ref`` (with a backup branch first).
 
         Refuses to delete branches or touch remotes; the previous HEAD is
         preserved as ``sfo-rollback/<timestamp>`` so the reset can be undone.
+
+        A dirty workspace is refused with :class:`DirtyWorkspaceError`
+        (``code == "GIT_WORKSPACE_DIRTY"``) because ``reset --hard`` would
+        silently discard uncommitted tracked edits.  ``force=True`` snapshots
+        those edits under ``refs/sfo-rollback-stash/<timestamp>`` before the
+        reset and returns the ref as ``stash_ref`` (``git stash apply
+        <stash_ref>`` brings them back).  Untracked files survive a
+        ``reset --hard`` either way and are left in place.
         """
         self._require_repo_root()
         commit = self._resolve(ref)
         previous_head = self._head()
         previous_branch = self._branch()
+        changes = self._status_entries(limit=50)
+        if changes and not force:
+            raise DirtyWorkspaceError(
+                f"workspace has {len(changes)} uncommitted change(s); "
+                "commit them first, or roll back with force=True to keep them "
+                f"under {ROLLBACK_STASH_PREFIX}<timestamp> before the reset",
+                changes=changes,
+                hint=("commit the pending work, then retry; or force=True to "
+                      f"snapshot it to {ROLLBACK_STASH_PREFIX}<timestamp>"))
+        stash_ref = self._stash_dirty_work() if changes else ""
         backup = ""
         if previous_head:
             stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
@@ -384,7 +462,7 @@ class WorkspaceGit:
                 backup = f"{ROLLBACK_BRANCH_PREFIX}{stamp}-{suffix}"
             self._run("branch", backup, previous_head)
         self._run("reset", "--hard", commit)
-        return {
+        result = {
             "ref": str(ref),
             "commit": commit,
             "previous_head": previous_head,
@@ -393,13 +471,23 @@ class WorkspaceGit:
             "branch": self._branch(),
             "head": self._head(),
             "workspace": str(self.workspace),
+            "force": bool(force),
+            "dirty_before": bool(changes),
+            "changes": changes,
+            "stash_ref": stash_ref,
         }
+        if stash_ref:
+            result["restore_hint"] = f"git stash apply {stash_ref}"
+        return result
 
 
 __all__ = [
+    "DIRTY_WORKSPACE_CODE",
+    "DirtyWorkspaceError",
     "GIT_TIMEOUT_S",
     "GitError",
     "ROLLBACK_BRANCH_PREFIX",
+    "ROLLBACK_STASH_PREFIX",
     "TASK_BRANCH_PREFIX",
     "WorkspaceGit",
     "git_available",

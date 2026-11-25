@@ -352,9 +352,27 @@ class App:
             "llm_provider": str(getattr(self.provider, "name", "")),
             "llm_model": str(getattr(self.provider, "model", "")),
         }, source="sys")
+        # A priority queue restored from agents.json has no other caller: it
+        # would sit until the next spawn/finish/config event, so parked spawns
+        # from before the restart would never run.  Re-arm it once every
+        # subsystem (allocator, transport, extensions) is up.
+        self._resume_agent_queue()
         log.info("hub ready: rpc=%s events=%s web=%s",
                  self.sys_addresses.rpc, self.sys_addresses.events, cfg.web.port)
         return self
+
+    def _resume_agent_queue(self) -> dict:
+        """Boot hook: drain spawns parked by the previous hub process."""
+        supervisor = getattr(self, "supervisor", None)
+        resume = getattr(supervisor, "resume_queue", None)
+        if supervisor is None or not callable(resume):
+            return {}
+        try:
+            result = resume()
+        except Exception:  # a broken queue snapshot must not block boot
+            self.log.exception("cannot resume the agent dispatch queue")
+            return {}
+        return result if isinstance(result, dict) else {}
 
     @staticmethod
     def aggregation_signature(project: Any, tasks: list[Any]) -> tuple:
