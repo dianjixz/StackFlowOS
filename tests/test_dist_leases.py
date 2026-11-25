@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from stackflowos.config import default_root
 from stackflowos.errors import BadRequest, Conflict, Denied, NotFound
@@ -140,6 +141,57 @@ class FencingTests(_Base):
                     if name == "lease.acquired"]
         self.assertEqual(acquired[0]["data"]["token"], lease.token)
         self.assertEqual(acquired[0]["data"]["lease"]["token"], lease.token)
+
+
+class FencingPersistFailureTests(_Base):
+    """Best-effort fencing persistence must warn and expose its failure count."""
+
+    def test_persist_failure_warns_and_is_counted_in_health(self):
+        path = self.dir / "state" / "lease_fencing.json"
+        manager = LeaseManager(self.ctx, self.log, fencing_path=path)
+        with mock.patch("stackflowos.l2.leases.write_json",
+                        side_effect=OSError("read-only filesystem")):
+            with self.assertLogs(self.ctx.log, level="WARNING") as captured:
+                lease = manager.acquire("slot:coder.1:0", "coder.1", 60)
+        self.assertEqual(lease.token, 1)
+        self.assertIn("could not persist lease fencing tokens",
+                      "\n".join(captured.output))
+        fencing = manager.health()["fencing"]
+        self.assertFalse(fencing["persisted"])
+        self.assertEqual(fencing["persist_failures"], 1)
+        self.assertFalse(path.exists(),
+                         "a failed write must not leave partial state behind")
+
+        # One failed write must not stop the in-memory counter from advancing.
+        manager.release(lease.id)
+        with mock.patch("stackflowos.l2.leases.write_json",
+                        side_effect=OSError("read-only filesystem")):
+            second = manager.acquire("slot:coder.1:0", "coder.2", 60)
+        self.assertEqual(second.token, 2)
+        self.assertEqual(manager.health()["fencing"]["persist_failures"], 2)
+
+        # Documented consequence: no durable high-water mark, so a restarted
+        # hub may re-issue an already used token.
+        restarted = LeaseManager(self.ctx, self.log, fencing_path=path)
+        self.assertEqual(
+            restarted.acquire("slot:coder.1:0", "coder.3", 60).token, 1)
+
+    def test_persist_failure_recovers_and_counter_stays_cumulative(self):
+        path = self.dir / "state" / "lease_fencing.json"
+        manager = LeaseManager(self.ctx, self.log, fencing_path=path)
+        with mock.patch("stackflowos.l2.leases.write_json",
+                        side_effect=OSError("disk full")):
+            manager.acquire("cap:fs.write", "coder.1", 60)
+        self.assertFalse(manager.health()["fencing"]["persisted"])
+
+        manager.acquire("cap:fs.read", "coder.2", 60)  # disk writable again
+        fencing = manager.health()["fencing"]
+        self.assertTrue(fencing["persisted"])
+        self.assertEqual(fencing["persist_failures"], 1,
+                         "the failure counter is cumulative, not a gauge")
+        payload = json.loads(path.read_text("utf-8"))
+        self.assertEqual(payload["tokens"]["cap:fs.write"], 1)
+        self.assertEqual(payload["tokens"]["cap:fs.read"], 1)
 
 
 class ClockSkewTests(_Base):

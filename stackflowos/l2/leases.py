@@ -19,12 +19,24 @@ Fencing (``cluster.lease_fencing``)
 -----------------------------------
 Each acquisition of a resource gets a **monotonically increasing fencing
 token**.  The token is persisted under ``<state>/state/lease_fencing.json``
-(best effort: a write failure is logged and the in-memory counter keeps
-increasing -- a restarted hub may then re-issue tokens, which the health
-payload reports as ``persisted: false``).  A holder that was paused long
-enough for its lease to expire must not act on its stale token: consumers
-verify ``(lease_id, token)`` before touching the protected resource.  Renewal
-keeps the token; only a new acquisition increments it.
+(best effort: a write failure is logged at WARNING and the in-memory counter
+keeps increasing -- a restarted hub may then re-issue tokens).  Operators
+monitor this through :meth:`LeaseManager.health`::
+
+    health()["fencing"] == {
+        "enabled": bool,
+        "persisted": bool,        # last write reached disk
+        "persist_failures": int,  # cumulative failed writes since startup
+        ...
+    }
+
+``persist_failures`` is the value to map onto a metric such as
+``sfo_lease_fencing_persist_failures_total``; a non-zero counter (and
+``persisted: false``) means token uniqueness after a restart is no longer
+guaranteed.  A holder that was paused long enough for its lease to expire
+must not act on its stale token: consumers verify ``(lease_id, token)``
+before touching the protected resource.  Renewal keeps the token; only a new
+acquisition increments it.
 
 Clock-skew tolerance (``cluster.lease_clock_skew_s``)
 ----------------------------------------------------
@@ -143,6 +155,9 @@ class LeaseManager:
         self._tokens: dict[str, int] = {}
         #: Whether the last token write reached disk.
         self._token_persist_ok = True
+        #: Cumulative fencing-token writes that failed since startup (best
+        #: effort persistence; exposed by :meth:`health`).
+        self._fencing_persist_failures = 0
         self._load_tokens()
 
     # -- acquire / renew / release ---------------------------------------
@@ -385,6 +400,10 @@ class LeaseManager:
                 "last_token": max(tokens.values()) if tokens else 0,
                 "path": str(self.fencing_path),
                 "persisted": bool(self._token_persist_ok),
+                # Cumulative failed best-effort writes; map to a metric such as
+                # sfo_lease_fencing_persist_failures_total.  Non-zero means a
+                # restart may re-issue fencing tokens.
+                "persist_failures": int(self._fencing_persist_failures),
             },
             "clock_skew_s": self.clock_skew_s,
             "max_ttl_s": self.max_ttl_s,
@@ -445,6 +464,10 @@ class LeaseManager:
             self._token_persist_ok = True
         except OSError as exc:
             self._token_persist_ok = False
+            self._fencing_persist_failures += 1
+            # Counted in health()["fencing"]["persist_failures"]; the in-memory
+            # token stays valid for this process, but after a restart the
+            # durable high-water mark may be behind, so tokens can repeat.
             self.log.warning("could not persist lease fencing tokens to %s: %s",
                              self.fencing_path, exc)
 

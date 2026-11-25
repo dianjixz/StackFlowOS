@@ -4,12 +4,14 @@ Public API::
 
     from stackflowos.storage import JsonFileBackend, SqliteBackend
     from stackflowos.storage import migrate_json_to_sqlite, open_backend
+    from stackflowos.storage import verify_divergence
 
 The composition root (``app.py``) constructs the event log and memory store
 without a backend today; both accept an optional ``backend=`` argument, and
 they also honour ``SFO_STORAGE_BACKEND=sqlite`` / ``SFO_STORAGE_SQLITE_PATH``
 so a deployment can switch without code changes.  ``migrate_json_to_sqlite``
-copies an existing JSON state directory into the database.
+copies an existing JSON state directory into the database, and
+``verify_divergence`` reports (read-only) where the two copies have drifted.
 """
 
 from __future__ import annotations
@@ -63,10 +65,11 @@ def backend_from_env(state_dir: Path) -> Optional[StorageBackend]:
 
 
 from .migrate import migrate_json_to_sqlite  # noqa: E402  (import after backends)
+from .consistency import verify_divergence  # noqa: E402  (read-only diagnostics)
 
 __all__ = [
     "ENV_BACKEND", "ENV_SQLITE_PATH", "JsonFileBackend", "SCHEMA_VERSION",
     "SqliteBackend", "StorageBackend", "StorageError", "backend_from_env",
     "default_sqlite_path", "migrate_json_to_sqlite", "open_backend",
-    "validate_namespace",
+    "validate_namespace", "verify_divergence",
 ]

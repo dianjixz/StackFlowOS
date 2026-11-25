@@ -12,8 +12,13 @@ The log is the durable memory of the system and the replay source for the UI
     ``events-<seq>.jsonl``, never pruned -- this keeps existing state dirs and
     callers byte-for-byte compatible;
 * every record carries a globally monotonic ``seq``. Ephemeral record types
-  (streaming deltas) still get a ``seq`` and are broadcast live, but are not
-  written to disk, so a restart resumes the sequence from the file maximum;
+  (streaming deltas: ``chat.delta``, ``agent.chat.delta``, any ``*.delta`` and
+  ``stream.chunk``) still get a ``seq`` and are broadcast live, but are not
+  written to disk, so a restart resumes the sequence from the file maximum and
+  can never replay a half-streamed message.  A transient type found in
+  persistence (legacy rows or rows relayed by hand) is skipped by replay
+  (``since``/``query``) and counted as ``replay_skipped_transient`` in
+  :meth:`EventLog.health`;
 * the last ``memory_limit`` records are kept in memory to serve ``tail`` and
   hot ``since`` reads; older replay streams the archives in rotation order.
   ``query`` scans newest->oldest and stops as soon as ``limit`` matches are
@@ -51,6 +56,9 @@ from ..storage import StorageBackend, backend_from_env
 #: Rotated files (new compressed format and the legacy uncompressed one).
 _ROTATED_RE = re.compile(r"^events-(?P<seq>\d+)(?:-[^.]*)?\.jsonl(?P<gz>\.gz)?$")
 
+#: Suffix that marks a streaming/delta event as transient (broadcast only).
+_TRANSIENT_SUFFIX = ".delta"
+
 #: Environment overrides read by the constructor (the composition root passes
 #: ``config.storage.eventlog_rotate_*`` explicitly when it wires the log).
 ENV_ROTATE_BYTES = "SFO_EVENTLOG_ROTATE_BYTES"
@@ -87,6 +95,18 @@ class EventLog:
     #: Event types that are broadcast but never persisted.
     EPHEMERAL_TYPES = {"chat.delta", "agent.chat.delta", "stream.chunk"}
 
+    @classmethod
+    def is_transient(cls, event_type: Any) -> bool:
+        """Whether *event_type* is broadcast-only (never durable/replayable).
+
+        Streaming deltas are matched by the ``*.delta`` suffix on top of
+        :attr:`EPHEMERAL_TYPES`, so every producer's delta variant
+        (``worker.chat.delta``, ``tool.delta``, ...) is classified without
+        maintaining a global list.
+        """
+        name = str(event_type or "")
+        return name in cls.EPHEMERAL_TYPES or name.endswith(_TRANSIENT_SUFFIX)
+
     #: Hard upper bound for :meth:`query` (mirrors the web API limit).
     QUERY_MAX_LIMIT = 1000
     #: Upper bounds for one filtered query's backward file replay.  When an
@@ -122,6 +142,10 @@ class EventLog:
         self._memory: deque[EventRecord] = deque(maxlen=self.memory_limit)
         self._subscribers: list[asyncio.Queue] = []
         self._archive_errors: deque[dict] = deque(maxlen=20)
+        #: Transient (``*.delta``/ephemeral) rows skipped while replaying
+        #: persistence; reported by :meth:`health` so operators can see that a
+        #: restart dropped streaming-only history (by design).
+        self._replay_skipped_transient = 0
         if self._backend is not None and self._backend.count("events") == 0:
             file_max = self._file_last_seq()
             if file_max:
@@ -167,7 +191,7 @@ class EventLog:
         """
         if not isinstance(record, EventRecord):
             raise BadRequest("append_record expects an EventRecord")
-        ephemeral = record.type in self.EPHEMERAL_TYPES
+        ephemeral = self.is_transient(record.type)
         with self._lock:
             self._maybe_rotate()
             seq = self._last_seq + 1
@@ -345,6 +369,10 @@ class EventLog:
             "archive_bytes": 0,
             "writable": False,
             "corrupt_archives": len(self._archive_errors),
+            # Transient streaming rows found in persistence are never replayed
+            # (see is_transient); the counter makes that visible instead of
+            # silently dropping history.
+            "replay_skipped_transient": int(self._replay_skipped_transient),
         }
         if self._backend is not None:
             try:
@@ -434,16 +462,32 @@ class EventLog:
                     self.log.debug("subscriber queue full; dropping %s", record.type)
 
     # -- persistence helpers ---------------------------------------------
+    def _skip_replay_transient(self, record: EventRecord) -> bool:
+        """Drop a transient row from replay, counting it for ``health()``.
+
+        Transient/delta events are broadcast-only (never written by this log),
+        but legacy files or rows relayed by another tool may still contain one.
+        Replaying them would hand the UI a partial message, so they are skipped
+        and reported explicitly rather than silently.
+        """
+        if not self.is_transient(record.type):
+            return False
+        with self._lock:
+            self._replay_skipped_transient += 1
+        return True
+
     def _iter_persisted_ascending(self) -> Iterator[EventRecord]:
-        """Yield persisted records oldest first (backend rows or files)."""
+        """Yield durable records oldest first (backend rows or files)."""
         if self._backend is not None:
             for row in self._backend.iter_rows("events"):
                 record = _record_from_dict(row)
-                if record is not None:
+                if record is not None and not self._skip_replay_transient(record):
                     yield record
             return
         for path in self._files_ascending():
-            yield from _iter_file_records(path, self)
+            for record in _iter_file_records(path, self):
+                if not self._skip_replay_transient(record):
+                    yield record
 
     def _query_backend(self, collected: list[EventRecord],
                        keep: Callable[[EventRecord], bool], limit: int,
@@ -457,6 +501,8 @@ class EventLog:
             scanned += 1
             record = _record_from_dict(row)
             if record is None or record.seq in seen:
+                continue
+            if self._skip_replay_transient(record):
                 continue
             seen.add(record.seq)
             if memory_floor is not None and record.seq >= memory_floor:
@@ -623,6 +669,8 @@ class EventLog:
                 record = _record_from_dict(obj)
                 if record is None or record.seq in seen:
                     continue
+                if self._skip_replay_transient(record):
+                    continue
                 seen.add(record.seq)
                 if memory_floor is not None and record.seq >= memory_floor:
                     continue
@@ -639,14 +687,17 @@ class EventLog:
             for row in self._backend.iter_rows("events", reverse=True,
                                                limit=self.memory_limit):
                 record = _record_from_dict(row)
-                if record is not None:
+                # Transient rows are never part of the durable window; this
+                # warm-up is not a user-visible replay, so it is not counted.
+                if record is not None and not self.is_transient(record.type):
                     rows.append(record)
             rows.reverse()
             self._memory.extend(rows[-self.memory_limit:])
             return
         collected: list[EventRecord] = []
         for path in reversed(self._files_ascending()):
-            rows = list(_iter_file_records(path, self))
+            rows = [record for record in _iter_file_records(path, self)
+                    if not self.is_transient(record.type)]
             collected = rows + collected
             if len(collected) >= self.memory_limit:
                 break

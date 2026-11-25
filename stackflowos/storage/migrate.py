@@ -130,7 +130,15 @@ def migrate_json_to_sqlite(
         else state_dir / "state" / "stackflowos.db"
     )
     owns_backend = backend is None
-    store = backend or SqliteBackend(target)
+    if backend is not None:
+        store = backend
+    elif dry_run and not target.exists():
+        # A dry run must not create the database as a side effect: a present
+        # (even empty) database is what the consistency checker compares
+        # against, and operators run --dry-run on read-only state dirs.
+        store = SqliteBackend(":memory:")
+    else:
+        store = SqliteBackend(target)
     summary = {
         "sqlite_path": str(store.path),
         "events": 0,

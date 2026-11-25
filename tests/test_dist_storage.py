@@ -237,10 +237,14 @@ class MigrationTests(_Base):
 
     def test_dry_run_writes_nothing(self):
         state = self._seed_state()
+        db_path = default_sqlite_path(state)
+        self.assertFalse(db_path.exists())
         summary = migrate_json_to_sqlite(state, dry_run=True)
         self.assertTrue(summary["dry_run"])
         self.assertEqual(summary["events"], 4)
-        db = SqliteBackend(default_sqlite_path(state))
+        self.assertFalse(db_path.exists(),
+                         "a dry run must not create the database file")
+        db = SqliteBackend(db_path)
         try:
             self.assertEqual(db.count("events"), 0)
         finally:
