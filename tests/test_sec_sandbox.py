@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -11,9 +12,25 @@ from pathlib import Path
 from unittest import mock
 
 from stackflowos.config import default_root
+from stackflowos.l2 import EventLog
 from stackflowos.security import sandbox
+from stackflowos.transport.address import AddressAllocator
 
 REPO = default_root()
+
+
+def _landlock_skip_reason(prefix: str = "Landlock is not available") -> str:
+    """Skip reason that carries the full capability matrix (W3 item 2).
+
+    A bare "unavailable" hides *why* the host cannot isolate and which other
+    backend was probed; the matrix makes the skip self-explanatory in CI logs.
+    """
+    try:
+        matrix = sandbox.capability_matrix()
+        detail = sandbox.matrix_line(matrix)
+    except Exception as exc:  # pragma: no cover - probing is best effort
+        detail = f"capability probe failed: {type(exc).__name__}: {exc}"
+    return f"{prefix} — capability matrix: {detail}"
 
 
 class DetectionTests(unittest.TestCase):
@@ -136,7 +153,7 @@ class BuildCommandTests(unittest.TestCase):
     def test_auto_landlock_plan_carries_preexec(self):
         status = sandbox.detect_landlock()
         if not status.available:
-            self.skipTest("Landlock is not available")
+            self.skipTest(_landlock_skip_reason())
         plan = sandbox.wrap_command(
             ["echo", "hi"], cwd=self.tmp, writable_paths=[self.tmp],
             allow_network=True, backend="auto")
@@ -146,8 +163,9 @@ class BuildCommandTests(unittest.TestCase):
         self.assertTrue(plan.notes)
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "Landlock is Linux-only")
 class LandlockEnforcementTests(unittest.TestCase):
+    # No class-level skipUnless: every test calls ``_require_landlock()`` so the
+    # skip reason can include the capability matrix (Linux-only is part of it).
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(
             dir=str(REPO / ".stackflowos" / "tmp"))
@@ -161,7 +179,8 @@ class LandlockEnforcementTests(unittest.TestCase):
     def _require_landlock(self) -> sandbox.LandlockStatus:
         status = sandbox.detect_landlock()
         if not status.available:
-            self.skipTest(f"Landlock unavailable: {status.reason}")
+            self.skipTest(_landlock_skip_reason(
+                f"Landlock unavailable: {status.reason}"))
         return status
 
     def _run_child(self, source: str, *, writable=True,
@@ -221,7 +240,8 @@ else:
     def test_tcp_connect_denied_when_network_disabled(self):
         status = self._require_landlock()
         if status.abi < 4:
-            self.skipTest("Landlock ABI < 4 has no network rules")
+            self.skipTest(_landlock_skip_reason(
+                "Landlock ABI < 4 has no network rules"))
         source = """
 import socket
 try:
@@ -240,7 +260,8 @@ else:
     def test_network_allowed_when_requested(self):
         status = self._require_landlock()
         if status.abi < 4:
-            self.skipTest("Landlock ABI < 4 has no network rules")
+            self.skipTest(_landlock_skip_reason(
+                "Landlock ABI < 4 has no network rules"))
         source = """
 import socket
 try:
@@ -274,6 +295,217 @@ print("net", report.network_restricted)
         self.assertIn("backend landlock", completed.stdout)
         self.assertIn(f"abi {status.abi}", completed.stdout)
         self.assertIn("net True", completed.stdout)
+
+class CapabilityMatrixTests(unittest.TestCase):
+    """Item 2: the host capability matrix is explicit, not a silent default."""
+
+    def test_matrix_has_both_backends_and_selection(self):
+        matrix = sandbox.capability_matrix()
+        self.assertEqual(matrix["platform"], sys.platform)
+        self.assertIn("landlock", matrix)
+        self.assertIn("bwrap", matrix)
+        self.assertIn(matrix["auto_backend"],
+                      {"landlock", "bwrap", "unsandboxed"})
+        self.assertIsInstance(matrix["landlock"]["available"], bool)
+        self.assertIsInstance(matrix["bwrap"]["available"], bool)
+        self.assertTrue(matrix["bwrap"]["probed"])
+        line = sandbox.matrix_line(matrix)
+        self.assertIn("landlock=", line)
+        self.assertIn("bwrap=", line)
+        self.assertIn("auto=", line)
+
+    def test_matrix_can_skip_the_expensive_bwrap_probe(self):
+        with mock.patch.object(sandbox, "detect_bwrap") as probe:
+            matrix = sandbox.capability_matrix(probe_bwrap=False)
+        probe.assert_not_called()
+        self.assertFalse(matrix["bwrap"]["probed"])
+        self.assertIsNone(matrix["auto_backend"])
+        self.assertEqual(sandbox.selected_backend(matrix, "off"),
+                         "unsandboxed")
+
+    def test_selected_backend_reads_the_matrix_only(self):
+        matrix = sandbox.capability_matrix(probe_bwrap=False)
+        with mock.patch.object(sandbox, "detect_bwrap") as probe:
+            self.assertIn(sandbox.selected_backend(matrix, "auto"),
+                          {"landlock", "unsandboxed"})
+        probe.assert_not_called()
+        with self.assertRaises(ValueError):
+            sandbox.selected_backend(matrix, "magic")
+
+    def test_skip_reason_includes_the_matrix(self):
+        reason = _landlock_skip_reason("Landlock unavailable: example")
+        self.assertIn("Landlock unavailable: example", reason)
+        self.assertIn("landlock=", reason)
+        self.assertIn("bwrap=", reason)
+
+
+class StartupAuditTests(unittest.TestCase):
+    """Item 2: startup probe logs a WARNING and an audit event on degradation."""
+
+    def _app(self, mode: str, allow_network: bool = False):
+        from types import SimpleNamespace
+
+        tmp = tempfile.mkdtemp(dir=str(REPO / ".stackflowos" / "tmp"))
+        app = SimpleNamespace(
+            config=SimpleNamespace(security=SimpleNamespace(
+                sandbox=mode, sandbox_allow_network=allow_network)),
+            eventlog=EventLog(Path(tmp) / "events"),
+        )
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        return app
+
+    def _close(self, app) -> None:
+        asyncio.run(app.eventlog.close())
+
+    def test_unsandboxed_degradation_warns_and_audits(self):
+        app = self._app("landlock")
+        unavailable = sandbox.LandlockStatus(
+            False, reason="landlock unavailable: Operation not permitted")
+        with mock.patch.object(sandbox, "detect_landlock",
+                               return_value=unavailable), \
+                mock.patch.object(
+                    sandbox, "detect_bwrap",
+                    return_value=sandbox.BackendInfo(
+                        "bwrap", False,
+                        "bwrap cannot create an unprivileged sandbox")):
+            try:
+                with self.assertLogs("sfo.security.sandbox",
+                                     level="WARNING") as captured:
+                    matrix = sandbox.audit_startup(app)
+            finally:
+                self._close(app)
+        self.assertEqual(matrix["effective_backend"], "unsandboxed")
+        self.assertTrue(matrix["unsandboxed"])
+        self.assertTrue(any("UNSANDBOXED" in line for line in captured.output))
+        records = app.eventlog.query(types=["sandbox"])
+        types = [record.type for record in records]
+        self.assertIn("sandbox.unsandboxed", types)
+        payload = next(record for record in records
+                       if record.type == "sandbox.unsandboxed")
+        self.assertEqual(payload.data["effective_backend"], "unsandboxed")
+        self.assertIn("landlock", payload.data["matrix"])
+
+    def test_available_backend_records_capability_event(self):
+        app = self._app("auto")
+        with mock.patch.object(
+                sandbox, "detect_landlock",
+                return_value=sandbox.LandlockStatus(True, abi=8)), \
+                mock.patch.object(
+                    sandbox, "detect_bwrap",
+                    return_value=sandbox.BackendInfo(
+                        "bwrap", False, "namespaces denied")):
+            try:
+                with self.assertLogs("sfo.security.sandbox",
+                                     level="INFO") as captured:
+                    matrix = sandbox.audit_startup(app)
+            finally:
+                self._close(app)
+        self.assertEqual(matrix["effective_backend"],
+                         sandbox.BACKEND_LANDLOCK)
+        self.assertNotIn("UNSANDBOXED", "\n".join(captured.output))
+        types = [record.type for record in app.eventlog.query(types=["sandbox"])]
+        self.assertIn("sandbox.capabilities", types)
+        self.assertNotIn("sandbox.unsandboxed", types)
+
+    def test_disabled_sandbox_is_logged_but_not_an_alert(self):
+        app = self._app("off")
+        with mock.patch.object(
+                sandbox, "detect_landlock",
+                return_value=sandbox.LandlockStatus(True, abi=8)), \
+                mock.patch.object(sandbox, "detect_bwrap") as probe:
+            try:
+                with self.assertLogs("sfo.security.sandbox",
+                                     level="INFO") as captured:
+                    matrix = sandbox.audit_startup(app)
+            finally:
+                self._close(app)
+        probe.assert_not_called()  # no subprocess at boot when disabled
+        self.assertEqual(matrix["mode"], "off")
+        self.assertFalse(matrix["bwrap"]["probed"])
+        self.assertTrue(any("sandbox disabled" in line
+                            for line in captured.output))
+        self.assertEqual(app.eventlog.query(types=["sandbox"]), [])
+
+
+class WorkerSocketCleanupTests(unittest.TestCase):
+    """Item 1: the worker's Landlock whitelist cannot unlink run/ sockets.
+
+    This is a verified residual risk, not papered over: the worker-side unlink
+    is denied (and the transport logs a warning), while the hub allocator
+    reclaims stale socket files on release/reallocation.  Adding ``run/`` to
+    the worker whitelist would let a worker unlink/rebind hub sockets, so the
+    fix is deliberately *not* applied here.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(
+            dir=str(REPO / ".stackflowos" / "tmp"))
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_worker_whitelist_denies_unlinking_run_dir_socket(self):
+        status = sandbox.detect_landlock()
+        if not status.available:
+            self.skipTest(_landlock_skip_reason())
+        writable = self.tmp / "workspace"
+        writable.mkdir()
+        run_dir = self.tmp / "run"
+        run_dir.mkdir()
+        socket_file = run_dir / "coder.1.rpc.sock"
+        socket_file.write_text("stale", "utf-8")
+        # Run the real transport cleanup helper inside a Landlocked child with
+        # exactly the worker whitelist: the unlink is denied and the helper
+        # logs a WARNING (it is not silently swallowed).
+        source = f"""
+from stackflowos.transport.nng import cleanup_ipc_address
+cleanup_ipc_address("ipc://{socket_file}")
+import os
+print("exists", os.path.exists({str(socket_file)!r}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", source],
+            preexec_fn=sandbox.preexec_landlock(
+                [str(writable)], allow_network=True),
+            capture_output=True, text=True, timeout=30, check=False,
+            env={**os.environ, "PYTHONPATH": str(REPO)})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("exists True", completed.stdout)
+        self.assertIn("cannot remove ipc socket", completed.stderr)
+        self.assertIn("Permission denied", completed.stderr)
+        self.assertTrue(socket_file.exists())
+
+    def test_cleanup_failure_is_logged_not_silent(self):
+        from stackflowos.transport.nng import cleanup_ipc_address
+
+        with mock.patch.object(Path, "unlink",
+                               side_effect=PermissionError(13, "denied")):
+            with self.assertLogs("sfo.transport", level="WARNING") as captured:
+                cleanup_ipc_address(f"ipc://{self.tmp}/run/coder.1.rpc.sock")
+        self.assertTrue(any("cannot remove ipc socket" in line
+                            for line in captured.output))
+
+    def test_hub_allocator_reclaims_stale_socket_files(self):
+        run_dir = self.tmp / "run"
+        allocator = AddressAllocator(mode="ipc", host="127.0.0.1",
+                                     run_dir=run_dir)
+        addresses = allocator.allocate("coder.1")
+        paths = [Path(url[len("ipc://"):])
+                 for url in (addresses.rpc, addresses.events)]
+        for path in paths:
+            path.write_text("stale", "utf-8")
+        allocator.release("coder.1")
+        for path in paths:
+            self.assertFalse(path.exists())
+        # A crashed predecessor leaves files behind; reallocation unlinks them
+        # before the new listener binds, so a stale socket cannot wedge a unit.
+        for path in paths:
+            path.write_text("stale", "utf-8")
+        allocator.allocate("coder.1")
+        for path in paths:
+            self.assertFalse(path.exists())
+
 
 
 if __name__ == "__main__":

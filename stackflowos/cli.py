@@ -139,6 +139,9 @@ def _parser() -> argparse.ArgumentParser:
     backup = sub.add_parser("backup", help="create a state archive")
     _add_common(backup)
     backup.add_argument("--dest", default=None, help="target directory/file")
+    backup.add_argument("--include-secrets", action="store_true",
+                        help="write config.json API keys/tokens in clear text "
+                             "(default: secrets are masked as ***)")
     backup.add_argument("--keep", type=int, default=None,
                         help="keep the newest N archives")
 
@@ -876,7 +879,9 @@ def _backup(args) -> int:
     from .observability.backup import backup_status, create_backup
 
     path = create_backup(cfg.paths, dest=getattr(args, "dest", None),
-                         keep=getattr(args, "keep", None))
+                         keep=getattr(args, "keep", None),
+                         include_secrets=bool(getattr(args, "include_secrets",
+                                                       False)))
     print(path)
     status = backup_status(cfg.paths)
     print(f"backups={status.get('backups', 0)} bytes={status.get('bytes', 0)}")

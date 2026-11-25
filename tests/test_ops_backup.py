@@ -261,5 +261,96 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(status["bytes"], 0)
 
 
+    # -- secret redaction (W3 item 3) -------------------------------------
+    def _write_secret_config(self, state: Path, api_key: str) -> None:
+        (state / "config.json").write_text(json.dumps({
+            "llm": {"api_key": api_key, "provider": "mock"},
+            "web": {"users": [{"name": "operator",
+                               "token_sha256": "deadbeef"}]},
+        }), "utf-8")
+
+    def test_backup_redacts_config_secrets_by_default(self):
+        state = _make_state(self.tmp)
+        self._write_secret_config(state, "sk-real-secret-value")
+        archive = backup.create_backup(state)
+        with tarfile.open(archive, "r:gz") as tar:
+            raw = tar.extractfile("config.json").read()
+            manifest = json.load(tar.extractfile("manifest.json"))
+        self.assertNotIn(b"sk-real-secret-value", raw)
+        data = json.loads(raw)
+        self.assertEqual(data["llm"]["api_key"], "***")
+        self.assertEqual(data["web"]["users"][0]["token_sha256"], "***")
+        # Non-secret fields survive untouched.
+        self.assertEqual(data["llm"]["provider"], "mock")
+        self.assertEqual(data["web"]["users"][0]["name"], "operator")
+        self.assertEqual(manifest["include_secrets"], False)
+        self.assertEqual(manifest["secrets"]["redacted"], ["config.json"])
+        self.assertEqual(manifest["secrets"]["fields"], 2)
+        # The manifest hashes what the archive actually stores.
+        entry = manifest["files"]["config.json"]
+        self.assertEqual(entry["size"], len(raw))
+
+    def test_backup_masks_strings_beneath_a_secret_container(self):
+        state = _make_state(self.tmp)
+        (state / "config.json").write_text(json.dumps({
+            "secrets": {"github": "ghp_nested_secret", "retries": 42},
+            "llm": {"provider": "mock"},
+        }), "utf-8")
+        archive = backup.create_backup(state)
+        with tarfile.open(archive, "r:gz") as tar:
+            raw = tar.extractfile("config.json").read()
+        self.assertNotIn(b"ghp_nested_secret", raw)
+        data = json.loads(raw)
+        self.assertEqual(data["secrets"]["github"], "***")
+        self.assertEqual(data["secrets"]["retries"], "***")
+        self.assertEqual(data["llm"]["provider"], "mock")
+
+    def test_include_secrets_writes_plaintext_on_request(self):
+        state = _make_state(self.tmp)
+        self._write_secret_config(state, "sk-explicit-plaintext")
+        archive = backup.create_backup(state, include_secrets=True)
+        with tarfile.open(archive, "r:gz") as tar:
+            raw = tar.extractfile("config.json").read()
+            manifest = json.load(tar.extractfile("manifest.json"))
+        self.assertIn(b"sk-explicit-plaintext", raw)
+        self.assertEqual(manifest["include_secrets"], True)
+        self.assertEqual(manifest["secrets"]["redacted"], [])
+        # An explicit plaintext backup restores the credential verbatim.
+        target = self.tmp / "plain" / "state"
+        backup.restore(archive, target)
+        restored = json.loads((target / "config.json").read_text("utf-8"))
+        self.assertEqual(restored["llm"]["api_key"], "sk-explicit-plaintext")
+
+    def test_restore_keeps_current_secret_values(self):
+        source = _make_state(self.tmp / "source")
+        self._write_secret_config(source, "sk-original-backup")
+        archive = backup.create_backup(source)
+        target = _make_state(self.tmp / "target")
+        self._write_secret_config(target, "sk-current-host")
+        result = backup.restore(archive, target, force=True)
+        restored = json.loads((target / "config.json").read_text("utf-8"))
+        # The redacted backup did not clobber the host's live credential...
+        self.assertEqual(restored["llm"]["api_key"], "sk-current-host")
+        # ...while non-secret config from the backup is applied.
+        self.assertEqual(restored["llm"]["provider"], "mock")
+        self.assertNotIn("sk-original-backup",
+                         (target / "config.json").read_text("utf-8"))
+        self.assertTrue(result["secrets"]["redacted"])
+        self.assertGreaterEqual(result["secrets"]["restored"], 1)
+
+    def test_restore_without_current_secret_reports_missing_mask(self):
+        source = _make_state(self.tmp / "source")
+        self._write_secret_config(source, "sk-original-backup")
+        archive = backup.create_backup(source)
+        target = self.tmp / "fresh" / "state"
+        result = backup.restore(archive, target)
+        restored = json.loads((target / "config.json").read_text("utf-8"))
+        self.assertEqual(restored["llm"]["api_key"], "***")
+        self.assertTrue(result["secrets"]["redacted"])
+        self.assertEqual(result["secrets"]["restored"], 0)
+        self.assertGreaterEqual(result["secrets"]["missing"], 1)
+
+
+
 if __name__ == "__main__":
     unittest.main()

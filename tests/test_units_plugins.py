@@ -10,6 +10,8 @@ from pathlib import Path
 from stackflowos.app import App
 from stackflowos.config import Config, default_root
 from stackflowos.security import Principal
+from stackflowos.security.plugin_audit import (high_risk_permissions,
+                                               permission_risk)
 from stackflowos.web.api import WebAPI
 
 REPO = default_root()
@@ -225,6 +227,105 @@ class PluginLoaderTests(unittest.IsolatedAsyncioTestCase):
         status, payload = await self.api_call("GET", "/api/plugins")
         by_id = {item["id"]: item for item in payload["data"]["plugins"]}
         self.assertEqual(by_id["bad"]["status"], "invalid")
+
+
+    # -- manifest permission audit (W3 item 4) ---------------------------
+    async def _wait_for_security_event(self, predicate, timeout: float = 3.0):
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            for record in self.app.eventlog.query(types=["security"], limit=100):
+                if record.type == "security.plugin_permissions" and predicate(record):
+                    return record
+            await asyncio.sleep(0.01)
+        self.fail("security.plugin_permissions event was not recorded")
+
+    async def test_high_risk_plugin_permissions_are_warned_and_audited(self):
+        risky = self.tmp / "risky_plugins"
+        (risky / "risky").mkdir(parents=True)
+        (risky / "risky" / "stackflow.plugin.json").write_text(json.dumps({
+            "id": "risky", "name": "Risky", "version": "1.0.0",
+            "entry": {"type": "python", "module": "risky_plugin:apply"},
+            "permissions": ["inproc", "net:api.example.com",
+                            "secret:API_KEY"],
+        }), "utf-8")
+        (risky / "risky" / "risky_plugin.py").write_text(
+            "def apply(ctx, provides):\n    return None\n", "utf-8")
+        self.app.config = self.app.config.update({
+            "plugins": {"dirs": [str(EXAMPLES), str(risky)],
+                        "enabled": ["hello"]}})
+        self.app.plugin_loader.discover()
+        with self.assertLogs("sfo.security.plugins", level="WARNING") as captured:
+            await self.app.plugin_loader.load("risky")
+            record = await self._wait_for_security_event(
+                lambda item: item.data.get("plugin_id") == "risky")
+        data = record.data
+        self.assertEqual(data["enforced"], False)
+        self.assertEqual(data["source"], "plugin.loaded")
+        self.assertIn("net:api.example.com", data["high_risk"])
+        self.assertIn("secret:API_KEY", data["high_risk"])
+        self.assertNotIn("inproc", data["high_risk"])
+        self.assertTrue(any("NOT enforced" in line for line in captured.output))
+        # The low-risk example plugin does not produce audit noise.
+        hello_events = [item for item in
+                        self.app.eventlog.query(types=["security"], limit=100)
+                        if item.type == "security.plugin_permissions"
+                        and item.data.get("plugin_id") == "hello"]
+        self.assertEqual(hello_events, [])
+
+    def test_permission_risk_classification_is_conservative(self):
+        self.assertEqual(permission_risk("inproc"), "low")
+        self.assertEqual(permission_risk(""), "low")
+        for declared in ("net:api.github.com", "secret:github_token",
+                         "shell", "fs:workspace", "unknown-capability"):
+            self.assertEqual(permission_risk(declared), "high", declared)
+        self.assertEqual(
+            high_risk_permissions(["inproc", "net:api.github.com", "shell"]),
+            ["net:api.github.com", "shell"])
+
+
+class PluginPermissionStartupTests(unittest.IsolatedAsyncioTestCase):
+    """A plugin loaded during startup is audited by the startup scan."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory(
+            dir=str(REPO / ".stackflowos" / "tmp"))
+        self.tmp = Path(self._tmp.name)
+        risky = self.tmp / "plugins"
+        (risky / "risky").mkdir(parents=True)
+        (risky / "risky" / "stackflow.plugin.json").write_text(json.dumps({
+            "id": "risky", "name": "Risky", "version": "1.0.0",
+            "entry": {"type": "python", "module": "risky_plugin:apply"},
+            "permissions": ["net:api.example.com"],
+        }), "utf-8")
+        (risky / "risky" / "risky_plugin.py").write_text(
+            "def apply(ctx, provides):\n    return None\n", "utf-8")
+        cfg = Config.load(root=self.tmp, state_dir=self.tmp / "state")
+        cfg = cfg.update({
+            "skills": {"dirs": [], "enabled": []},
+            "plugins": {"dirs": [str(risky)], "enabled": ["risky"]},
+            "mcp": {"servers": []},
+        })
+        self.app = App(cfg)
+
+    async def asyncTearDown(self):
+        await self.app.stop()
+        self._tmp.cleanup()
+
+    async def test_startup_load_is_audited_and_warned(self):
+        with self.assertLogs("sfo.security.plugins", level="WARNING") as captured:
+            await self.app.start()
+        records = [record for record in
+                   self.app.eventlog.query(types=["security"], limit=100)
+                   if record.type == "security.plugin_permissions"]
+        self.assertTrue(records, "startup scan did not audit the plugin")
+        self.assertEqual(records[0].data["plugin_id"], "risky")
+        self.assertEqual(records[0].data["source"], "startup")
+        self.assertEqual(records[0].data["enforced"], False)
+        self.assertTrue(any("NOT enforced" in line for line in captured.output))
+
 
 
 if __name__ == "__main__":

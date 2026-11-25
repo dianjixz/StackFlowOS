@@ -41,6 +41,7 @@ in-process (a dedicated worker process can call that once at startup).
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import platform
 import shutil
@@ -48,7 +49,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 # ----------------------------------------------------------------------
 # constants
@@ -235,23 +236,14 @@ def detect_backends() -> dict[str, BackendInfo]:
     }
 
 
-def detect_backend(prefer: str = "auto", *,
-                   allow_network: bool = False) -> str:
-    """Return the strongest usable backend name for the preference.
+def _select_backend(infos: dict[str, BackendInfo], preference: str,
+                    allow_network: bool = False) -> str:
+    """Pure backend selection on already-probed :class:`BackendInfo` values.
 
-    ``auto`` prefers Landlock (unprivileged), then bubblewrap.  A preference
-    for an unavailable backend degrades to ``"unsandboxed"`` rather than
-    pretending.  When ``allow_network`` is False, a backend that cannot isolate
-    the network is only selected if nothing better exists; callers should pass
-    the returned name to :func:`build_command`, which records the trade-off in
-    its notes.
+    Shared by :func:`detect_backend` and :func:`capability_matrix` so the
+    startup audit reports exactly the backend the executor would pick without
+    probing bubblewrap twice.  ``preference`` must already be normalised.
     """
-    preference = str(prefer or "auto").strip().lower()
-    if preference in _SANDBOX_OFF:
-        return BACKEND_UNSANDBOXED
-    if preference not in _VALID_PREFERENCE:
-        raise ValueError(f"unknown sandbox preference: {prefer!r}")
-    infos = detect_backends()
     if preference == BACKEND_LANDLOCK:
         return (BACKEND_LANDLOCK if infos[BACKEND_LANDLOCK].available
                 else BACKEND_UNSANDBOXED)
@@ -275,6 +267,222 @@ def detect_backend(prefer: str = "auto", *,
     if land.available:
         return BACKEND_LANDLOCK
     return BACKEND_UNSANDBOXED
+
+
+def detect_backend(prefer: str = "auto", *,
+                   allow_network: bool = False) -> str:
+    """Return the strongest usable backend name for the preference.
+
+    ``auto`` prefers Landlock (unprivileged), then bubblewrap.  A preference
+    for an unavailable backend degrades to ``"unsandboxed"`` rather than
+    pretending.  When ``allow_network`` is False, a backend that cannot isolate
+    the network is only selected if nothing better exists; callers should pass
+    the returned name to :func:`build_command`, which records the trade-off in
+    its notes.
+    """
+    preference = str(prefer or "auto").strip().lower()
+    if preference in _SANDBOX_OFF:
+        return BACKEND_UNSANDBOXED
+    if preference not in _VALID_PREFERENCE:
+        raise ValueError(f"unknown sandbox preference: {prefer!r}")
+    return _select_backend(detect_backends(), preference, allow_network)
+
+
+# ----------------------------------------------------------------------
+# capability matrix / startup audit
+# ----------------------------------------------------------------------
+def capability_matrix(*, probe_bwrap: bool = True) -> dict:
+    """Probe the host and return a JSON-friendly capability matrix.
+
+    The matrix is the single source of truth for "what would actually
+    isolate this host": both backends' availability and concrete reason, the
+    backend ``auto`` would select, and whether that leaves commands
+    unsandboxed.  :func:`detect_landlock` is a cheap syscall; bubblewrap is a
+    functional probe that spawns a process, so callers may pass
+    ``probe_bwrap=False`` (startup with ``security.sandbox=off``) and get an
+    explicit ``probed: false`` instead of a guessed verdict.
+    """
+    landlock = detect_landlock()
+    if probe_bwrap:
+        bwrap_info = detect_bwrap()
+        bwrap = {
+            "available": bool(bwrap_info.available),
+            "detail": bwrap_info.detail,
+            "path": bwrap_info.path,
+            "network_isolated": bool(bwrap_info.network_isolated),
+            "probed": True,
+        }
+    else:
+        bwrap = {
+            "available": False,
+            "detail": "not probed (security.sandbox=off or caller skipped)",
+            "path": "",
+            "network_isolated": False,
+            "probed": False,
+        }
+    infos = {
+        BACKEND_LANDLOCK: BackendInfo(
+            BACKEND_LANDLOCK, landlock.available,
+            landlock.reason or "ok", landlock_abi=landlock.abi,
+            network_isolated=landlock.supports_network),
+        BACKEND_BWRAP: BackendInfo(
+            BACKEND_BWRAP, bwrap["available"], bwrap["detail"],
+            path=bwrap["path"],
+            network_isolated=bwrap["network_isolated"]),
+    }
+    selected: dict[str, str | None] = {}
+    if probe_bwrap:
+        selected = {
+            BACKEND_LANDLOCK: _select_backend(
+                infos, BACKEND_LANDLOCK, allow_network=False),
+            BACKEND_BWRAP: _select_backend(
+                infos, BACKEND_BWRAP, allow_network=False),
+            "auto": _select_backend(infos, "auto", allow_network=False),
+            "auto_allow_network": _select_backend(
+                infos, "auto", allow_network=True),
+        }
+    auto_backend = selected.get("auto") if probe_bwrap else None
+    reasons: list[str] = []
+    if not landlock.available:
+        reasons.append(f"landlock: {landlock.reason or 'unavailable'}")
+    if not bwrap["available"]:
+        reasons.append(f"bwrap: {bwrap['detail'] or 'unavailable'}")
+    return {
+        "platform": sys.platform,
+        "landlock": {
+            "available": bool(landlock.available),
+            "abi": int(landlock.abi),
+            "reason": landlock.reason,
+            "network_isolated": bool(landlock.supports_network),
+        },
+        "bwrap": bwrap,
+        "selected": selected,
+        "auto_backend": auto_backend,
+        "unsandboxed": auto_backend == BACKEND_UNSANDBOXED,
+        "reasons": reasons,
+        "probed": probe_bwrap,
+    }
+
+
+def matrix_line(matrix: dict) -> str:
+    """One-line capability summary for logs, skip reasons and health."""
+    landlock = matrix.get("landlock") or {}
+    bwrap = matrix.get("bwrap") or {}
+    land_text = (f"available(abi={landlock.get('abi', 0)})"
+                 if landlock.get("available")
+                 else f"unavailable({landlock.get('reason') or 'unknown'})")
+    bwrap_text = (f"available(net={bool(bwrap.get('network_isolated'))})"
+                  if bwrap.get("available")
+                  else f"unavailable({bwrap.get('detail') or 'unknown'})")
+    auto = matrix.get("auto_backend")
+    if auto is None:
+        auto_text = "not-probed"
+    elif auto == BACKEND_UNSANDBOXED:
+        auto_text = f"{BACKEND_UNSANDBOXED}(no backend)"
+    else:
+        auto_text = str(auto)
+    return f"landlock={land_text}; bwrap={bwrap_text}; auto={auto_text}"
+
+
+def selected_backend(matrix: dict, preference: str = "auto", *,
+                     allow_network: bool = False) -> str:
+    """Resolve a backend from an existing matrix (no additional probing)."""
+    preference = str(preference or "auto").strip().lower()
+    if preference in _SANDBOX_OFF:
+        return BACKEND_UNSANDBOXED
+    if preference not in _VALID_PREFERENCE:
+        raise ValueError(f"unknown sandbox preference: {preference!r}")
+    landlock = matrix.get("landlock") or {}
+    bwrap = matrix.get("bwrap") or {}
+    infos = {
+        BACKEND_LANDLOCK: BackendInfo(
+            BACKEND_LANDLOCK, bool(landlock.get("available")),
+            str(landlock.get("reason") or ""),
+            landlock_abi=int(landlock.get("abi") or 0),
+            network_isolated=bool(landlock.get("network_isolated"))),
+        BACKEND_BWRAP: BackendInfo(
+            BACKEND_BWRAP, bool(bwrap.get("available")),
+            str(bwrap.get("detail") or ""),
+            path=str(bwrap.get("path") or ""),
+            network_isolated=bool(bwrap.get("network_isolated"))),
+    }
+    return _select_backend(infos, preference, allow_network)
+
+
+def _audit_event(app: Any, event_type: str, data: dict) -> None:
+    """Append an audit event, tolerating a bare/fake app in tests."""
+    eventlog = getattr(app, "eventlog", None)
+    if eventlog is None:
+        return
+    try:
+        from ..l2.eventlog import emit_both
+
+        ctx = getattr(app, "ctx", None)
+        if ctx is not None:
+            emit_both(ctx, eventlog, event_type, data)
+        else:
+            eventlog.append(event_type, data, source="sys")
+    except Exception:  # pragma: no cover - audit must never break startup
+        logging.getLogger("sfo.security.sandbox").debug(
+            "sandbox audit event %s failed", event_type, exc_info=True)
+
+
+def audit_startup(app: Any, *, logger: logging.Logger | None = None) -> dict:
+    """Probe the sandbox backends at startup and make the verdict auditable.
+
+    * builds the capability matrix (bubblewrap probing is skipped when the
+      sandbox is configured ``off``, to keep boot fast and spawn no process);
+    * logs the matrix at INFO;
+    * when a non-off mode has *no* usable backend, logs a prominent WARNING and
+      appends a ``sandbox.unsandboxed`` audit event so the degradation is
+      visible in the event log (not only in one log line);
+    * otherwise appends ``sandbox.capabilities`` with the full matrix.
+
+    Returns the matrix (with ``mode``/``effective_backend`` added), never
+    raises: startup must not fail because capability probing did.
+    """
+    log = logger or logging.getLogger("sfo.security.sandbox")
+    config = getattr(app, "config", None)
+    security = getattr(config, "security", None)
+    raw_mode = str(getattr(security, "sandbox", "off") or "off").strip().lower()
+    disabled = raw_mode in _SANDBOX_OFF
+    mode = "off" if disabled else raw_mode
+    try:
+        matrix = capability_matrix(probe_bwrap=not disabled)
+        matrix["mode"] = mode
+        allow_network = bool(getattr(security, "sandbox_allow_network", False))
+        matrix["allow_network"] = allow_network
+        if disabled:
+            log.info("sandbox disabled (security.sandbox=off); capability "
+                     "matrix: %s", matrix_line(matrix))
+            return matrix
+        effective = selected_backend(matrix, mode, allow_network=allow_network)
+        matrix["effective_backend"] = effective
+        if effective == BACKEND_UNSANDBOXED:
+            reason = "; ".join(matrix.get("reasons") or ()) or "unknown"
+            log.warning(
+                "sandbox mode %r requested but no backend is available: %s; "
+                "shell.exec and worker processes run UNSANDBOXED", mode, reason)
+            _audit_event(app, "sandbox.unsandboxed", {
+                "mode": mode,
+                "effective_backend": BACKEND_UNSANDBOXED,
+                "allow_network": allow_network,
+                "matrix": matrix,
+                "reason": reason,
+            })
+        else:
+            log.info("sandbox effective backend=%s (mode=%s); capability "
+                     "matrix: %s", effective, mode, matrix_line(matrix))
+            _audit_event(app, "sandbox.capabilities", {
+                "mode": mode,
+                "effective_backend": effective,
+                "allow_network": allow_network,
+                "matrix": matrix,
+            })
+        return matrix
+    except Exception as exc:  # pragma: no cover - detection is best effort
+        log.warning("sandbox capability probe failed at startup: %s", exc)
+        return {"mode": mode, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ----------------------------------------------------------------------
@@ -648,12 +856,16 @@ __all__ = [
     "SandboxError",
     "SandboxPlan",
     "SandboxReport",
+    "audit_startup",
     "build_command",
+    "capability_matrix",
     "detect_backend",
     "detect_backends",
     "detect_bwrap",
     "detect_landlock",
+    "matrix_line",
     "preexec_landlock",
     "restrict_current_process",
+    "selected_backend",
     "wrap_command",
 ]

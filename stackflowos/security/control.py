@@ -275,8 +275,18 @@ class ControlExtension:
     def __init__(self, app: Any, server: ControlServer | None) -> None:
         self.app = app
         self.server = server
+        #: Startup capability matrix (sandbox backends), exposed via health().
+        self.sandbox_capabilities: dict = {}
+        self._plugin_auditor: Any = None
 
     async def start(self) -> None:
+        # The security control extension also owns the startup security audit:
+        # the sandbox capability matrix (so an unsandboxed degradation is a
+        # warning + audit event instead of a silent default) and the plugin
+        # permission audit (manifest permissions are display-only).  Both are
+        # best-effort and never block the hub.
+        self._sandbox_audit()
+        await self._start_plugin_audit()
         if self.server is None:
             return
         try:
@@ -287,7 +297,35 @@ class ControlExtension:
             self.server.log.warning("control socket disabled: %s", exc)
             self.server = None
 
+    def _sandbox_audit(self) -> None:
+        try:
+            from .sandbox import audit_startup
+
+            self.sandbox_capabilities = audit_startup(self.app)
+        except Exception as exc:  # pragma: no cover - audit is best effort
+            self.sandbox_capabilities = {}
+            get_logger("security.control").debug(
+                "sandbox startup audit failed: %s", exc)
+
+    async def _start_plugin_audit(self) -> None:
+        try:
+            from .plugin_audit import build_auditor
+
+            self._plugin_auditor = build_auditor(self.app)
+            await self._plugin_auditor.start()
+        except Exception as exc:  # pragma: no cover - audit is best effort
+            self._plugin_auditor = None
+            get_logger("security.control").debug(
+                "plugin permission audit failed to start: %s", exc)
+
     async def stop(self) -> None:
+        auditor, self._plugin_auditor = self._plugin_auditor, None
+        if auditor is not None:
+            try:
+                await auditor.stop()
+            except Exception:  # pragma: no cover - shutdown is best effort
+                get_logger("security.control").debug(
+                    "plugin permission audit stop failed", exc_info=True)
         if self.server is not None:
             await self.server.stop()
 
@@ -301,7 +339,10 @@ class ControlExtension:
 
     def health(self) -> dict:
         return {"socket": str(self.server.path) if self.server else None,
-                "listening": bool(self._listening())}
+                "listening": bool(self._listening()),
+                # Capability matrix from startup so the UI/ops can see *why*
+                # the sandbox is degraded instead of guessing from logs.
+                "sandbox": dict(self.sandbox_capabilities or {})}
 
     def _listening(self) -> bool:
         if self.server is None:

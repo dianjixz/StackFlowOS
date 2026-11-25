@@ -8,6 +8,12 @@ Layout of a backup (``sfo-backup-YYYYmmdd-HHMMSS-<rand>.tar.gz``)::
     projects/<id>/workspace/ # agent artifacts
     events/...               # append-only event log + rotations
 
+``config.json`` may contain credentials, so by default it is stored with
+secret-looking fields masked as ``***`` (``include_secrets=True`` writes it
+verbatim for an explicit opt-in).  Restore merges those placeholders with the
+target's current config values, so a round-trip through a redacted backup does
+not destroy secrets that already exist on the restoring host.
+
 Deliberately **excluded** (documented in docs/team/ops.md):
 
 * ``run/``   -- sockets/locks are process identities, not data;
@@ -45,6 +51,7 @@ from typing import Any, Iterator
 from ..errors import Conflict, ValidationError
 from ..util.jsonio import iter_jsonl
 from ..util.logging import get_logger
+from ..util.redact import MASK, is_secret_key
 from . import (BACKUP_FORMAT, BACKUP_VERSION, app_version, backup_keep_of,
                events_dir_of, now_ms, safe_int, state_dir_of)
 
@@ -52,6 +59,7 @@ _ARCHIVE_PREFIX = "sfo-backup-"
 _ARCHIVE_SUFFIX = ".tar.gz"
 _ROTATED_RE = re.compile(r"^events-(\d+)(?:-[^.]*)?\.jsonl$")
 _INCLUDE_ENTRIES = ("config.json", "state", "projects", "events")
+_CONFIG_NAME = "config.json"
 _EXCLUDED = ("run", "tmp", "logs", "backups")
 _MANIFEST = "manifest.json"
 _CHUNK = 1024 * 1024
@@ -164,15 +172,138 @@ def _archive_name() -> str:
     return f"{_ARCHIVE_PREFIX}{stamp}-{os.urandom(4).hex()}{_ARCHIVE_SUFFIX}"
 
 
+# -- secret redaction ----------------------------------------------------
+def _redact_secret_tree(value: Any, *, force: bool = False) -> tuple[Any, int]:
+    """Mask secret-looking string fields; return ``(copy, masked_count)``.
+
+    A key classified by :func:`stackflowos.util.redact.is_secret_key`
+    (``api_key``/``token``/``secret``/``password``/...) masks its own string
+    value.  When such a key holds an object/list, *every* string leaf beneath
+    it is masked as well (``force``), so ``"secrets": {"github": "ghp_..."}``
+    cannot leak through an innocent nested key name.  Structure is preserved,
+    no textual rewriting happens, and the input is never mutated, so the
+    restore merge can put live values back.
+    """
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        masked = 0
+        for key, item in value.items():
+            if is_secret_key(key):
+                if isinstance(item, str) and item:
+                    out[key] = MASK
+                    masked += 1
+                elif isinstance(item, (dict, list)):
+                    out[key], count = _redact_secret_tree(item, force=True)
+                    masked += count
+                elif item is None or item == "" or isinstance(item, bool):
+                    out[key] = item
+                else:
+                    # A non-string scalar under a secret name is still a
+                    # credential; never store it verbatim.
+                    out[key] = MASK
+                    masked += 1
+            else:
+                out[key], count = _redact_secret_tree(item, force=force)
+                masked += count
+        return out, masked
+    if isinstance(value, list):
+        out_list: list[Any] = []
+        masked = 0
+        for item in value:
+            clean, count = _redact_secret_tree(item, force=force)
+            out_list.append(clean)
+            masked += count
+        return out_list, masked
+    if force and value is not None and value != "" and not isinstance(value, bool):
+        # Inside a secret container every non-empty scalar leaf is a value the
+        # operator asked to keep out of the archive.
+        return MASK, 1
+    return value, 0
+
+
+def _redacted_config_payload(path: Path) -> tuple[bytes | None, int]:
+    """Return ``(redacted_json_bytes, masked_count)`` for a config file.
+
+    ``None`` means "do not archive it": an unparseable/oversized config is
+    omitted rather than written verbatim, because its secret fields cannot be
+    identified reliably.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, 0
+    if len(raw) > _MAX_FILE_BYTES:
+        return None, 0
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, 0
+    redacted, masked = _redact_secret_tree(data)
+    payload = json.dumps(redacted, ensure_ascii=False, indent=2,
+                         sort_keys=True).encode("utf-8") + b"\n"
+    return payload, masked
+
+
+def _restore_masked_secrets(current: Any, backup: Any) -> tuple[Any, int, int]:
+    """Replace ``***`` placeholders in *backup* with values from *current*.
+
+    Mirrors the UI config patch semantics: a masked value is only restored
+    when the target already has a real (non-masked) value for the same path.
+    Returns ``(merged, restored_count, missing_count)``.
+    """
+    counts = {"restored": 0, "missing": 0}
+
+    def walk(cur: Any, bak: Any) -> Any:
+        if isinstance(bak, str) and bak == MASK:
+            if (isinstance(cur, (str, int, float))
+                    and not isinstance(cur, bool)
+                    and cur != "" and cur != MASK):
+                counts["restored"] += 1
+                return cur
+            counts["missing"] += 1
+            return bak
+        if isinstance(bak, dict):
+            cur_map = cur if isinstance(cur, dict) else {}
+            return {key: walk(cur_map.get(key), item)
+                    for key, item in bak.items()}
+        if isinstance(bak, list):
+            cur_list = cur if isinstance(cur, list) else []
+            by_name = {
+                str(item["name"]): item for item in cur_list
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            }
+            merged: list[Any] = []
+            for index, item in enumerate(bak):
+                if (isinstance(item, dict)
+                        and isinstance(item.get("name"), str)
+                        and item["name"] in by_name):
+                    merged.append(walk(by_name[item["name"]], item))
+                elif index < len(cur_list):
+                    merged.append(walk(cur_list[index], item))
+                else:
+                    merged.append(walk(None, item))
+            return merged
+        return bak
+
+    return walk(current, backup), counts["restored"], counts["missing"]
+
+
 # -- backup --------------------------------------------------------------
 def create_backup(paths: Any, dest: str | Path | None = None,
-                  keep: int | None = None) -> Path:
+                  keep: int | None = None, *,
+                  include_secrets: bool = False) -> Path:
     """Create a ``tar.gz`` backup and return its path.
 
     ``paths`` accepts an ``App``, a ``config.Paths`` object or a state-dir
     path.  ``dest`` defaults to ``<state>/backups``.  When ``keep`` is omitted
     it comes from ``observability.backup_keep`` (default 7); ``keep <= 0``
     disables pruning.
+
+    ``include_secrets`` defaults to ``False``: ``config.json`` is stored with
+    secret-looking fields masked as ``***`` so the archive itself does not
+    carry API keys.  Pass ``True`` (CLI/ops explicit opt-in) to write it
+    verbatim; the manifest records which files were redacted so
+    :func:`restore` can merge the placeholders with live values.
     """
     state = state_dir_of(paths)
     if not state.exists() or not state.is_dir():
@@ -202,9 +333,14 @@ def create_backup(paths: Any, dest: str | Path | None = None,
         "files": {},
         "skipped": [],
         "counts": {"files": 0, "bytes": 0},
+        "include_secrets": bool(include_secrets),
+        #: Files whose secret-looking fields were masked in this archive.
+        "secrets": {"redacted": [], "mask": MASK, "fields": 0},
     }
     total = 0
     skipped: list[str] = []
+    redacted_files: list[str] = []
+    redacted_fields = 0
     try:
         with tarfile.open(temp_path, "w:gz") as archive:
             for path, arcname in _iter_backup_files(state, skipped):
@@ -218,11 +354,27 @@ def create_backup(paths: Any, dest: str | Path | None = None,
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 info.mode = (info.mode & 0o777) or 0o600
-                try:
-                    handle = open(path, "rb")
-                except OSError:
-                    _LOG.warning("skipping unreadable file during backup: %s", path)
-                    continue
+                redacted_payload: bytes | None = None
+                if arcname == _CONFIG_NAME and not include_secrets:
+                    redacted_payload, masked = _redacted_config_payload(path)
+                    if redacted_payload is None:
+                        skipped.append(
+                            f"{arcname} (unparseable; omitted to avoid "
+                            "leaking secrets)")
+                        _LOG.warning(
+                            "config.json is not valid JSON; omitting it from "
+                            "the backup instead of storing possible secrets")
+                        continue
+                    info.size = len(redacted_payload)
+                    redacted_files.append(arcname)
+                    redacted_fields += masked
+                    handle = io.BytesIO(redacted_payload)
+                else:
+                    try:
+                        handle = open(path, "rb")
+                    except OSError:
+                        _LOG.warning("skipping unreadable file during backup: %s", path)
+                        continue
                 with handle:
                     reader = _HashingReader(handle)
                     # Do not swallow read errors mid-member: a partially
@@ -241,6 +393,9 @@ def create_backup(paths: Any, dest: str | Path | None = None,
                 "files": len(manifest["files"]),
                 "bytes": total,
             }
+            manifest["secrets"] = {"redacted": list(redacted_files),
+                                   "mask": MASK,
+                                   "fields": redacted_fields}
             payload = json.dumps(manifest, ensure_ascii=False,
                                  sort_keys=True).encode("utf-8")
             info = tarfile.TarInfo(_MANIFEST)
@@ -492,6 +647,51 @@ def restore(archive: str | Path, state_dir: str | Path, force: bool = False, *,
                 restored_files += 1
                 restored_bytes += size
 
+        # A redacted backup carries ``***`` for config secrets.  Before the
+        # swap, fill those placeholders from the target's *current* config so a
+        # restore does not destroy credentials that already exist here; when the
+        # target has no value the mask stays (and is reported below).
+        secrets_meta = (manifest.get("secrets")
+                        if isinstance(manifest.get("secrets"), dict) else {})
+        redacted_names: list[str] = []
+        for raw_name in secrets_meta.get("redacted") or ():
+            if not isinstance(raw_name, str):
+                continue
+            try:
+                redacted_names.append(_safe_member_name(raw_name))
+            except BackupError:
+                continue
+        restored_secrets = 0
+        missing_secrets = 0
+        if _CONFIG_NAME in redacted_names:
+            staged_config = staging / _CONFIG_NAME
+            if staged_config.is_file():
+                current_config = state / _CONFIG_NAME
+                current_data: Any = None
+                try:
+                    if (current_config.is_file()
+                            and not current_config.is_symlink()):
+                        current_data = json.loads(
+                            current_config.read_text("utf-8"))
+                except (OSError, ValueError):
+                    current_data = None
+                try:
+                    backup_data = json.loads(staged_config.read_text("utf-8"))
+                    merged, restored_secrets, missing_secrets = \
+                        _restore_masked_secrets(current_data, backup_data)
+                    staged_config.write_text(
+                        json.dumps(merged, ensure_ascii=False, indent=2,
+                                   sort_keys=True) + "\n", "utf-8")
+                except (OSError, ValueError):
+                    _LOG.warning(
+                        "could not merge current secrets into restored "
+                        "config.json; masked placeholders remain")
+        if missing_secrets:
+            _LOG.warning(
+                "restored config.json has %d masked secret field(s) with no "
+                "current value to fill them; re-enter them after restore",
+                missing_secrets)
+
         # Swap the fully validated tree into place.  Keep the old tree until
         # the rename succeeds so a failure cannot leave the operator with
         # neither the old nor the new state.
@@ -551,6 +751,11 @@ def restore(archive: str | Path, state_dir: str | Path, force: bool = False, *,
             "bytes": restored_bytes,
             "replaced": previous is not None,
             "backup": str(backup_path) if backup_path is not None else None,
+            "secrets": {
+                "redacted": _CONFIG_NAME in redacted_names,
+                "restored": restored_secrets,
+                "missing": missing_secrets,
+            },
             "manifest": {
                 "version": BACKUP_VERSION,
                 "created_at": manifest.get("created_at"),
@@ -725,8 +930,10 @@ class BackupExtension:
         self.app = app
         self.log = get_logger("observability.backup")
 
-    def create(self, dest: str | Path | None = None, keep: int | None = None) -> Path:
-        return create_backup(self.app, dest=dest, keep=keep)
+    def create(self, dest: str | Path | None = None, keep: int | None = None,
+               *, include_secrets: bool = False) -> Path:
+        return create_backup(self.app, dest=dest, keep=keep,
+                             include_secrets=include_secrets)
 
     def restore(self, archive: str | Path, force: bool = False) -> dict:
         return restore(archive, self.app.paths.state_dir, force=force)

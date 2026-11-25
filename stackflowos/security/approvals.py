@@ -13,6 +13,13 @@ one-shot grants are bound to execution through :meth:`ApprovalBroker.claim`
 Every request/decision/claim/use is written to the event log, so the audit
 page is just a filtered event stream. Pending requests and the last 200
 decided ones are persisted atomically.
+
+Timeout (default ``security.approval_ttl_s`` = 300s) is a **denial**: a
+pending request that expires is never auto-approved.  W3 makes the expiry
+observable beyond ``approval.expired``: ``approval.timeout`` is emitted with
+``decision="deny"``/``escalated=True``, a WARNING is logged, the ledger gets a
+bounded ``timeout_queue()`` entry, and an optional synchronous
+``timeout_handler`` (never able to approve) can forward the escalation.
 """
 
 from __future__ import annotations
@@ -21,9 +28,10 @@ import hashlib
 import logging
 import re
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..errors import BadRequest, Conflict, Denied, NotFound, ValidationError
 from ..kernel import Context
@@ -71,6 +79,9 @@ _KEEP_DECIDED = 200
 _KEEP_AUTO_DECIDED = 50
 #: Hard ceiling for a stored full preview (chars); config is validated to it.
 _MAX_PREVIEW_STORE_CHARS = 262144
+#: Bounded in-memory "operator queue" of timed-out requests.  Escalation is
+#: observability, never auto-approval: the request stays expired/denied.
+_TIMEOUT_QUEUE_MAX = 100
 
 
 @dataclass
@@ -149,6 +160,7 @@ class ApprovalBroker:
                  approvals_path: Path, approval_ttl_s: int = 300,
                  grant_ttl_s: int = 3600,
                  preview_store_chars: int = 65536,
+                 timeout_handler: Callable[[ApprovalRequest], Any] | None = None,
                  logger: logging.Logger | None = None) -> None:
         self.ctx = ctx
         self.policy = policy
@@ -162,6 +174,11 @@ class ApprovalBroker:
                                      logging.getLogger("sfo.security.approvals"))
         self._requests: dict[str, ApprovalRequest] = {}
         self._lock = threading.RLock()
+        #: Optional operator-side escalation hook (sync; exceptions logged).
+        self._timeout_handler = timeout_handler if callable(timeout_handler) else None
+        #: Bounded queue the operator UI / assistant can drain; ``approval.expired``
+        #: remains the durable audit record.
+        self._timeouts: deque[dict] = deque(maxlen=_TIMEOUT_QUEUE_MAX)
         self.load()
 
     # -- request ----------------------------------------------------------
@@ -307,6 +324,7 @@ class ApprovalBroker:
         self.save()
         if expired:
             self._emit("approval.expired", request)
+            self._record_timeout(request, source="decide")
             raise Conflict(f"approval {request_id!r} has expired",
                            detail={"request_id": request_id, "status": "expired"})
         self._emit("approval.decided", request, decision=decision,
@@ -476,6 +494,7 @@ class ApprovalBroker:
                 request.note = request.note or "expired"
             self.save()
             self._emit("approval.expired", request)
+            self._record_timeout(request, source="poll")
         return request
 
     def use(self, grant_id: str, *, principal: str | None = None) -> bool:
@@ -569,7 +588,68 @@ class ApprovalBroker:
             self.save()
             for request in expired:
                 self._emit("approval.expired", request)
+                self._record_timeout(request, source="sweep")
         return expired
+
+    # -- timeout escalation (W3, item 5) ----------------------------------
+    def set_timeout_handler(
+            self, handler: Callable[[ApprovalRequest], Any] | None) -> None:
+        """Register an optional escalation sink for timed-out requests.
+
+        The hook is advisory: it cannot approve the request, and an exception
+        inside it is logged and swallowed so the fail-closed expiry path is
+        never broken.  Passing ``None`` removes the hook.
+        """
+        self._timeout_handler = handler if callable(handler) else None
+
+    def timeout_queue(self, limit: int = 50) -> list[dict]:
+        """Recent timeout escalations, oldest first (bounded, in-memory).
+
+        This is the minimal "operator queue": a timed-out request is recorded
+        here and in ``approval.timeout`` so an operator can follow up, while
+        the request itself stays expired (a timeout is still a denial).
+        """
+        try:
+            size = max(1, min(int(limit), _TIMEOUT_QUEUE_MAX))
+        except (TypeError, ValueError):
+            size = 50
+        with self._lock:
+            return [dict(item) for item in list(self._timeouts)[-size:]]
+
+    def _record_timeout(self, request: ApprovalRequest,
+                        *, source: str) -> None:
+        """Record one timeout escalation: event + queue + warning + hook."""
+        entry = {
+            "request_id": request.id,
+            "principal": request.principal,
+            "capability": request.capability,
+            "risk": request.risk,
+            "project_id": request.project_id,
+            "task_id": request.task_id,
+            "expired_at": request.decided_at or _now_ms(),
+            "source": source,
+            "escalated_to": "operator",
+        }
+        with self._lock:
+            self._timeouts.append(dict(entry))
+        self.log.warning(
+            "approval %s (%s/%s) timed out after %ss; treated as deny and "
+            "escalated to the operator queue (%s)", request.id,
+            request.principal, request.capability,
+            max(0, int((request.expires_at - request.created_at) / 1000)),
+            source)
+        self._emit("approval.timeout", request, escalated=True,
+                   escalation=entry, decision="deny")
+        handler = self._timeout_handler
+        if handler is not None:
+            try:
+                result = handler(request)
+                if result is not None and hasattr(result, "__await__"):
+                    self.log.debug(
+                        "approval timeout handler returned an awaitable; "
+                        "escalation hooks must be synchronous")
+            except Exception:  # noqa: BLE001 - escalation cannot break expiry
+                self.log.exception("approval timeout escalation hook failed")
 
     def pending_count(self) -> int:
         """Number of requests still waiting for a human decision."""
