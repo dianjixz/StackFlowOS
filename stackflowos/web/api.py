@@ -14,8 +14,9 @@ import re
 import secrets
 from typing import Any, Awaitable, Callable
 
-from ..errors import BadRequest, SfoError
+from ..errors import BadRequest, Denied, SfoError
 from ..extensions import extension_routes
+from ..protocol import now_ms
 from ..util.logging import get_logger
 
 Handler = Callable[[re.Match, dict, dict], Awaitable[tuple[int, Any]]]
@@ -55,6 +56,43 @@ class WebReply:
 _INTEGER = re.compile(r"^[+-]?[0-9]+$")
 _TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_STRINGS = frozenset({"", "0", "false", "no", "off"})
+
+#: ``GET /api/units?include=`` values (docs/units-plan.md §6.1).  Absent keeps
+#: the historical full-descriptor payload; ``brief`` trims each unit to
+#: identity/state/runtime/lease/abilities; ``descriptor`` spells out the
+#: default explicitly.  An unknown token is a client bug, not something to
+#: silently ignore (the audit found the parameter was ignored entirely).
+_UNIT_INCLUDE_VALUES = frozenset({"descriptor", "brief"})
+_UNIT_BRIEF_FIELDS = (
+    "unit_id", "work_id", "kind", "role", "tier", "label", "project_id",
+    "status", "state", "reason", "critical", "runtime", "lease", "abilities",
+    "state_source", "state_checked_at", "state_staleness_ms",
+)
+
+#: Catalogue endpoints owned by optional extensions (``skills/``,
+#: ``capabilities.py``).  Those modules register their own routes and are not
+#: edited here, so the shared web layer applies the pagination contract
+#: (``limit``/``offset``) uniformly on top of their ``data`` envelope.  Without
+#: either parameter the response is byte-for-byte the old one.
+_CATALOGUE_PAGE_KEYS = {
+    "/api/skills": "skills",
+    "/api/capabilities": "capabilities",
+}
+_MAX_CATALOGUE_LIMIT = 1000
+_MAX_CATALOGUE_OFFSET = 1_000_000
+
+#: Mutating control-plane routes that only the ``operator`` role may call.
+#: Feature extensions already re-check ``current_auth()`` but historically
+#: raised ``BadRequest`` (400) for a viewer; enforcing the same rule once in
+#: the router makes every refusal a stable 403 regardless of the extension,
+#: and a future route cannot forget it.
+_OPERATOR_ROUTES = tuple(re.compile(pattern) for pattern in (
+    r"/api/units/[^/]+/actions",
+    r"/api/skills/[^/]+/(?:enable|disable)",
+    r"/api/mcp/servers/[^/]+/(?:connect|disconnect)",
+    r"/api/mcp/call",
+    r"/api/plugins/[^/]+/(?:load|unload)",
+))
 
 
 def _ok(data: Any, status: int = 200) -> tuple[int, dict]:
@@ -121,6 +159,16 @@ def _int_body(body: dict, key: str, default: int, minimum: int,
     return _parse_int(body.get(key), key, default, minimum, maximum)
 
 
+def _safe_ms(value: Any) -> int | None:
+    """Coerce an epoch-millisecond timestamp, or ``None`` when unknown."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class WebAPI:
     def __init__(self, app) -> None:
         self.app = app
@@ -138,6 +186,9 @@ class WebAPI:
                                                 "message": str(exc)}}
         auth_token = _current_auth.set(auth)
         try:
+            refused = self._operator_refusal(method, path, auth)
+            if refused is not None:
+                return refused
             for route_method, pattern, handler in self._routes:
                 if route_method != method:
                     continue
@@ -146,7 +197,7 @@ class WebAPI:
                     continue
                 try:
                     status, result = await handler(match, query, payload)
-                    return status, result
+                    return status, self._paginate_catalogue(path, query, result)
                 except SfoError as exc:
                     return exc.http_status, {"ok": False, "error": exc.to_dict()}
                 except Exception:
@@ -166,6 +217,68 @@ class WebAPI:
 
     def _route(self, method: str, pattern: str, handler: Handler) -> None:
         self._routes.append((method, re.compile(pattern), handler))
+
+    # -- cross-cutting request policy -----------------------------------
+    @staticmethod
+    def _operator_refusal(method: str, path: str,
+                          auth: Any) -> tuple[int, dict] | None:
+        """Refuse a viewer's write to an operator-only route with 403.
+
+        ``auth`` is the admission decision (``None`` for in-process/test
+        calls with no request context, which stays permissive like the
+        feature handlers).  A decision whose role is ``None`` is a legacy/fake
+        object and is not treated as privileged either; only ``operator`` may
+        pass.
+        """
+        if method in ("GET", "HEAD") or auth is None:
+            return None
+        role = getattr(auth, "role", None)
+        if role is None or str(role) == "operator":
+            return None
+        if not any(pattern.fullmatch(path) for pattern in _OPERATOR_ROUTES):
+            return None
+        exc = Denied("operator role required")
+        return exc.http_status, {"ok": False, "error": exc.to_dict()}
+
+    @staticmethod
+    def _paginate_catalogue(path: str, query: dict, result: Any) -> Any:
+        """Apply ``limit``/``offset`` to an extension-owned catalogue list.
+
+        The ``/api/skills`` and ``/api/capabilities`` routes belong to optional
+        subsystems; they keep their own envelope and are not edited by the web
+        layer.  When neither parameter is present the payload is returned
+        untouched (default = every row, backwards compatible).  When paging is
+        requested, ``data.pagination`` describes the window and ``data.count``
+        (capabilities) counts the returned page while ``total`` keeps the full
+        catalogue size.
+        """
+        key = _CATALOGUE_PAGE_KEYS.get(path)
+        if key is None or not isinstance(result, dict):
+            return result
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return result
+        rows = data.get(key)
+        if not isinstance(rows, list):
+            return result
+        if "limit" not in query and "offset" not in query:
+            return result
+        offset = _int_query(query, "offset", 0, 0, _MAX_CATALOGUE_OFFSET)
+        limit = _int_query(query, "limit", None, 1, _MAX_CATALOGUE_LIMIT)
+        if limit is None:
+            limit = max(1, len(rows) - offset)
+        page = rows[offset:offset + limit]
+        data[key] = page
+        data["pagination"] = {
+            "total": len(rows),
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "has_more": offset + len(page) < len(rows),
+        }
+        if "count" in data:
+            data["count"] = len(page)
+        return result
 
     # ------------------------------------------------------------------
     def _build_routes(self) -> None:
@@ -450,24 +563,40 @@ class WebAPI:
         return _ok({"deleted": self.app.policy.delete_rule(match.group(1))})
 
     async def units_list(self, match, query, body):
+        include = self._unit_include(query.get("include"))
         kind = query.get("kind") or None
         tier = query.get("tier") or None
         state = query.get("state") or None
         project_id = query.get("project_id") or None
         status = query.get("status") or None
-        units = [
-            unit for unit in self.app.unit_cards()
-            if (kind is None or unit.get("kind") == kind)
-            and (tier is None or unit.get("tier") == tier)
-            and (state is None or unit.get("state") == state)
-            and (project_id is None or unit.get("project_id") == project_id)
-            and (status is None or unit.get("status") == status)
-        ]
-        payload: dict[str, Any] = {"units": units}
+        controller = getattr(self.app, "unit_control", None)
+        units = []
+        for card in self.app.unit_cards():
+            if not isinstance(card, dict):
+                continue
+            unit = dict(card)
+            # One state source for both endpoints: the control-plane state
+            # machine (when it has a record for this unit) is what
+            # /api/units/summary counts, so the list must show the same
+            # effective state or the two endpoints disagree at the same
+            # instant.  ``state_source``/``state_staleness_ms`` make that
+            # provenance explicit for the UI and for reconciliation tests.
+            self._merge_control_state(unit, controller)
+            if (kind is None or unit.get("kind") == kind) \
+                    and (tier is None or unit.get("tier") == tier) \
+                    and (state is None or unit.get("state") == state) \
+                    and (project_id is None
+                         or unit.get("project_id") == project_id) \
+                    and (status is None or unit.get("status") == status):
+                units.append(self._unit_view(unit, include))
+        payload: dict[str, Any] = {
+            "schema": "stackflow.units/v1",
+            "generated_at": now_ms(),
+            "units": units,
+        }
         # The unit-control extension keeps hysteresis/dependency state; expose
         # its summary here so `/api/units` matches the documented contract
         # while remaining backwards compatible when the extension is absent.
-        controller = getattr(self.app, "unit_control", None)
         summary = getattr(controller, "summary", None)
         if callable(summary):
             try:
@@ -475,6 +604,73 @@ class WebAPI:
             except Exception:  # noqa: BLE001 - summary is advisory
                 self.log.debug("unit summary failed", exc_info=True)
         return _ok(payload)
+
+    # -- units helpers ---------------------------------------------------
+    @staticmethod
+    def _unit_include(raw: Any) -> frozenset[str]:
+        """Parse ``?include=`` (``descriptor`` default, or ``brief``)."""
+        if raw is None:
+            return frozenset()
+        text = str(raw).strip()
+        if not text:
+            return frozenset()
+        tokens = frozenset(
+            part.strip().lower() for part in text.split(",") if part.strip())
+        unknown = sorted(tokens - _UNIT_INCLUDE_VALUES)
+        if unknown:
+            raise BadRequest(
+                f"unknown include value(s): {', '.join(unknown)}; "
+                "allowed: brief, descriptor",
+                detail={"allowed": sorted(_UNIT_INCLUDE_VALUES),
+                        "unknown": unknown})
+        if len(tokens) > 1:
+            raise BadRequest(
+                "include accepts exactly one of: brief, descriptor",
+                detail={"allowed": sorted(_UNIT_INCLUDE_VALUES)})
+        return tokens
+
+    @staticmethod
+    def _merge_control_state(unit: dict, controller: Any) -> None:
+        """Overlay the control-plane state and annotate where it came from."""
+        now = now_ms()
+        unit_id = str(unit.get("unit_id") or unit.get("work_id") or "")
+        record = None
+        if controller is not None and unit_id:
+            try:
+                get = getattr(getattr(controller, "store", None), "get", None)
+                if callable(get):
+                    record = get(unit_id)
+            except Exception:  # noqa: BLE001 - provenance is advisory
+                record = None
+        if record is not None:
+            try:
+                merged = controller.overlay(unit)
+                if isinstance(merged, dict):
+                    unit.clear()
+                    unit.update(merged)
+            except Exception:  # noqa: BLE001 - keep the probe card
+                pass
+            health = getattr(record, "health", None)
+            checked_at = (health or {}).get("checked_at") \
+                if isinstance(health, dict) else None
+            unit["state_source"] = "controller"
+            unit["state_checked_at"] = _safe_ms(checked_at)
+            unit["state_staleness_ms"] = (
+                max(0, now - unit["state_checked_at"])
+                if unit["state_checked_at"] is not None else None)
+            return
+        unit["state_source"] = "probe"
+        unit["state_checked_at"] = _safe_ms(unit.get("last_seen"))
+        unit["state_staleness_ms"] = (
+            max(0, now - unit["state_checked_at"])
+            if unit["state_checked_at"] is not None else None)
+
+    @staticmethod
+    def _unit_view(unit: dict, include: frozenset[str]) -> dict:
+        if "brief" not in include:
+            return unit
+        return {field: unit[field] for field in _UNIT_BRIEF_FIELDS
+                if field in unit}
 
     async def unit_kill(self, match, query, body):
         return _ok(await self.app.kill_unit(match.group(1)))

@@ -76,6 +76,25 @@ class FeatureEndpointTests(unittest.IsolatedAsyncioTestCase):
                          f"{method} {path} -> {status} {payload}")
         return payload
 
+    async def test_units_include_and_catalogue_paging_over_http(self):
+        payload = await self.assert_endpoint("/api/units?include=descriptor")
+        units = payload["data"]["units"]
+        self.assertTrue(units, "unit list must not be empty")
+        self.assertTrue(all("state_source" in unit for unit in units))
+        self.assertTrue(any("runtime" in unit for unit in units))
+        # An unknown include token is an explicit client error, not ignored.
+        status, _payload = await self.request("/api/units?include=banana")
+        self.assertEqual(status, 400)
+        status, payload = await self.request(
+            "/api/capabilities?type=tool&limit=2")
+        self.assertEqual(status, 200)
+        data = payload["data"]
+        self.assertLessEqual(len(data["capabilities"]), 2)
+        self.assertIn("pagination", data)
+        status, payload = await self.request("/api/skills?limit=1")
+        self.assertEqual(status, 200)
+        self.assertIn("pagination", payload["data"])
+
     async def test_capability_and_registry_endpoints(self):
         payload = await self.assert_endpoint("/api/capabilities?type=tool")
         data = payload.get("data") if isinstance(payload, dict) else None

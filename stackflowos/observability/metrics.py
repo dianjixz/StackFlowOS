@@ -16,7 +16,11 @@ Design constraints:
   not persist request or SSE counters, so this extension wraps
   ``WebAPI.handle`` / ``WebServer._serve_sse`` once per process to observe them
   (without changing return values).  Both wrappers are defensive and are
-  documented in ``docs/team/ops.md``.
+  documented in ``docs/team/ops.md``.  Only requests routed through
+  ``WebAPI.handle`` are counted in ``sfo_http_requests_total``: ``/healthz``,
+  static assets and the SSE route are served by ``WebServer`` before the API
+  router, so they are not part of that counter (live SSE clients are covered by
+  ``sfo_sse_clients``).
 
 ``observability.metrics_enabled = false`` keeps the extension loaded (health
 still reports it) but the route answers ``404`` -- exposing metrics is opt-in.
@@ -46,8 +50,11 @@ _http_counts: "weakref.WeakKeyDictionary[Any, dict[tuple[str, str], int]]" = (
 _sse_clients: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
 _instrumented = False
 
-_HTTP_HELP = ("Total API requests handled by the web console, by HTTP method "
-              "and response status.")
+_HTTP_HELP = ("Total routed /api/* requests handled by the web console, by HTTP "
+              "method and response status. Requests that never reach the API "
+              "router -- /healthz, static assets and the SSE stream "
+              "(/api/events/stream) -- are NOT counted here; live SSE clients "
+              "are exposed by sfo_sse_clients instead.")
 _SSE_HELP = "Currently connected /api/events/stream (SSE) clients."
 
 
@@ -242,7 +249,13 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
-def _queue_depth(app: Any) -> int:
+def _queue_depth(app: Any) -> int | None:
+    """Best-effort queued-dispatch depth, or ``None`` when no source knows it.
+
+    ``None`` is rendered as ``-1`` plus ``sfo_agent_queue_known 0``: a missing
+    queue source must never look like an empty queue (0), which would hide a
+    stuck dispatcher.
+    """
     objects = [app, getattr(app, "supervisor", None),
                getattr(app, "agents", None), getattr(app, "scheduler", None)]
     seen: set[int] = set()
@@ -264,7 +277,17 @@ def _queue_depth(app: Any) -> int:
                         pass
                     continue
             if isinstance(raw, dict):
-                raw = raw.get("depth", raw.get("queued", raw.get("size", 0)))
+                # A mapping without any of the accepted keys carries no
+                # measurement: fall through to the next candidate instead of
+                # pretending the depth is 0.
+                measured = False
+                for key in ("depth", "queued", "size", "pending"):
+                    if key in raw:
+                        raw = raw[key]
+                        measured = True
+                        break
+                if not measured:
+                    continue
             value = safe_int(raw, -1)
             if value >= 0:
                 return value
@@ -274,7 +297,7 @@ def _queue_depth(app: Any) -> int:
         for key in ("queue_depth", "queued", "pending_dispatches"):
             if key in stats:
                 return max(0, safe_int(stats[key]))
-    return 0
+    return None
 
 
 def _llm_usage(app: Any) -> dict | None:
@@ -666,9 +689,15 @@ class MetricsExtension:
                 "Agent roster by status and role.",
                 [((("status", status), ("role", role)), count)
                  for (status, role), count in sorted(agent_counts.items())])
+        queue_depth = _queue_depth(app)
         _family(lines, "sfo_agent_queue_depth", "gauge",
-                "Queued agent dispatches waiting for a worker.", [((),
-                _queue_depth(app))])
+                "Queued agent dispatches waiting for a worker; -1 means no "
+                "source reported a queue depth (see sfo_agent_queue_known).",
+                [((), -1 if queue_depth is None else queue_depth)])
+        _family(lines, "sfo_agent_queue_known", "gauge",
+                "1 when a live source provided sfo_agent_queue_depth, 0 when "
+                "the queue depth is unknown (-1).",
+                [((), 0 if queue_depth is None else 1)])
 
         project_counts: dict[str, int] = {}
         for project in _projects(app):
@@ -705,6 +734,28 @@ class MetricsExtension:
                        "leases.list")
         _family(lines, "sfo_leases_active", "gauge",
                 "Active leases currently held.", [((), len(leases or []))])
+
+        # Fencing persistence is best-effort: a failed write still issues the
+        # token in memory, so a restart may re-issue it.  Surface that instead
+        # of leaving it only in the log.
+        leases_hook = getattr(getattr(app, "leases", None), "health", None)
+        leases_health = (_safe(leases_hook, {}, self.log, "leases.health")
+                         if callable(leases_hook) else {}) or {}
+        fencing = (leases_health.get("fencing")
+                   if isinstance(leases_health, dict) else None) or {}
+        _family(lines, "sfo_lease_fencing_persist_failures_total", "counter",
+                "Lease fencing token writes that failed to reach disk (the "
+                "token was still issued in memory; a restart may re-issue it).",
+                [((), max(0, safe_int(fencing.get("persist_failures", 0))))])
+
+        eventlog_hook = getattr(getattr(app, "eventlog", None), "health", None)
+        eventlog_health = (_safe(eventlog_hook, {}, self.log, "eventlog.health")
+                           if callable(eventlog_hook) else {}) or {}
+        _family(lines, "sfo_eventlog_replay_skipped_transient_total", "counter",
+                "Transient events (chat/agent deltas) skipped during replay "
+                "and memory warm-up; they are never replayable.",
+                [((), max(0, safe_int(
+                    eventlog_health.get("replay_skipped_transient", 0))))])
 
         usage = _llm_usage(app)
         token_rows: list[tuple[str, str, str, int]] = []

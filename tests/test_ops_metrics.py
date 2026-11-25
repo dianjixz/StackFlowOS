@@ -119,10 +119,13 @@ class MetricsTests(unittest.IsolatedAsyncioTestCase):
         for name in (
             "sfo_up", "sfo_uptime_seconds", "sfo_events_total", "sfo_event_seq",
             "sfo_units", "sfo_unit_restarts_total", "sfo_agents",
-            "sfo_agent_queue_depth", "sfo_projects", "sfo_tasks",
+            "sfo_agent_queue_depth", "sfo_agent_queue_known",
+            "sfo_projects", "sfo_tasks",
             "sfo_approvals_pending", "sfo_approvals_decided_total",
             "sfo_leases_active", "sfo_llm_tokens_total",
             "sfo_llm_cost_usd_total", "sfo_sse_clients",
+            "sfo_lease_fencing_persist_failures_total",
+            "sfo_eventlog_replay_skipped_transient_total",
             "sfo_http_requests_total",
         ):
             self.assertIn(f"# HELP {name} ", text)
@@ -142,7 +145,52 @@ class MetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('sfo_llm_tokens_total{provider="openai",model="gpt-test",kind="prompt"} 11', text)
         self.assertIn("sfo_llm_cost_usd_total 0.0125", text)
         self.assertIn("sfo_sse_clients 0", text)
-        self.assertIn("sfo_agent_queue_depth 0", text)
+        self.assertIn("sfo_lease_fencing_persist_failures_total 0", text)
+        self.assertIn("sfo_eventlog_replay_skipped_transient_total 0", text)
+        # No queue source: -1 (unknown) + known=0, never a misleading 0.
+        self.assertIn("sfo_agent_queue_depth -1", text)
+        self.assertIn("sfo_agent_queue_known 0", text)
+
+    async def test_agent_queue_depth_reports_known_sources(self):
+        text = self.extension.metrics_text()
+        self.assertIn("sfo_agent_queue_depth -1", text)
+        self.assertIn("sfo_agent_queue_known 0", text)
+        # A live source turns the depth into a real measurement.
+        self.app.supervisor.queue_depth = 7
+        try:
+            text = self.extension.metrics_text()
+        finally:
+            del self.app.supervisor.queue_depth
+        self.assertIn("sfo_agent_queue_depth 7", text)
+        self.assertIn("sfo_agent_queue_known 1", text)
+
+    async def test_agent_queue_mapping_without_depth_is_unknown(self):
+        # A mapping that carries no depth key is "no measurement", not zero.
+        self.app.supervisor.queue_size = {"other": 1}
+        try:
+            text = self.extension.metrics_text()
+        finally:
+            del self.app.supervisor.queue_size
+        self.assertIn("sfo_agent_queue_depth -1", text)
+        self.assertIn("sfo_agent_queue_known 0", text)
+
+    async def test_fencing_persist_failures_are_exported(self):
+        # A failed fencing write issues the token in memory; the metric
+        # must surface that a restart may re-issue it.
+        self.app.leases = SimpleNamespace(
+            list=lambda **kw: [],
+            health=lambda: {"fencing": {"persist_failures": 2}})
+        text = self.extension.metrics_text()
+        self.assertIn("sfo_lease_fencing_persist_failures_total 2", text)
+
+    async def test_http_counter_documents_its_scope(self):
+        text = self.extension.metrics_text()
+        help_line = next(line for line in text.splitlines()
+                         if line.startswith("# HELP sfo_http_requests_total "))
+        self.assertIn("/api/", help_line)
+        self.assertIn("/healthz", help_line)
+        self.assertIn("SSE", help_line)
+        self.assertIn("sfo_sse_clients", help_line)
 
     async def test_route_returns_web_reply_with_prometheus_content_type(self):
         status, reply = await self.extension.handle_metrics(None, {}, {})
