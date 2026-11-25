@@ -82,7 +82,8 @@ def create_provider(spec: dict) -> Any:
     if name == "mock":
         mock_keys = {"model", "stream", "rpm", "tpm", "max_concurrency",
                      "max_context_tokens", "project_token_budget",
-                     "max_tokens"}
+                     "max_tokens", "price_per_1k_input", "price_per_1k_output",
+                     "circuit_threshold", "circuit_cooldown_s"}
         return MockProvider(**{key: value for key, value in kwargs.items()
                                if key in mock_keys})
     kwargs.pop("base_url", None)

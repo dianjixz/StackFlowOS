@@ -29,16 +29,64 @@ _log = get_logger("ai.usage")
 
 #: Conservative fallback tokenizer: ~3 characters per token.  Real tokenizers
 #: over/under-count for CJK and code; over-estimating keeps budgets safe.
+#: There is no tokenizer dependency on purpose (stdlib-only providers, and a
+#: worker must be able to run without the hub's Python environment).  Every
+#: truncation below goes through the helpers in this module so the advertised
+#: token count and the number of bytes actually kept by a clip can never
+#: disagree.
 CHARS_PER_TOKEN = 3
 
 
 def estimate_tokens(text: Any) -> int:
-    """Estimate tokens for a string (conservative characters/3 heuristic)."""
+    """Estimate tokens for a string (conservative characters/3 heuristic).
+
+    This is the *single* estimator used for budgets, provider usage estimates,
+    context trimming and every token-based truncation.
+    """
     if text is None:
         return 0
     if not isinstance(text, str):
         text = str(text)
     return max(1, math.ceil(len(text) / CHARS_PER_TOKEN)) if text else 0
+
+
+def tokens_to_chars(tokens: Any) -> int:
+    """Character budget equivalent to ``tokens`` under :func:`estimate_tokens`."""
+    try:
+        value = int(tokens or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value) * CHARS_PER_TOKEN
+
+
+def clip_text_to_tokens(text: Any, max_tokens: Any, *,
+                        suffix: str = "…") -> str:
+    """Clip ``text`` to a token budget using the shared estimator.
+
+    The returned string is guaranteed to estimate at/below ``max_tokens``
+    (the suffix counts against the budget), so a caller that clipped to N
+    tokens and a later estimate both report the same bound.  A non-positive
+    budget returns ``""`` instead of silently keeping the whole text.
+    """
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    try:
+        budget = int(max_tokens or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget <= 0:
+        return ""
+    if estimate_tokens(text) <= budget:
+        return text
+    suffix = str(suffix or "")
+    if estimate_tokens(suffix) >= budget:
+        # The marker alone would blow the budget: keep a shortened marker
+        # rather than returning text that estimates above the limit.
+        return clip_text_to_tokens(suffix, budget, suffix="")
+    # Reserve the suffix first, then spend the remaining chars on content.
+    content_chars = max(0, tokens_to_chars(budget)
+                        - (len(suffix) + 1))
+    return text[:content_chars] + suffix
 
 
 def estimate_messages_tokens(messages: list[dict]) -> int:
@@ -70,12 +118,25 @@ class BudgetExceeded(Unavailable):
 
 
 class UsageTracker:
-    """Thread-safe, optionally persistent usage aggregation."""
+    """Thread-safe, optionally persistent usage aggregation.
+
+    When ``path`` is shared by several processes (hub + worker units all point
+    at ``<state_dir>/state/llm_usage.json``), each tracker refreshes from disk
+    before mutating or reading, so usage recorded by a worker becomes visible
+    to the hub's ``llm_usage`` snapshot and to its budget checks without a
+    restart.  Writes remain atomic; a read-modify-write race between two
+    processes still loses at most the rows written in that window (the next
+    record refreshes first, so history is not wiped by a later writer).
+    """
 
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path else None
         self._lock = threading.RLock()
         self._data = self._load()
+        self._disk_stamp: tuple[int, int, int] | None = self._stat_stamp()
+        #: In-memory rows not on disk yet (coalescing/OS error); blocks a
+        #: refresh that would discard them.
+        self._dirty = False
         self._last_save = 0.0
         #: Minimum seconds between writes from a burst; 0 disables coalescing.
         self.save_interval_s = 0.0
@@ -96,17 +157,32 @@ class UsageTracker:
             "recent": [],
         }
 
-    def _load(self) -> dict:
-        data = self._empty()
+    def _stat_stamp(self) -> tuple[int, int, int] | None:
+        """Identity of the on-disk file (mtime_ns, size, inode).
+
+        ``write_json`` replaces the file atomically, so the inode changes on
+        every write even when a coarse filesystem clock would report the same
+        mtime: the stamp reliably detects another process's update.
+        """
         if self.path is None:
-            return data
+            return None
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size), int(stat.st_ino))
+
+    def _read_raw(self) -> dict | None:
+        if self.path is None:
+            return None
         try:
             raw = read_json(self.path, default=None)
         except ValueError:
             _log.warning("ignoring corrupt llm usage file %s", self.path)
-            return data
-        if not isinstance(raw, dict):
-            return data
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _normalise(self, raw: dict) -> dict:
         merged = self._empty()
         for key in ("totals", "projects", "roles", "providers", "models"):
             value = raw.get(key)
@@ -125,6 +201,24 @@ class UsageTracker:
         merged["updated_at"] = int(raw.get("updated_at") or 0)
         return merged
 
+    def _load(self) -> dict:
+        raw = self._read_raw()
+        return self._normalise(raw) if raw is not None else self._empty()
+
+    def _refresh_locked(self) -> None:
+        """Merge another process's writes into memory before touching state."""
+        if self.path is None or self._dirty:
+            return
+        stamp = self._stat_stamp()
+        if stamp is None or stamp == self._disk_stamp:
+            return
+        raw = self._read_raw()
+        if raw is None:
+            self._disk_stamp = stamp
+            return
+        self._data = self._normalise(raw)
+        self._disk_stamp = stamp
+
     @staticmethod
     def _bucket(value: Any) -> dict:
         item = value if isinstance(value, dict) else {}
@@ -141,19 +235,25 @@ class UsageTracker:
             return
         now = time.monotonic()
         if self.save_interval_s and now - self._last_save < self.save_interval_s:
+            self._dirty = True
             return
         self._last_save = now
         self._data["updated_at"] = int(time.time() * 1000)
         try:
             write_json(self.path, self._data)
         except OSError:
+            self._dirty = True
             _log.warning("cannot persist llm usage to %s", self.path,
                          exc_info=True)
+            return
+        self._dirty = False
+        self._disk_stamp = self._stat_stamp()
 
     def flush(self) -> None:
         """Force a write (used by tests and graceful shutdown)."""
         with self._lock:
             self._last_save = 0.0
+            self._refresh_locked()
             self._save_locked()
 
     # -- mutations --------------------------------------------------------
@@ -177,6 +277,7 @@ class UsageTracker:
         provider_key = str(provider or "unknown")
         model_key = str(model or "unknown")
         with self._lock:
+            self._refresh_locked()
             self._add(self._data["totals"], usage, cost)
             for key, bucket_key in ((project, "projects"), (role_key, "roles"),
                                     (provider_key, "providers"),
@@ -209,12 +310,15 @@ class UsageTracker:
     def reset(self) -> None:
         with self._lock:
             self._data = self._empty()
+            self._dirty = False
+            self._last_save = 0.0
             self._save_locked()
 
     # -- queries ----------------------------------------------------------
     def snapshot(self, project_id: str | None = None) -> dict:
         """Return a JSON-safe copy of the aggregates (optionally per project)."""
         with self._lock:
+            self._refresh_locked()
             data = {
                 "totals": self._bucket_copy(self._data["totals"]),
                 "projects": {k: self._bucket_copy(v) for k, v in
@@ -239,11 +343,13 @@ class UsageTracker:
         if not project_id:
             return 0
         with self._lock:
+            self._refresh_locked()
             bucket = self._data["projects"].get(str(project_id)) or {}
             return int(bucket.get("total") or 0)
 
     def total_tokens(self) -> int:
         with self._lock:
+            self._refresh_locked()
             return int(self._data["totals"].get("total") or 0)
 
     def check_budget(self, project_id: str | None, predicted_tokens: int,
@@ -367,8 +473,10 @@ __all__ = [
     "LLMRuntime",
     "UsageTracker",
     "attach_provider_runtime",
+    "clip_text_to_tokens",
     "estimate_messages_tokens",
     "estimate_tokens",
     "get_runtime",
     "reset_runtime",
+    "tokens_to_chars",
 ]

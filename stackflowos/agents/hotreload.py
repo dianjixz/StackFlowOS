@@ -39,6 +39,8 @@ LLM_RUNTIME_FIELDS = (
     "provider", "model", "base_url", "temperature", "max_tokens",
     "timeout_s", "stream", "rpm", "tpm", "max_concurrency",
     "max_context_tokens", "project_token_budget", "retries", "retry_backoff_s",
+    "price_per_1k_input", "price_per_1k_output",
+    "circuit_threshold", "circuit_cooldown_s",
 )
 
 #: Name fragments that mark a secret field worth stripping from nested data.

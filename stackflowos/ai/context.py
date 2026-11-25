@@ -13,13 +13,19 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .telemetry import estimate_messages_tokens, estimate_tokens
+from .telemetry import (CHARS_PER_TOKEN, clip_text_to_tokens,
+                        estimate_messages_tokens, estimate_tokens)
 
 #: Never trim below this even if the configured window is tiny.
 MIN_CONTEXT_TOKENS = 256
-#: Individual content clips applied before dropping whole messages.
-TOOL_RESULT_CHARS = 8_000
-MESSAGE_CHARS = 16_000
+#: Individual content clips applied before dropping whole messages.  These are
+#: token budgets: the character cuts are derived from the shared estimator so
+#: a content clip and the token count reported for it cannot disagree.  The
+#: ``*_CHARS`` names are kept for callers/tests that referenced them.
+TOOL_RESULT_TOKENS = 2_667        # ≈ 8 000 chars under the shared heuristic
+MESSAGE_TOKENS = 5_334            # ≈ 16 000 chars
+TOOL_RESULT_CHARS = TOOL_RESULT_TOKENS * CHARS_PER_TOKEN
+MESSAGE_CHARS = MESSAGE_TOKENS * CHARS_PER_TOKEN
 
 
 @dataclass
@@ -66,11 +72,13 @@ def _estimate(messages: list[dict], tools_tokens: int = 0) -> int:
 
 def _clip_content(message: dict) -> bool:
     content = message.get("content")
-    limit = TOOL_RESULT_CHARS if message.get("role") == "tool" else MESSAGE_CHARS
-    if not isinstance(content, str) or len(content) <= limit:
+    limit_tokens = (TOOL_RESULT_TOKENS if message.get("role") == "tool"
+                    else MESSAGE_TOKENS)
+    if not isinstance(content, str) or estimate_tokens(content) <= limit_tokens:
         return False
     suffix = f"\n…[已截断，原长 {len(content)} 字符]"
-    message["content"] = content[:limit] + suffix
+    message["content"] = clip_text_to_tokens(content, limit_tokens,
+                                             suffix=suffix)
     return True
 
 
@@ -137,8 +145,10 @@ def trim_messages(messages: list[dict], limit: int, *,
 
 __all__ = [
     "MESSAGE_CHARS",
+    "MESSAGE_TOKENS",
     "MIN_CONTEXT_TOKENS",
     "TOOL_RESULT_CHARS",
+    "TOOL_RESULT_TOKENS",
     "TrimResult",
     "estimate_tools_tokens",
     "trim_messages",

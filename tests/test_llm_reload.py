@@ -56,6 +56,22 @@ class LlmReloadTests(unittest.IsolatedAsyncioTestCase):
         # The rejected patch did not stick.
         self.assertEqual(self.app.config.llm.provider, "mock")
 
+    async def test_runtime_snapshot_carries_price_and_circuit_fields(self):
+        # price/circuit knobs must reach workers through the pushed runtime
+        # config, otherwise a reload silently ignores them.
+        from stackflowos.agents.hotreload import public_runtime_config
+        await self.app.update_config({
+            "llm": {"price_per_1k_input": 0.002,
+                    "price_per_1k_output": 0.004,
+                    "circuit_threshold": 5,
+                    "circuit_cooldown_s": 10},
+        })
+        llm = public_runtime_config(self.app.config)["llm"]
+        self.assertEqual(llm["price_per_1k_input"], 0.002)
+        self.assertEqual(llm["price_per_1k_output"], 0.004)
+        self.assertEqual(llm["circuit_threshold"], 5)
+        self.assertEqual(llm["circuit_cooldown_s"], 10)
+
     async def test_llm_test_endpoint_shape(self):
         result = await self.app.provider.ping()
         self.assertTrue(result["ok"])

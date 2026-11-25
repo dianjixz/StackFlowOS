@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from .llm import (AnthropicProvider, BaseProvider, GeminiProvider, LLMBrain,
                   LLMProvider, LLMResult, MockProvider,
-                  OpenAICompatibleProvider, Router, ToolCall, Usage, complete,
-                  make_provider, supports_native_tools)
+                  OpenAICompatibleProvider, Router, StreamInterrupted, ToolCall,
+                  Usage, complete, make_provider, supports_native_tools)
 from .prompts import SYSTEM_PROMPT_OS, role_prompt, tool_call_protocol
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "MockProvider",
     "OpenAICompatibleProvider",
     "Router",
+    "StreamInterrupted",
     "SYSTEM_PROMPT_OS",
     "ToolCall",
     "Usage",

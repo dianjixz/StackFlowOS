@@ -170,6 +170,16 @@ class LLMCfg:
     max_context_tokens: int = 128000
     #: Per-project token budget (0 = unlimited); exceeded calls fail closed.
     project_token_budget: int = 0
+    #: Optional USD price per 1 000 prompt/completion tokens for the primary
+    #: provider (routes/fallback entries can override per model).  0 keeps the
+    #: historical behaviour: usage is counted but cost stays 0.
+    price_per_1k_input: float = 0.0
+    price_per_1k_output: float = 0.0
+    #: Circuit breaker for the primary provider: open after N consecutive
+    #: transient failures, probe again after the cooldown.  Defaults match the
+    #: values that used to be hard-coded (3 failures / 30 s).
+    circuit_threshold: int = 3
+    circuit_cooldown_s: float = 30.0
     #: Extra providers tried in order when the primary is unavailable.  Each
     #: entry has the same shape as a ``routes`` entry without ``role``.
     fallback: list[dict] = field(default_factory=list)
@@ -286,6 +296,10 @@ class SkillsCfg:
     #: the registry state file.
     enabled: list[str] = field(default_factory=list)
     inject_max_chars: int = 8000
+    #: Token budget for injected skills (0 = derive from ``inject_max_chars``
+    #: through the shared chars/3 estimator).  When > 0 the worker truncates
+    #: the rendered skill block by tokens instead of characters.
+    inject_max_tokens: int = 0
     max_skills: int = 200
 
 
@@ -687,6 +701,13 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("llm.project_token_budget must be >= 0")
         if section.retries < 0 or section.retry_backoff_s < 0:
             raise ConfigError("llm.retries/retry_backoff_s must be >= 0")
+        if section.price_per_1k_input < 0 or section.price_per_1k_output < 0:
+            raise ConfigError(
+                "llm.price_per_1k_input/price_per_1k_output must be >= 0")
+        if section.circuit_threshold < 1:
+            raise ConfigError("llm.circuit_threshold must be >= 1")
+        if section.circuit_cooldown_s < 0:
+            raise ConfigError("llm.circuit_cooldown_s must be >= 0")
         if not isinstance(section.routes, list) or not isinstance(section.fallback, list):
             raise ConfigError("llm.routes/llm.fallback must be lists")
         for field_name, entries in (("routes", section.routes),
@@ -726,6 +747,8 @@ def _validate_section(name: str, section: Any) -> None:
             raise ConfigError("skills.enabled must be a list of strings")
         if not (1000 <= section.inject_max_chars <= 1_000_000):
             raise ConfigError("skills.inject_max_chars out of range")
+        if not (0 <= section.inject_max_tokens <= 2_000_000):
+            raise ConfigError("skills.inject_max_tokens out of range")
         if not (1 <= section.max_skills <= 10000):
             raise ConfigError("skills.max_skills out of range")
     elif name == "plugins":

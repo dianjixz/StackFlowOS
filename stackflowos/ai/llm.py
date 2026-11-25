@@ -25,6 +25,7 @@ from .providers import (
     GeminiProvider,
     MockProvider,
     OpenAICompatibleProvider,
+    StreamInterrupted,
     _compact,
     _content_text,
     _is_transient,
@@ -38,7 +39,9 @@ from .providers import (
     provider_tool_name,
 )
 from .router import Router
-from .telemetry import attach_provider_runtime, estimate_messages_tokens
+from .telemetry import (CHARS_PER_TOKEN, attach_provider_runtime,
+                        clip_text_to_tokens, estimate_messages_tokens,
+                        estimate_tokens)
 from .types import (LLMResult, ToolCall, Usage, coerce_tool_calls,
                     parse_tool_arguments)
 
@@ -96,7 +99,7 @@ async def complete(provider: Any, messages: list[dict], *,
     raw = await provider.chat(messages)
     text = raw if isinstance(raw, str) else str(raw or "")
     usage = Usage(prompt=estimate_messages_tokens(messages),
-                  completion=max(0, len(text) // 3))
+                  completion=estimate_tokens(text))
     return LLMResult(text=text, usage=usage,
                      model=str(getattr(provider, "model", "") or ""),
                      provider=str(getattr(provider, "name", "") or ""))
@@ -223,7 +226,14 @@ def _compact_state(view: Any) -> str:
 
 #: Conversation budget: keep the opening context plus the newest turns.
 MAX_HISTORY_MESSAGES = 40
-MAX_HISTORY_CHARS = 60_000
+#: Token budget for the rolling conversation (the historical char budget is
+#: kept as a derived constant for import compatibility).  ``_trim`` measures
+#: history with the same :func:`estimate_messages_tokens` used for provider
+#: usage, so trimming and accounting cannot disagree.
+MAX_HISTORY_TOKENS = 20_000
+MAX_HISTORY_CHARS = MAX_HISTORY_TOKENS * CHARS_PER_TOKEN
+#: Tool-result JSON cap for ``observe`` (token budget; ≈12k chars).
+OBSERVE_RESULT_TOKENS = 4_000
 RESULT_STR_LIMIT = 6000
 ACTION_STR_LIMIT = 1500
 
@@ -244,7 +254,8 @@ class LLMBrain:
 
     def __init__(self, provider: Any, role: str, *,
                  max_steps: int = 16,
-                 skill_renderer: Any = None) -> None:
+                 skill_renderer: Any = None,
+                 skill_max_tokens: int = 0) -> None:
         self.provider = provider
         self.role = str(role)
         self.max_steps = int(max_steps)
@@ -252,6 +263,11 @@ class LLMBrain:
         #: filesystem-backed renderer so enabled skills reach the system prompt
         #: without the worker needing the hub's SkillRegistry object.
         self.skill_renderer = skill_renderer
+        #: Token budget applied to rendered skills (0 = renderer's own limit).
+        #: Callers configure it from ``skills.inject_max_tokens`` (or the
+        #: legacy ``inject_max_chars`` through the shared estimator) so skill
+        #: truncation uses the same token accounting as budgets.
+        self.skill_max_tokens = max(0, int(skill_max_tokens or 0))
         self._skills_cache: tuple[tuple, str] | None = None
         self._history: list[dict] = []
         self._pending: Any = None
@@ -287,6 +303,13 @@ class LLMBrain:
         except Exception:  # noqa: BLE001 - skills must never break a run
             _log.debug("skill injection failed", exc_info=True)
             text = ""
+        if text and self.skill_max_tokens:
+            # Enforce the configured budget with the shared estimator instead
+            # of trusting the renderer's character cut (which would silently
+            # mean a different token count for CJK/code-heavy skills).
+            text = clip_text_to_tokens(
+                text, self.skill_max_tokens,
+                suffix="\n...[skills truncated to token budget]...")
         self._skills_cache = (signature, text)
         return text
 
@@ -320,8 +343,9 @@ class LLMBrain:
         if data:
             payload["data"] = _clip_value(data, RESULT_STR_LIMIT)
         text = json.dumps(payload, ensure_ascii=False)
-        if len(text) > 12_000:
-            text = text[:12_000] + "…[结果已截断]"
+        if estimate_tokens(text) > OBSERVE_RESULT_TOKENS:
+            text = clip_text_to_tokens(text, OBSERVE_RESULT_TOKENS,
+                                       suffix="…[结果已截断]")
         call_id = self._pending_call_id
         if call_id:
             self._history.append({"role": "tool", "tool_call_id": call_id,
@@ -366,17 +390,12 @@ class LLMBrain:
     def _trim(self) -> None:
         """Drop the oldest assistant/user pairs (index 0 holds the opening)."""
         def size() -> int:
-            total = 0
-            for item in self._history:
-                content = item.get("content")
-                total += len(content) if isinstance(content, str) else 0
-                if item.get("tool_calls"):
-                    total += len(json.dumps(item["tool_calls"],
-                                            ensure_ascii=False))
-            return total
+            # Same estimator the provider uses for prompt/usage accounting.
+            return estimate_messages_tokens(self._history)
+
         while len(self._history) > 3 and (
                 len(self._history) > MAX_HISTORY_MESSAGES
-                or size() > MAX_HISTORY_CHARS):
+                or size() > MAX_HISTORY_TOKENS):
             remove = 2
             first = self._history[1]
             if (isinstance(first, dict) and first.get("role") == "assistant"
@@ -548,6 +567,7 @@ __all__ = [
     "MockProvider",
     "OpenAICompatibleProvider",
     "Router",
+    "StreamInterrupted",
     "ToolCall",
     "Usage",
     "anthropic_tools",

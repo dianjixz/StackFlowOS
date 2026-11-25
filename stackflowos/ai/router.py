@@ -23,7 +23,8 @@ from typing import Any, AsyncIterator, Callable
 from ..errors import SfoError, Unavailable
 from ..util.logging import get_logger
 from .factory import create_provider, merge_specs, spec_from_config
-from .providers import BaseProvider, MockProvider, _is_transient
+from .providers import (BaseProvider, MockProvider, StreamInterrupted,
+                        _is_transient, _maybe_await)
 from .telemetry import BudgetExceeded, estimate_messages_tokens, get_runtime
 from .types import LLMResult
 
@@ -135,14 +136,39 @@ class Router:
                 _log.info("skipping %s: circuit %s", getattr(provider, "name", "?"),
                           breaker.state)
                 continue
+            emitted: list[str] = []
+
+            async def forward(delta: dict) -> Any:
+                if str(delta.get("type") or "") == "text":
+                    emitted.append(str(delta.get("text") or ""))
+                return await _maybe_await(on_delta(delta))
+
             try:
                 result = await provider.chat_with_tools(
                     messages, tools=tools, tool_choice=tool_choice,
-                    role=role, project_id=project_id, on_delta=on_delta,
+                    role=role, project_id=project_id,
+                    on_delta=forward if on_delta is not None else None,
                     stream=stream)
             except BudgetExceeded:
                 raise
             except SfoError as exc:
+                if isinstance(exc, StreamInterrupted):
+                    raise
+                partial = "".join(emitted)
+                if partial:
+                    # The user already saw part of this answer.  Do not replay
+                    # it on the next candidate (that duplicates the visible
+                    # text); surface an explicit interruption instead.
+                    raise StreamInterrupted(
+                        "LLM stream interrupted after "
+                        f"{len(partial)} characters "
+                        f"({getattr(provider, 'name', '?')}/"
+                        f"{getattr(provider, 'model', '')}); no fallback was "
+                        f"attempted to avoid duplicating the partial reply: "
+                        f"{exc}",
+                        provider=str(getattr(provider, "name", "")),
+                        model=str(getattr(provider, "model", "")),
+                        partial_text=partial) from exc
                 last_error = exc
                 _log.info("provider %s failed (%s); trying next",
                           getattr(provider, "name", "?"), exc)
@@ -180,22 +206,33 @@ class Router:
             if breaker is not None and hasattr(breaker, "available") \
                     and not breaker.available():
                 continue
-            yielded = False
+            emitted: list[str] = []
             try:
                 async for delta in provider.stream(
                         messages, tools=tools, tool_choice=tool_choice,
                         role=role, project_id=project_id):
-                    yielded = True
+                    if str(delta.get("type") or "") == "text":
+                        emitted.append(str(delta.get("text") or ""))
                     yield delta
                 self._last_used = str(getattr(provider, "name", ""))
                 return
             except BudgetExceeded:
                 raise
             except SfoError as exc:
-                last_error = exc
-                if yielded:
-                    # Never replay a partially streamed answer elsewhere.
+                if isinstance(exc, StreamInterrupted):
                     raise
+                partial = "".join(emitted)
+                if partial:
+                    # Never replay a partially streamed answer elsewhere.
+                    raise StreamInterrupted(
+                        "LLM stream interrupted after "
+                        f"{len(partial)} characters "
+                        f"({getattr(provider, 'name', '?')}/"
+                        f"{getattr(provider, 'model', '')}): {exc}",
+                        provider=str(getattr(provider, "name", "")),
+                        model=str(getattr(provider, "model", "")),
+                        partial_text=partial) from exc
+                last_error = exc
                 _log.info("stream provider %s failed (%s); trying next",
                           getattr(provider, "name", "?"), exc)
                 continue

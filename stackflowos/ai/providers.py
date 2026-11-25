@@ -125,6 +125,35 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+class StreamInterrupted(Unavailable):
+    """A provider stream failed *after* it already delivered output.
+
+    The partial answer was already forwarded to the caller/UI.  Replaying it
+    on another provider (router fallback) or silently retrying would duplicate
+    the visible text, so callers must treat this as an explicit terminal error
+    for the turn: :attr:`partial_text` / :attr:`partial_chars` describe what
+    was delivered, and the underlying reason is attached as ``__cause__``.
+    Accounting keeps the partial completion (a failed stream still costs).
+    """
+
+    def __init__(self, message: str, *, provider: str = "", model: str = "",
+                 partial_text: str = "") -> None:
+        partial = str(partial_text or "")
+        super().__init__(
+            message,
+            detail={
+                "provider": str(provider or ""),
+                "model": str(model or ""),
+                "partial_chars": len(partial),
+                "partial_text": partial[-4000:],
+            },
+        )
+        self.provider = str(provider or "")
+        self.model = str(model or "")
+        self.partial_text = partial
+        self.partial_chars = len(partial)
+
+
 # ---------------------------------------------------------------------------
 # tool schema conversion
 # ---------------------------------------------------------------------------
@@ -626,7 +655,26 @@ class BaseProvider:
             raise
         except Exception as exc:
             self._note_failure(exc, started)
-            raise
+            partial = "".join(text_parts)
+            if isinstance(exc, StreamInterrupted) or not partial:
+                raise
+            # The stream broke after visible output.  Keep the partial
+            # completion in the usage aggregates (it was billed upstream) and
+            # turn the failure into an explicit interruption so callers can
+            # report "reply interrupted after N chars" instead of a generic
+            # provider error with no trace of what the user already saw.
+            usage = self._fill_usage(usage, prompt_estimate, partial)
+            actual_tokens = usage.total
+            try:
+                self._record_usage(usage, role=role, project_id=project_id)
+            except Exception:  # pragma: no cover - accounting is best effort
+                _log.debug("could not record partial stream usage",
+                           exc_info=True)
+            raise StreamInterrupted(
+                f"LLM stream interrupted after {len(partial)} characters "
+                f"({self.name}/{self.model}): {_compact(str(exc), 200)}",
+                provider=self.name, model=self.model,
+                partial_text=partial) from exc
         finally:
             self.limiter.release(ticket, actual_tokens)
             try:
@@ -1283,12 +1331,21 @@ class MockProvider:
         self.max_tokens = max(1, int(kwargs.get("max_tokens", 4096) or 4096))
         self.project_token_budget = max(0, int(
             kwargs.get("project_token_budget", 0) or 0))
-        self.price_per_1k_input = 0.0
-        self.price_per_1k_output = 0.0
+        #: Optional cost accounting for the offline provider.  Zero by default
+        #: (the mock is free); a configured ``llm.price_per_1k_*`` still lets
+        #: tests/operators exercise the cost pipeline without a real model.
+        self.price_per_1k_input = max(
+            0.0, float(kwargs.get("price_per_1k_input", 0.0) or 0.0))
+        self.price_per_1k_output = max(
+            0.0, float(kwargs.get("price_per_1k_output", 0.0) or 0.0))
         self.rpm = int(kwargs.get("rpm", 0) or 0)
         self.tpm = int(kwargs.get("tpm", 0) or 0)
         self.max_concurrency = int(kwargs.get("max_concurrency", 8) or 8)
-        self.breaker = CircuitBreaker()
+        threshold = kwargs.get("circuit_threshold", 3) or 3
+        cooldown = kwargs.get("circuit_cooldown_s")
+        self.breaker = CircuitBreaker(
+            threshold=int(threshold),
+            cooldown_s=float(30.0 if cooldown is None else cooldown))
         self.limiter = RateLimiter(rpm=self.rpm, tpm=self.tpm,
                                    max_concurrency=self.max_concurrency)
         self._stats = {"calls": 0, "failures": 0, "last_latency_ms": None,
@@ -1368,7 +1425,9 @@ class MockProvider:
         self.runtime.usage.check_budget(
             project_id, usage.prompt, self.project_token_budget)
         self.runtime.record(project_id=project_id, role=role,
-                            provider="mock", model=self.model, usage=usage)
+                            provider="mock", model=self.model, usage=usage,
+                            price_per_1k_input=self.price_per_1k_input,
+                            price_per_1k_output=self.price_per_1k_output)
         self._stats["calls"] = int(self._stats.get("calls") or 0) + 1
         self._stats["last_used_at"] = int(time.time() * 1000)
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
 import signal
 import socket
@@ -74,6 +75,10 @@ async def run_worker(args: argparse.Namespace) -> int:
     cfg = Config.load(root=root, state_dir=state_dir)
     setup_logging("INFO", cfg.paths.log_file)
     log = get_logger(f"worker.{args.role}")
+    # Token/cost accounting is process-wide: bind the worker's LLM runtime to
+    # the hub's shared state dir before any provider/brain is built, so worker
+    # usage reaches the hub's llm_usage aggregates and budget checks.
+    _configure_llm_usage(cfg)
     log.info("worker boot: work_id=%s role=%s project=%s task=%s",
              args.work_id, args.role, args.project, args.task)
 
@@ -341,6 +346,47 @@ async def run_worker(args: argparse.Namespace) -> int:
         log.info("worker exit: %s", work_id)
 
 
+def _configure_llm_usage(cfg: Config) -> Any:
+    """Point this process's LLM runtime at the shared state directory.
+
+    The worker is a separate process with its own ``get_runtime()``; without
+    this the provider records usage into memory only, so the hub's
+    ``llm_usage``/cost/budget view silently ignored every worker call.
+    ``--state-dir`` is the same directory the hub/supervisor uses, so the
+    worker writes ``<state_dir>/state/llm_usage.json`` and the hub tracker
+    refreshes from that shared file (see ``UsageTracker._refresh_locked``).
+    """
+    from ..ai.telemetry import get_runtime
+
+    runtime = get_runtime()
+    state_dir = getattr(getattr(cfg, "paths", None), "state_dir", None)
+    if state_dir is None:
+        return runtime
+    try:
+        runtime.configure(state_dir=state_dir)
+    except Exception:  # noqa: BLE001 - accounting must never block a worker
+        get_logger("worker").debug("could not configure llm usage runtime",
+                                   exc_info=True)
+    return runtime
+
+
+def _skill_token_budget(cfg: Config) -> int:
+    """Resolve the skill-injection token budget from the skills config.
+
+    ``skills.inject_max_tokens`` wins when set; otherwise the legacy
+    ``inject_max_chars`` is converted with the shared chars/3 estimator so
+    token accounting and truncation use a single convention.
+    """
+    from ..ai.telemetry import CHARS_PER_TOKEN
+
+    skills = getattr(cfg, "skills", None)
+    explicit = int(getattr(skills, "inject_max_tokens", 0) or 0)
+    if explicit > 0:
+        return explicit
+    chars = int(getattr(skills, "inject_max_chars", 8000) or 8000)
+    return max(1, math.ceil(chars / CHARS_PER_TOKEN))
+
+
 def _make_skill_renderer(cfg: Config):
     """Build a worker-local skill prompt renderer.
 
@@ -380,9 +426,16 @@ def _make_skill_renderer(cfg: Config):
             cache["at"] = now
         if registry is None:
             return ""
+        # Pass a character cap derived from the token budget so the registry's
+        # internal character cut and the brain's token clip agree on the same
+        # effective limit (both go through the shared estimator).
+        from ..ai.telemetry import tokens_to_chars
+
+        max_chars = tokens_to_chars(_skill_token_budget(cfg))
         try:
             return registry.render_injection(
-                project_id=project_id, role=role, prompt=prompt)
+                project_id=project_id, role=role, prompt=prompt,
+                max_chars=max_chars)
         except Exception:  # noqa: BLE001
             get_logger("worker").debug("skill render failed", exc_info=True)
             return ""
@@ -399,9 +452,12 @@ def _make_brain(role: str, cfg: Config):
             or getattr(cfg.llm, "fallback", None)):
         try:
             from ..ai.llm import LLMBrain
+            # Usage must land in the shared hub state, not just this process.
+            _configure_llm_usage(cfg)
             provider = make_provider(cfg.llm)
             return LLMBrain(provider, role, max_steps=cfg.agents.max_steps,
-                            skill_renderer=_make_skill_renderer(cfg))
+                            skill_renderer=_make_skill_renderer(cfg),
+                            skill_max_tokens=_skill_token_budget(cfg))
         except Exception:
             get_logger("worker").exception("LLM brain unavailable; falling back to mock")
     return MockBrain(role, max_steps=cfg.agents.max_steps)
